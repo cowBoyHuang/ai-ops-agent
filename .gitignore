@@ -1,0 +1,6 @@
+/.agent/
+/.pycache/
+/.superpowers/
+/.venv/
+/ai_ops_agent.egg-info/
+/src/tests/
