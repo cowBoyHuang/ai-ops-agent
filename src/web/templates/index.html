@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="page">
+    <section class="panel input-panel" id="aiops-panel">
+      <h1>AIOps Agent 模块</h1>
+      <p>通过 chatId 链路发起排障并进行多轮追问（首轮创建 chat，后续基于 chatId 续聊）。</p>
+      <form id="analyze-form">
+        <label>
+          用户ID
+          <input id="user_id" name="user_id" value="u1001">
+        </label>
+        <label>
+          ChatID（可选，续聊时填写）
+          <input id="chat_id" name="chat_id" placeholder="例如：chat_a1b2c3">
+        </label>
+        <label>
+          输入内容
+          <textarea id="query" name="query" placeholder="先输入问题，例如：订单创建失败；后续轮次继续补充你观察到的现象"></textarea>
+        </label>
+        <button type="submit">发送</button>
+        <button type="button" id="new-chat-btn">新开对话</button>
+      </form>
+      <div class="trace-block">
+        <h3>会话状态</h3>
+        <pre id="aiops-session-state">chatId 暂无</pre>
+      </div>
+      <div class="trace-block">
+        <h3>过程日志文件</h3>
+        <pre id="aiops-trace-log-path">提交分析后显示</pre>
+      </div>
+      <div class="trace-block">
+        <h3>分析结果</h3>
+        <pre id="aiops-result">提交分析后显示</pre>
+      </div>
+    </section>
+    <section class="panel" id="chat-panel">
+      <h2>大模型回答模块</h2>
+      <p>仅展示 AIOps 任务链路中产出的最终结论（根因与建议）。</p>
+      <div class="trace-block">
+        <h3>过程日志文件</h3>
+        <pre id="llm-trace-log-path">提交分析后显示</pre>
+      </div>
+      <div class="trace-block">
+        <h3>回答</h3>
+        <pre id="llm-answer">提交分析后显示</pre>
+      </div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=20260406-1"></script>
+</body>
+</html>

@@ -1,0 +1,107 @@
+:root {
+  --bg: #f4efe8;
+  --panel: #fffaf4;
+  --text: #1f2937;
+  --accent: #ab5f2c;
+  --line: #e8d5c3;
+}
+
+body {
+  margin: 0;
+  font-family: "SF Pro Text", "PingFang SC", sans-serif;
+  color: var(--text);
+  background: linear-gradient(135deg, #f8f1e9 0%, #efe3d4 100%);
+}
+
+.page {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding: 24px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 20px;
+  box-shadow: 0 10px 30px rgba(131, 90, 54, 0.08);
+}
+
+label {
+  display: block;
+  margin-bottom: 12px;
+}
+
+input, textarea, button {
+  width: 100%;
+  box-sizing: border-box;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  padding: 12px;
+  margin-top: 6px;
+  font: inherit;
+}
+
+textarea {
+  min-height: 160px;
+}
+
+button {
+  background: var(--accent);
+  color: white;
+  border: 0;
+  cursor: pointer;
+}
+
+.step {
+  border-bottom: 1px solid var(--line);
+  padding: 10px 0;
+}
+
+.trace-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.trace-meta div {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(171, 95, 44, 0.06);
+}
+
+.trace-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #7b5b44;
+}
+
+.trace-block + .trace-block {
+  margin-top: 16px;
+}
+
+.trace-block h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.chat-meta {
+  margin-top: 16px;
+}
+
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 960px) {
+  .page {
+    grid-template-columns: 1fr;
+  }
+}
