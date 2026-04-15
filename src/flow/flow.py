@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from langchain_core.runnables import Runnable, RunnableLambda
 
-from flow.modules.agent_executor_subgraph.agent_executor_subgraph import run as agent_executor_subgraph_run
+from flow.modules.agent_executor_graph.agent_executor_graph import run as agent_executor_graph_run
 from flow.modules.context_build.context_build import run as context_build_run
 from flow.modules.duplicate_detect.duplicate_detect import run as duplicate_detect_run
 from flow.modules.error_handle.error_handle import run as error_handle_run
@@ -114,7 +114,7 @@ def build_langchain_main_chain() -> Runnable:
         | RunnableLambda(_module_node("input_validate", input_validate_run))
         | RunnableLambda(_module_node("duplicate_detect", duplicate_detect_run))
         | RunnableLambda(_module_node("context_build", context_build_run))
-        | RunnableLambda(_module_node("agent_executor_subgraph", agent_executor_subgraph_run))
+        | RunnableLambda(_module_node("agent_executor_graph", agent_executor_graph_run))
         | RunnableLambda(_module_node("error_handle", _error_gate))
         | RunnableLambda(_module_node("response_emit", response_emit_run))
         | RunnableLambda(_module_node("observability", observability_run))

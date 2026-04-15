@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from cache.message_cache_context import MessageCacheContext
+
 try:  # Optional dependency; fallback to in-memory cache methods if unavailable.
     import redis
 except Exception:  # pragma: no cover - optional runtime dependency
     redis = None
+
+
+_REPEAT_CHAT_PREFIX = "repeat_chat_id_"
+_MESSAGE_CONTEXT_PREFIX = "message_cache_context_"
 
 
 class RedisAtomicClient:
@@ -140,3 +146,29 @@ class RedisAtomicClient:
             return True
         except Exception:
             return False
+
+    # ===== Chat cache key helpers =====
+    def build_repeat_chat_id_key(self, chat_id: str) -> str:
+        return f"{_REPEAT_CHAT_PREFIX}{str(chat_id or '').strip()}"
+
+    def build_message_cache_context_key(self, chat_id: str) -> str:
+        return f"{_MESSAGE_CONTEXT_PREFIX}{str(chat_id or '').strip()}"
+
+    def mark_repeat_chat_id(self, chat_id: str, *, ex: int | None = None) -> bool:
+        key = self.build_repeat_chat_id_key(chat_id)
+        return self.set(key, "1", ex=ex)
+
+    def is_repeat_chat_id(self, chat_id: str) -> bool:
+        key = self.build_repeat_chat_id_key(chat_id)
+        return self.get(key) == "1"
+
+    def set_message_cache_context(self, chat_id: str, context: MessageCacheContext, *, ex: int | None = None) -> bool:
+        key = self.build_message_cache_context_key(chat_id)
+        return self.set(key, context.to_json(), ex=ex)
+
+    def get_message_cache_context(self, chat_id: str) -> MessageCacheContext | None:
+        key = self.build_message_cache_context_key(chat_id)
+        raw = self.get(key)
+        if raw is None:
+            return None
+        return MessageCacheContext.from_json(raw)

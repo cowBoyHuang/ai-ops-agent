@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
+from llm.llm import summarize_with_llm
+
 
 def summarize_with_llm_placeholder(total_message: str, summary_message: str) -> str:
     """
-    占位：后续接入真实大模型总结能力。
-    当前先把完整消息 + 历史总结做拼接压缩。
+    兼容旧方法名：实际调用统一收口至 llm.llm.summarize_with_llm。
     """
-    total_text = str(total_message).strip()
-    summary_text = str(summary_message).strip()
-    if not total_text and not summary_text:
-        return ""
-    merged = f"{summary_text}\n{total_text}".strip()
-    return merged[:500]
-
+    return summarize_with_llm(total_message=total_message, summary_message=summary_message)

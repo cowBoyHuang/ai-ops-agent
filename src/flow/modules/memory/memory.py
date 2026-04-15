@@ -15,6 +15,16 @@ _CACHE_STORE = MemoryCacheStore()
 _DB_STORE = ChatDBStore()
 
 
+def _to_float_list(values: Any) -> list[float]:
+    rows: list[float] = []
+    for item in list(values or []):
+        try:
+            rows.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    return rows
+
+
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     state = dict(payload)
     chat_id = str(state.get("chat_id") or "")
@@ -32,13 +42,38 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         summary_message=str(state.get("summary_message") or ""),
     )
 
-    _CACHE_STORE.cache_total_message(total_message)
-    _CACHE_STORE.cache_summary_message(summary_message)
-    row_id = _DB_STORE.insert_message(
-        chat_id=chat_id or "unknown_chat",
+    # Redis cache keys:
+    # - repeat_chat_id_{chat_id} -> 1
+    # - message_cache_context_{chat_id} -> MessageCacheContext JSON
+    _CACHE_STORE.mark_repeat_chat_id(chat_id)
+    _CACHE_STORE.cache_message_context(
+        chat_id=chat_id,
+        user_question=message,
+        agent_answer=response_message,
+        tools_context={
+            "tool_result": dict(state.get("tool_result") or {}),
+            "merged_evidence": dict(state.get("merged_evidence") or {}),
+            "route": state.get("route"),
+        },
+        user_question_embedding=_to_float_list(state.get("UserQuestionEmbedding")),
+    )
+
+    # MySQL tables:
+    # - total_message(id, chat_id, role, content)
+    # - summary_message(id, user_id, chat_id, content)
+    user_message_row_id = _DB_STORE.create_total_message(chat_id=chat_id or "unknown_chat", role="user", content=message)
+    assistant_message_row_id = 0
+    if response_message:
+        assistant_message_row_id = _DB_STORE.create_total_message(
+            chat_id=chat_id or "unknown_chat",
+            role="assistant",
+            content=response_message,
+        )
+
+    summary_row_id = _DB_STORE.create_summary_message(
         user_id=user_id,
-        total_message=total_message,
-        summary_message=summary_message,
+        chat_id=chat_id or "unknown_chat",
+        content=summary_message,
     )
 
     traces = _TRACE_ROWS.setdefault(chat_id, [])
@@ -51,7 +86,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         }
     )
     state["persisted"] = True
-    state["memory_row_id"] = row_id
+    state["memory_row_id"] = summary_row_id
+    state["total_message_row_ids"] = [row_id for row_id in [user_message_row_id, assistant_message_row_id] if row_id]
     state["summary_message"] = summary_message
     return state
-
