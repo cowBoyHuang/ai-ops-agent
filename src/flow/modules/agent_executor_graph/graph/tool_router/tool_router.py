@@ -38,7 +38,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             tool_name = "log_query"
             tool_params = {
                 "query": state.get("normalized_question") or state.get("question") or "",
-                "trace_id": state.get("trace_id") or context.get("trace_id") or "",
                 "order_id": state.get("order_id") or context.get("order_id") or "",
                 "step": steps[step_index],
             }

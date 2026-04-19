@@ -2,60 +2,94 @@
 
 from __future__ import annotations
 
-import hashlib
-import re
 from typing import Any
 
-_HISTORY_BY_MD5: dict[str, str] = {}
-_HISTORY_BY_TOKENS: list[tuple[set[str], str]] = []
+from cache.message_cache_context import MessageCacheContext, RoundMessageContext
+from embedding.embedding import cosine_similarity, text_embedding
+
+_EMBEDDING_DUPLICATE_THRESHOLD = 0.95
 
 
-def _normalize_question(text: str) -> str:
-    lowered = text.lower().strip()
-    lowered = re.sub(r"\s+", " ", lowered)
-    lowered = re.sub(r"[^\w\s\u4e00-\u9fff]", "", lowered)
-    return lowered
+# 方法注释（业务）:
+# - 业务：将任意缓存输入统一转换为 `MessageCacheContext` 对象。
+# - 入参：`value`(Any)=缓存值，可能为对象/JSON字符串/字典。
+# - 出参：`MessageCacheContext`，规范化后的缓存对象。
+# - 逻辑：按类型还原；无法还原时返回空对象。
+def _as_message_context(value: Any) -> MessageCacheContext:
+    if isinstance(value, MessageCacheContext):
+        return value
+    if isinstance(value, str):
+        return MessageCacheContext.from_json(value) or MessageCacheContext()
+    if isinstance(value, dict):
+        return MessageCacheContext.from_dict(value)
+    return MessageCacheContext()
 
 
-def _token_jaccard(lhs: set[str], rhs: set[str]) -> float:
-    if not lhs or not rhs:
-        return 0.0
-    return len(lhs & rhs) / len(lhs | rhs)
+# 方法注释（业务）:
+# - 业务：读取单轮缓存中的历史回答文本。
+# - 入参：`row`(RoundMessageContext)=单轮缓存对象。
+# - 出参：`str`，历史回答字符串（去首尾空白）。
+# - 逻辑：直接读取 `row.aiResponse` 并标准化为空字符串兜底。
+def _row_ai_response(row: RoundMessageContext) -> str:
+    return str(row.aiResponse or "").strip()
 
 
+# 方法注释（业务）:
+# - 业务：读取单轮缓存中的用户问题 embedding 向量。
+# - 入参：`row`(RoundMessageContext)=单轮缓存对象。
+# - 出参：`list[float]`，embedding 向量；异常类型时返回空数组。
+# - 逻辑：直接取 `row.userMessageEmbedding`，仅在类型正确时返回。
+def _row_embedding(row: RoundMessageContext) -> list[float]:
+    embedding = row.userMessageEmbedding
+    return embedding if isinstance(embedding, list) else []
+
+
+# 方法注释（业务）:
+# - 业务：在历史缓存中查找可复用回答。
+# - 入参：`message_context`(Any)=历史缓存；`embedding`(list[float])=当前问题向量。
+# - 出参：`str | None`，命中则返回历史回答，未命中返回 `None`。
+# - 逻辑：倒序遍历历史轮次，计算余弦相似度，达到阈值立即返回对应回答。
+def _find_duplicate_ai_response(message_context: Any, embedding: list[float]) -> str | None:
+    rounds = _as_message_context(message_context).rounds
+    for row in reversed(rounds):
+        response = _row_ai_response(row)
+        if not response:
+            continue
+
+        if embedding:
+            score = cosine_similarity(embedding, _row_embedding(row))
+            if score >= _EMBEDDING_DUPLICATE_THRESHOLD:
+                return response
+
+    return None
+
+
+# 方法注释（业务）:
+# - 业务：重复问题检测节点，命中时直接复用缓存回答并短路流程。
+# - 入参：`payload`(dict[str, Any])=上游上下文，核心字段为 `message` 与 `message_context`。
+# - 出参：`dict[str, Any]`，返回更新后的上下文（命中则 `duplicate_hit=True` 并 `pipeline_stop=True`）。
+# - 逻辑：
+#   1) 若上游已短路则直接透传；
+#   2) 计算当前消息 embedding；
+#   3) 倒序与缓存向量做余弦相似度匹配；
+#   4) 命中则返回历史回答并结束，否则继续下游。
 def run(payload: dict[str, Any]) -> dict[str, Any]:
-    state = dict(payload)
-    if state.get("pipeline_stop"):
-        return state
+    context = dict(payload)
+    if context.get("pipeline_stop"):
+        return context
 
-    normalized = _normalize_question(str(state.get("message") or ""))
-    digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()
-    state["normalized_question"] = normalized
+    message = str(context.get("message") or "")
+    embedding = text_embedding(message, dim=512)
+    message_context = context.get("message_context")
 
-    if digest in _HISTORY_BY_MD5:
-        state["duplicate_hit"] = True
-        state["duplicate_answer"] = _HISTORY_BY_MD5[digest]
-        state["pipeline_stop"] = True
-        state["status"] = "finished"
-        return state
+    duplicate_answer = _find_duplicate_ai_response(message_context, embedding)
+    if duplicate_answer is not None:
+        context["duplicate_hit"] = True
+        context["duplicate_answer"] = duplicate_answer
+        context["pipeline_stop"] = True
+        context["status"] = "finished"
+        return context
 
-    query_tokens = set(normalized.split())
-    for tokens, answer in _HISTORY_BY_TOKENS:
-        if _token_jaccard(tokens, query_tokens) >= 0.85:
-            state["duplicate_hit"] = True
-            state["duplicate_answer"] = answer
-            state["pipeline_stop"] = True
-            state["status"] = "finished"
-            return state
-
-    state["duplicate_hit"] = False
-    state["pipeline_stop"] = False
-    return state
-
-
-def remember_qa(question: str, answer: str) -> None:
-    normalized = _normalize_question(question)
-    digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()
-    _HISTORY_BY_MD5[digest] = answer
-    _HISTORY_BY_TOKENS.append((set(normalized.split()), answer))
-
+    context["duplicate_hit"] = False
+    context["pipeline_stop"] = False
+    return context

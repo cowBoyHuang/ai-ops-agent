@@ -14,7 +14,7 @@ try:
 except Exception:  # noqa: BLE001
     ChatOpenAI = None  # type: ignore[assignment]
 
-_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 _DEFAULT_MODEL = "azure/gpt-5.3-codex-2026-02-24"
 _DEFAULT_BASE_URL = "http://llm.api.corp.qunar.com/v1"
 _MAX_SUMMARY_LEN = 500
@@ -28,6 +28,16 @@ def load_prompt(prompt_file: str, default: str = "") -> str:
     if not path.exists():
         return default
     return path.read_text(encoding="utf-8")
+
+
+def render_prompt(prompt_file: str, **kwargs: Any) -> str:
+    template = load_prompt(prompt_file, default="")
+    if not template:
+        return ""
+    try:
+        return template.format(**kwargs)
+    except Exception:  # noqa: BLE001
+        return template
 
 
 def _coerce_text(content: Any) -> str:
@@ -114,19 +124,40 @@ def _invoke_llm(system_prompt: str, user_prompt: str) -> str:
         return ""
 
 
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:  # noqa: BLE001
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw[start : end + 1])
+    except Exception:  # noqa: BLE001
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def analyze_with_llm(question: str, evidence: str) -> dict[str, str]:
     question_text = str(question).strip()
     evidence_text = str(evidence).strip()
 
-    system_prompt = load_prompt(
-        "analysis_system_prompt.txt",
-        default="你是AIOps根因分析助手，请返回结构化JSON。",
+    system_prompt = load_prompt("analysis_system_prompt.txt", default="")
+    user_prompt = render_prompt(
+        "analysis_user_prompt.txt",
+        question=question_text,
+        evidence=evidence_text,
     )
-    user_prompt = (
-        "请根据问题与证据生成根因分析结果，输出严格 JSON，字段包含："
-        "root_cause, confidence(high|medium|low), reply。\n"
-        f"问题:\n{question_text}\n\n证据:\n{evidence_text}"
-    )
+    if not user_prompt:
+        return _default_analysis(question_text, evidence_text)
     text = _invoke_llm(system_prompt, user_prompt)
     if not text:
         return _default_analysis(question_text, evidence_text)
@@ -154,14 +185,14 @@ def summarize_with_llm(total_message: str, summary_message: str) -> str:
     if not fallback:
         return ""
 
-    system_prompt = load_prompt(
-        "summary_system_prompt.txt",
-        default="你是对话总结助手，保留关键信息，控制在500字符以内。",
+    system_prompt = load_prompt("summary_system_prompt.txt", default="")
+    user_prompt = render_prompt(
+        "summary_user_prompt.txt",
+        summary_message=summary_message,
+        total_message=total_message,
     )
-    user_prompt = (
-        "请对以下内容做增量总结，输出纯文本，不要JSON。\n"
-        f"历史摘要:\n{summary_message}\n\n新增内容:\n{total_message}"
-    )
+    if not user_prompt:
+        return fallback
     text = _invoke_llm(system_prompt, user_prompt)
     if not text:
         return fallback
@@ -173,3 +204,35 @@ def chat_with_llm(question: str, system_prompt: str = "") -> str:
     if not question_text:
         return ""
     return _invoke_llm(system_prompt=system_prompt, user_prompt=question_text)
+
+
+def check_sensitive_operation_with_llm(question: str) -> dict[str, Any]:
+    question_text = str(question).strip()
+    if not question_text:
+        return {"passed": False, "reason": "empty question"}
+
+    system_prompt = load_prompt("sensitive_operation_system_prompt.txt", default="")
+    user_prompt = render_prompt(
+        "sensitive_operation_user_prompt.txt",
+        question=question_text,
+    )
+    if not user_prompt:
+        return {"passed": False, "reason": "sensitive prompt missing"}
+
+    text = _invoke_llm(system_prompt, user_prompt)
+    if not text:
+        return {"passed": False, "reason": "llm check unavailable"}
+
+    parsed = _parse_json_object(text)
+    if not isinstance(parsed, dict):
+        return {"passed": False, "reason": "llm response parse failed"}
+
+    allow_value = parsed.get("allow")
+    if isinstance(allow_value, bool):
+        allow = allow_value
+    else:
+        allow_text = str(allow_value or "").strip().lower()
+        allow = allow_text in {"true", "1", "yes", "allow", "safe"}
+
+    reason = str(parsed.get("reason") or "").strip() or "llm sensitive check blocked"
+    return {"passed": allow, "reason": reason}

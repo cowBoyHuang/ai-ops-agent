@@ -1,7 +1,7 @@
 """澄清回复节点。
 
 业务职责：
-- 当信息不足时返回补充信息提示（traceId、时间范围、服务名）。
+- 当信息不足时返回补充信息提示（requestId、时间范围、服务名）。
 """
 
 from __future__ import annotations
@@ -23,6 +23,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state["response"] = {
         "chatId": state.get("chat_id", ""),
         "status": "waiting_input",
-        "message": "信息不足，请补充 traceId、报错时间和服务名。",
+        "message": "信息不足，请补充 requestId、报错时间和服务名。",
     }
     return state

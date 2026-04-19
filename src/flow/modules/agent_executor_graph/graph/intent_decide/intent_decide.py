@@ -2,7 +2,7 @@
 
 业务职责：
 - 识别是否为运维排障问题（OPS_ANALYSIS）。
-- 从问题中提取 order_id / trace_id / request_id。
+- 从问题中提取 order_id / request_id。
 - 初始化 retry/replan/tool 调用计数字段，保障后续循环可控。
 """
 
@@ -14,9 +14,8 @@ from typing import Any
 from flow.modules.agent_executor_graph.graph.agent_state import AgentState
 
 _ORDER_ID_RE = re.compile(r"(?:订单|order[_\s-]?id|order)(?:[:=：\s#-]*)?(\d{4,20})", re.IGNORECASE)
-_TRACE_ID_RE = re.compile(r"(?:trace[_\s-]?id|trace)(?:[:=：\s#-]*)?([a-zA-Z0-9_.:-]{6,128})", re.IGNORECASE)
 _REQUEST_ID_RE = re.compile(r"(?:request[_\s-]?id|req[_\s-]?id)(?:[:=：\s#-]*)?([a-zA-Z0-9_.:-]{6,128})", re.IGNORECASE)
-_OPS_HINTS = ("失败", "异常", "超时", "报错", "告警", "trace", "日志", "error", "timeout")
+_OPS_HINTS = ("失败", "异常", "超时", "报错", "告警", "日志", "error", "timeout")
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -70,7 +69,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     # 从问题文本中抽取业务 ID，后续工具调用直接复用。
     order_id = str(state.get("order_id") or context.get("order_id") or _extract_with_regex(normalized_question, _ORDER_ID_RE))
-    trace_id = str(state.get("trace_id") or context.get("trace_id") or _extract_with_regex(normalized_question, _TRACE_ID_RE))
     request_id = str(state.get("request_id") or context.get("request_id") or _extract_with_regex(normalized_question, _REQUEST_ID_RE))
 
     state["question"] = question or normalized_question
@@ -84,11 +82,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "normalized_question": normalized_question,
         "conversation_context": conversation_context,
         "order_id": order_id,
-        "trace_id": trace_id,
         "request_id": request_id,
     }
     state["order_id"] = order_id
-    state["trace_id"] = trace_id
     state["request_id"] = request_id
 
     state["retry_count"] = max(0, _as_int(state.get("retry_count"), 0))

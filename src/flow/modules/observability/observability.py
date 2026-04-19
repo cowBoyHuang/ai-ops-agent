@@ -6,9 +6,8 @@ from typing import Any
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
-    state = dict(payload)
-    trace = list(state.get("trace_steps", []))
+    context = dict(payload)
+    trace = list(context.get("trace_steps", []))
     trace.append({"step": "observability", "note": "TODO metrics/log export"})
-    state["trace_steps"] = trace
-    return state
-
+    context["trace_steps"] = trace
+    return context

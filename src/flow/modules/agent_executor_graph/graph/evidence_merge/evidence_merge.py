@@ -32,7 +32,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "knowledge": [],
         "context": {
             "order_id": state.get("order_id") or "",
-            "trace_id": state.get("trace_id") or "",
             "request_id": state.get("request_id") or "",
             "intent_type": state.get("intent_type") or "UNKNOWN",
         },

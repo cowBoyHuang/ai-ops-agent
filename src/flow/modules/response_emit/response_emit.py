@@ -6,25 +6,24 @@ from typing import Any
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
-    state = dict(payload)
-    if "response" in state and isinstance(state["response"], dict):
-        state["response"].setdefault("chatId", state.get("chat_id", ""))
-        return state
+    context = dict(payload)
+    if "response" in context and isinstance(context["response"], dict):
+        context["response"].setdefault("chatId", context.get("chat_id", ""))
+        return context
 
     message = ""
-    if state.get("duplicate_hit"):
-        message = str(state.get("duplicate_answer") or "")
-    elif state.get("analysis", {}).get("reply"):
-        message = str(state["analysis"]["reply"])
-    elif state.get("error"):
-        message = str(state.get("error"))
+    if context.get("duplicate_hit"):
+        message = str(context.get("duplicate_answer") or "")
+    elif context.get("analysis", {}).get("reply"):
+        message = str(context["analysis"]["reply"])
+    elif context.get("error"):
+        message = str(context.get("error"))
     else:
         message = "任务处理中"
 
-    state["response"] = {
-        "chatId": state.get("chat_id", ""),
-        "status": state.get("status", "running"),
+    context["response"] = {
+        "chatId": context.get("chat_id", ""),
+        "status": context.get("status", "running"),
         "message": message,
     }
-    return state
-
+    return context

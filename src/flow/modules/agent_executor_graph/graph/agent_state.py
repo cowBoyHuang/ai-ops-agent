@@ -16,7 +16,7 @@ AnalysisStatus = Literal["SUCCESS", "NEED_RETRY", "NEED_REPLAN", "FAIL"]
 
 class AgentState(TypedDict, total=False):
     # ===== 上游通用字段（来自主 flow）=====
-    # 用户本轮输入文本（已经过 request_ingest 标准化）。
+    # 用户本轮输入文本（已经过 context_build 标准化）。
     message: str
     # 兼容旧接口的 query 字段。
     query: str
@@ -54,8 +54,6 @@ class AgentState(TypedDict, total=False):
     structured_context: dict[str, Any]
     # 从问题中提取的订单号。
     order_id: str
-    # 从问题中提取的 traceId。
-    trace_id: str
     # 从问题中提取的 requestId。
     request_id: str
 

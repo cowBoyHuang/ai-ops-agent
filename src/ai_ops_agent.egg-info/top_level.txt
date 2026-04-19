@@ -1,6 +1,10 @@
 cache
 db
+embedding
 flow
+llm
 log
+skills
+src
 tests
 web

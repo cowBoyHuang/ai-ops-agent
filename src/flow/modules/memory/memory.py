@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.context_build.context_build import remember_message
-from flow.modules.duplicate_detect.duplicate_detect import remember_qa
 from db.db_store import ChatDBStore
 from flow.modules.memory.cache_store import MemoryCacheStore
 from flow.modules.memory.summary import summarize_with_llm_placeholder
@@ -26,20 +24,17 @@ def _to_float_list(values: Any) -> list[float]:
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
-    state = dict(payload)
-    chat_id = str(state.get("chat_id") or "")
-    user_id = str(state.get("user_id") or "anonymous")
-    message = str(state.get("message") or "")
-    remember_message(chat_id, message)
+    context = dict(payload)
+    chat_id = str(context.get("chat_id") or "")
+    user_id = str(context.get("user_id") or "anonymous")
+    message = str(context.get("message") or "")
 
-    response_message = str((state.get("response") or {}).get("message") or "")
-    if response_message:
-        remember_qa(message, response_message)
+    response_message = str((context.get("response") or {}).get("message") or "")
 
     total_message = f"user:{message}\nassistant:{response_message}".strip()
     summary_message = summarize_with_llm_placeholder(
         total_message=total_message,
-        summary_message=str(state.get("summary_message") or ""),
+        summary_message=str(context.get("summary_message") or ""),
     )
 
     # Redis cache keys:
@@ -48,14 +43,15 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     _CACHE_STORE.mark_repeat_chat_id(chat_id)
     _CACHE_STORE.cache_message_context(
         chat_id=chat_id,
+        summary=summary_message,
         user_question=message,
         agent_answer=response_message,
         tools_context={
-            "tool_result": dict(state.get("tool_result") or {}),
-            "merged_evidence": dict(state.get("merged_evidence") or {}),
-            "route": state.get("route"),
+            "tool_result": dict(context.get("tool_result") or {}),
+            "merged_evidence": dict(context.get("merged_evidence") or {}),
+            "route": context.get("route"),
         },
-        user_question_embedding=_to_float_list(state.get("UserQuestionEmbedding")),
+        user_question_embedding=_to_float_list(context.get("UserQuestionEmbedding")),
     )
 
     # MySQL tables:
@@ -79,14 +75,14 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     traces = _TRACE_ROWS.setdefault(chat_id, [])
     traces.append(
         {
-            "status": state.get("status"),
-            "route": state.get("route"),
-            "retry_count": state.get("retry_count", 0),
-            "error_code": state.get("error_code", ""),
+            "status": context.get("status"),
+            "route": context.get("route"),
+            "retry_count": context.get("retry_count", 0),
+            "error_code": context.get("error_code", ""),
         }
     )
-    state["persisted"] = True
-    state["memory_row_id"] = summary_row_id
-    state["total_message_row_ids"] = [row_id for row_id in [user_message_row_id, assistant_message_row_id] if row_id]
-    state["summary_message"] = summary_message
-    return state
+    context["persisted"] = True
+    context["memory_row_id"] = summary_row_id
+    context["total_message_row_ids"] = [row_id for row_id in [user_message_row_id, assistant_message_row_id] if row_id]
+    context["summary_message"] = summary_message
+    return context

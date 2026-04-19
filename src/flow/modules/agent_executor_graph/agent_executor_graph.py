@@ -22,9 +22,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     返参：
     - dict[str, Any]: 主图执行后的完整状态，包含分析结果、路由状态、回复内容等。
     """
-    state = dict(payload)
+    context = dict(payload)
     # 上游已经明确停止时，不再进入排障执行图。
-    if state.get("pipeline_stop"):
-        return state
+    if context.get("pipeline_stop"):
+        return context
     chain = build_langgraph_graph()
-    return chain.invoke(state)
+    return chain.invoke(context)

@@ -1,0 +1,6 @@
+请对以下内容做增量总结，输出纯文本，不要 JSON。
+历史摘要:
+{summary_message}
+
+新增内容:
+{total_message}

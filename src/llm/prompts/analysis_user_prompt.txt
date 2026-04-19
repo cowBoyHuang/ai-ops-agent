@@ -1,0 +1,7 @@
+请根据问题与证据生成根因分析结果，输出严格 JSON，字段包含：
+root_cause, confidence(high|medium|low), reply。
+问题:
+{question}
+
+证据:
+{evidence}

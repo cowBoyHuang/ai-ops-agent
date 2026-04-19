@@ -67,10 +67,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     # 占位工具实现：按 tool_name 构造模拟证据，保持字段结构稳定。
     elif tool_name == "log_query":
         order_id = str(tool_params.get("order_id") or state.get("order_id") or "")
-        trace_id = str(tool_params.get("trace_id") or state.get("trace_id") or "")
         evidence_rows = [
             f"log_query命中：{question[:64]}",
-            f"trace_id={trace_id or 'N/A'} order_id={order_id or 'N/A'}",
+            f"order_id={order_id or 'N/A'}",
         ]
         tool_result = _tool_success("log_query", evidence_rows)
     elif tool_name == "dependency_log_query":
