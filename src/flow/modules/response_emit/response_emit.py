@@ -12,9 +12,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         return context
 
     message = ""
-    if context.get("duplicate_hit"):
-        message = str(context.get("duplicate_answer") or "")
-    elif context.get("analysis", {}).get("reply"):
+    if context.get("analysis", {}).get("reply"):
         message = str(context["analysis"]["reply"])
     elif context.get("error"):
         message = str(context.get("error"))

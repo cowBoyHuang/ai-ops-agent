@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -22,7 +22,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - AgentState: 写入 tool_name/tool_params/tool_route，并路由到 tool_execute。
     """
     state: AgentState = dict(payload)
-    steps = [str(item) for item in list(state.get("plan_steps") or [])]
+    steps = list(state.get("plan_steps") or [])
     step_index = int(state.get("current_step_index") or 0)
     context = dict(state.get("structured_context") or {})
 
@@ -32,38 +32,24 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         tool_params: dict[str, Any] = {}
         route_reason = "计划步骤已执行完成"
     else:
-        # 规则路由：优先按步骤语义选择日志、依赖、知识工具。
-        step = steps[step_index].lower()
-        if "log" in step:
-            tool_name = "log_query"
+        step = dict(steps[step_index]) if isinstance(steps[step_index], dict) else {}
+        action_type = str(step.get("action_type") or "tool_call")
+        # 结构化路由：优先使用 PlanStep 中明确给出的工具与参数。
+        if action_type == "merge_evidence":
+            tool_name = "none"
             tool_params = {
-                "query": state.get("normalized_question") or state.get("question") or "",
-                "order_id": state.get("order_id") or context.get("order_id") or "",
-                "step": steps[step_index],
+                "consume_step": True,
+                "step": "merge_evidence",
             }
-            route_reason = "计划步骤要求查询日志"
-        elif "dependency" in step:
-            tool_name = "dependency_log_query"
-            tool_params = {
-                "query": state.get("normalized_question") or state.get("question") or "",
-                "request_id": state.get("request_id") or context.get("request_id") or "",
-                "step": steps[step_index],
-            }
-            route_reason = "计划步骤要求查询依赖服务"
-        elif "context" in step:
-            tool_name = "knowledge_lookup"
-            tool_params = {
-                "query": state.get("normalized_question") or state.get("question") or "",
-                "step": steps[step_index],
-            }
-            route_reason = "计划步骤要求补充上下文"
+            route_reason = "计划步骤要求合并证据"
         else:
-            tool_name = "knowledge_lookup"
-            tool_params = {
-                "query": state.get("normalized_question") or state.get("question") or "",
-                "step": steps[step_index],
-            }
-            route_reason = "默认知识检索策略"
+            tool_name = str(step.get("tool_name") or "knowledge_lookup")
+            tool_params = dict(step.get("params") or {})
+            tool_params.setdefault("query", state.get("normalized_question") or state.get("question") or "")
+            tool_params.setdefault("order_id", state.get("order_id") or context.get("order_id") or "")
+            tool_params.setdefault("request_id", state.get("request_id") or context.get("request_id") or "")
+            tool_params.setdefault("step", step)
+            route_reason = "按结构化计划步骤执行工具"
 
     state["tool_name"] = tool_name
     state["tool_params"] = tool_params

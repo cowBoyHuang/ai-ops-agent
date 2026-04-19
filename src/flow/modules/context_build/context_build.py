@@ -76,7 +76,7 @@ def _restore_message_context(cache_value: Any) -> MessageCacheContext:
 #   2) 生成 `requestId`；
 #   3) 标准化 `message`；
 #   4) 读取缓存并恢复为 `MessageCacheContext` 放入 `message_context`；
-#   5) 补齐流程默认控制字段。
+#   5) 补齐流程默认控制字段（初始状态为 `init`）。
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     context = dict(payload)
     context["chat_id"] = str(context.get("chat_id") or context.get("chatId") or f"chat_{uuid4().hex[:8]}")
@@ -86,10 +86,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     context["message"] = _normalize_message(_pick_message_input(context))
     cache = get_message_cache(context["chat_id"])
     context["message_context"] = _restore_message_context(cache)
-    context.setdefault("status", "running")
-    context.setdefault("retry_count", 0)
-    context.setdefault("max_retries", 2)
-    context.setdefault("pipeline_stop", False)
+    context.setdefault("status", "init")
     context.setdefault("error_code", "")
     context.setdefault("error", "")
     return context

@@ -77,7 +77,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         {
             "status": context.get("status"),
             "route": context.get("route"),
-            "retry_count": context.get("retry_count", 0),
             "error_code": context.get("error_code", ""),
         }
     )

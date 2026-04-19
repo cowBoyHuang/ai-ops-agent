@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 
 
 def _has_retryable_error(error_text: str) -> bool:
@@ -66,7 +66,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     tool_call_count = int(state.get("tool_call_count") or 0)
     max_tool_calls = max(1, int(state.get("max_tool_calls") or 6))
     current_step_index = int(state.get("current_step_index") or 0)
-    plan_steps = [str(item) for item in list(state.get("plan_steps") or [])]
+    plan_steps = list(state.get("plan_steps") or [])
     has_more_plan_steps = current_step_index < len(plan_steps)
     logs = list(merged_evidence.get("logs") or [])
     knowledge = list(merged_evidence.get("knowledge") or [])

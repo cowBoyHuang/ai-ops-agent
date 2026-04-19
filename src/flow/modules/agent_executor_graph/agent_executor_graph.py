@@ -2,7 +2,6 @@
 
 业务职责：
 - 接收上游 flow 传入的状态。
-- 当上游已标记 `pipeline_stop=True` 时直接透传，避免重复执行排障图。
 - 否则进入 LangGraph 主图执行完整排障流程。
 """
 
@@ -10,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.build_langgraph_graph import build_langgraph_graph
+from flow.modules.agent_executor_graph.build_langgraph_graph import build_langgraph_graph
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -23,8 +22,5 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - dict[str, Any]: 主图执行后的完整状态，包含分析结果、路由状态、回复内容等。
     """
     context = dict(payload)
-    # 上游已经明确停止时，不再进入排障执行图。
-    if context.get("pipeline_stop"):
-        return context
     chain = build_langgraph_graph()
     return chain.invoke(context)

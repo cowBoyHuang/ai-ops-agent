@@ -9,11 +9,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Any, TypedDict
 
 from langchain_core.runnables import Runnable
 from langgraph.graph import END, START, StateGraph
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 from flow.modules.agent_executor_graph.graph.analysis_execute.analysis_execute import run as analysis_execute_run
 from flow.modules.agent_executor_graph.graph.evidence_merge.evidence_merge import run as evidence_merge_run
 from flow.modules.agent_executor_graph.graph.intent_decide.intent_decide import run as intent_decide_run
@@ -25,6 +26,63 @@ from flow.modules.agent_executor_graph.graph.tool_execute.tool_execute import ru
 from flow.modules.agent_executor_graph.graph.tool_router.tool_router import run as tool_router_run
 
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
+
+
+class _GraphRuntimeState(TypedDict, total=False):
+    """LangGraph 运行时状态模式（避免未声明键在运行时被过滤）。"""
+
+    message: str
+    query: str
+    chat_id: str
+    chatId: str
+    user_id: str
+    userId: str
+    error: str
+    error_code: str
+    result: bool
+
+    question: str
+    normalized_question: str
+    conversation_context: list[str]
+    intent_type: str
+    structured_context: dict[str, Any]
+    order_id: str
+    request_id: str
+
+    rag_docs: list[dict[str, Any]]
+    rag_scores: list[float]
+
+    plan_steps: list[dict[str, Any]]
+    current_step_index: int
+
+    tool_name: str
+    tool_params: dict[str, Any]
+    tool_result: dict[str, Any]
+    tool_history: list[dict[str, Any]]
+    tool_call_count: int
+    max_tool_calls: int
+
+    merged_evidence: dict[str, Any]
+
+    analysis: dict[str, Any]
+    root_cause: str
+    confidence: float
+    solution: str
+    analysis_status: str
+
+    retry_count: int
+    max_retry: int
+    max_retries: int
+    replan_count: int
+    max_replan: int
+
+    final_answer: str
+    route: str
+    status: str
+    response: dict[str, Any]
+    planner_reset: bool
+    simulate_tool_timeout_once: bool
+    _simulate_tool_timeout_used: bool
 
 
 def _finish_node(payload: AgentState) -> AgentState:
@@ -90,7 +148,7 @@ def _fallback_node(payload: AgentState) -> AgentState:
     return state
 
 
-def _route_after_retry_router(state: AgentState) -> str:
+def _route_after_retry_router(state: dict[str, Any]) -> str:
     """根据 retry_router 写入的 route 决定下一跳。
 
     仅允许白名单节点，非法值统一降级到 fallback，避免图跑飞。
@@ -110,8 +168,8 @@ def build_langgraph_graph() -> Runnable:
     - Runnable: 可直接 `invoke(state)` 的执行图对象。
     """
 
-    # 统一状态类型为 AgentState，确保节点字段读写语义一致。
-    graph = StateGraph(AgentState)
+    # 运行时状态模式使用内部完整字段集合，避免键被过滤影响路由。
+    graph = StateGraph(_GraphRuntimeState)
     graph.add_node("intent_decide", intent_decide_run)
     graph.add_node("rag_retrieve", rag_retrieve_run)
     graph.add_node("planner", planner_run)

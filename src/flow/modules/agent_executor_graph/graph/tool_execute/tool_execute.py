@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -83,9 +83,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         tool_result = _tool_success("none", [])
 
-    # 有实际工具动作才推进调用计数与计划步进。
+    # 有实际工具动作时推进调用计数。
     if tool_name != "none":
         state["tool_call_count"] = tool_call_count + 1
+
+    # 计划步进：工具调用或显式消费步骤（如 merge_evidence）都需要推进下标。
+    if tool_name != "none" or bool(tool_params.get("consume_step")):
         state["current_step_index"] = _as_int(state.get("current_step_index"), 0) + 1
 
     state["tool_result"] = tool_result

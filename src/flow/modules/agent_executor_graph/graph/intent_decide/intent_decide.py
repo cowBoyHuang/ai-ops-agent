@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 
 _ORDER_ID_RE = re.compile(r"(?:订单|order[_\s-]?id|order)(?:[:=：\s#-]*)?(\d{4,20})", re.IGNORECASE)
 _REQUEST_ID_RE = re.compile(r"(?:request[_\s-]?id|req[_\s-]?id)(?:[:=：\s#-]*)?([a-zA-Z0-9_.:-]{6,128})", re.IGNORECASE)

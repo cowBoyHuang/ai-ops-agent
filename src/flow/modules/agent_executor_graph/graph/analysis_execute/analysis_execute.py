@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 from llm.llm import analyze_with_llm
 
 _CONFIDENCE_MAP = {

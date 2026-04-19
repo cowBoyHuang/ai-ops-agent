@@ -67,16 +67,13 @@ def _find_duplicate_ai_response(message_context: Any, embedding: list[float]) ->
 # 方法注释（业务）:
 # - 业务：重复问题检测节点，命中时直接复用缓存回答并短路流程。
 # - 入参：`payload`(dict[str, Any])=上游上下文，核心字段为 `message` 与 `message_context`。
-# - 出参：`dict[str, Any]`，返回更新后的上下文（命中则 `duplicate_hit=True` 并 `pipeline_stop=True`）。
+# - 出参：`dict[str, Any]`，返回更新后的上下文（命中则 `status=finished` 并写入 `response`）。
 # - 逻辑：
-#   1) 若上游已短路则直接透传；
-#   2) 计算当前消息 embedding；
-#   3) 倒序与缓存向量做余弦相似度匹配；
-#   4) 命中则返回历史回答并结束，否则继续下游。
+#   1) 计算当前消息 embedding；
+#   2) 倒序与缓存向量做余弦相似度匹配；
+#   3) 命中则写入历史回答并结束，否则继续下游。
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     context = dict(payload)
-    if context.get("pipeline_stop"):
-        return context
 
     message = str(context.get("message") or "")
     embedding = text_embedding(message, dim=512)
@@ -84,12 +81,14 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     duplicate_answer = _find_duplicate_ai_response(message_context, embedding)
     if duplicate_answer is not None:
-        context["duplicate_hit"] = True
-        context["duplicate_answer"] = duplicate_answer
-        context["pipeline_stop"] = True
         context["status"] = "finished"
+        context["error_code"] = ""
+        context["error"] = ""
+        context["response"] = {
+            "chatId": context.get("chat_id", ""),
+            "status": "finished",
+            "message": duplicate_answer,
+        }
         return context
 
-    context["duplicate_hit"] = False
-    context["pipeline_stop"] = False
     return context

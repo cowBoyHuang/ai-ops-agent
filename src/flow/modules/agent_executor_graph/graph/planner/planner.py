@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.plan_step import PlanStep
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -36,31 +37,75 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     replan_count = _as_int(state.get("replan_count"), 0)
     planner_reset = bool(state.pop("planner_reset", False))
 
-    # 正常首轮计划：按问题类型给出不同步骤模板。
+    # 正常首轮计划：按问题类型给出结构化步骤模板。
     if intent_type == "OPS_ANALYSIS":
-        plan_steps = [
-            "query_order_logs",
-            "query_service_logs",
-            "analyze_error",
+        plan_steps: list[PlanStep] = [
+            {
+                "action_type": "tool_call",
+                "tool_name": "log_query",
+                "params": {},
+            },
+            {
+                "action_type": "tool_call",
+                "tool_name": "dependency_log_query",
+                "params": {},
+            },
+            {
+                "action_type": "merge_evidence",
+                "tool_name": None,
+                "params": {},
+            },
         ]
     elif intent_type == "GENERAL_QA":
         plan_steps = [
-            "collect_general_context",
-            "answer_question",
+            {
+                "action_type": "tool_call",
+                "tool_name": "knowledge_lookup",
+                "params": {},
+            },
+            {
+                "action_type": "merge_evidence",
+                "tool_name": None,
+                "params": {},
+            },
         ]
     else:
         plan_steps = [
-            "collect_missing_context",
-            "query_order_logs",
-            "analyze_error",
+            {
+                "action_type": "tool_call",
+                "tool_name": "knowledge_lookup",
+                "params": {},
+            },
+            {
+                "action_type": "tool_call",
+                "tool_name": "log_query",
+                "params": {},
+            },
+            {
+                "action_type": "merge_evidence",
+                "tool_name": None,
+                "params": {},
+            },
         ]
 
     # Replan 时直接替换为“最新日志+依赖日志+分析”路径。
     if replan_count > 0:
         plan_steps = [
-            "query_latest_error_logs",
-            "query_dependency_logs",
-            "analyze_error",
+            {
+                "action_type": "tool_call",
+                "tool_name": "log_query",
+                "params": {},
+            },
+            {
+                "action_type": "tool_call",
+                "tool_name": "dependency_log_query",
+                "params": {},
+            },
+            {
+                "action_type": "merge_evidence",
+                "tool_name": None,
+                "params": {},
+            },
         ]
 
     # 当明确要求重置，或首次生成计划时，从第 0 步开始。

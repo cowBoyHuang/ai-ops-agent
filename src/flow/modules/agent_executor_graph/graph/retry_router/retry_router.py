@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
 
@@ -41,7 +41,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     tool_call_count = _as_int(state.get("tool_call_count"), 0)
     max_tool_calls = max(1, _as_int(state.get("max_tool_calls"), 6))
     current_step_index = _as_int(state.get("current_step_index"), 0)
-    plan_steps = [str(item) for item in list(state.get("plan_steps") or [])]
+    plan_steps = list(state.get("plan_steps") or [])
     has_more_plan_steps = current_step_index < len(plan_steps)
     tool_result = dict(state.get("tool_result") or {})
     tool_ok = bool(tool_result.get("ok", True))

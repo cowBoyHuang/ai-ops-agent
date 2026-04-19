@@ -26,10 +26,9 @@ _DANGEROUS_COMMAND_BLACKLIST = (
 # - 入参：`context`(dict)=流程上下文；`error_code`(str)=错误码；`error`(str)=错误文案；
 #         `sensitive_check`(dict)=敏感校验详情。
 # - 出参：`dict[str, Any]`，返回已标记失败状态的上下文。
-# - 逻辑：设置 `pipeline_stop/status/error_code/error/sensitive_check` 后返回。
+# - 逻辑：设置 `status/error_code/error/sensitive_check` 后返回。
 def _mark_validate_failed(context: dict[str, Any], error_code: str, error: str, sensitive_check: dict[str, Any]) -> dict[str, Any]:
-    context["pipeline_stop"] = True
-    context["status"] = "failed"
+    context["status"] = "finished"
     context["error_code"] = error_code
     context["error"] = error
     context["sensitive_check"] = sensitive_check
@@ -59,14 +58,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     context = dict(payload)
     message = str(context.get("message") or "")
     if not message:
-        context["pipeline_stop"] = True
-        context["status"] = "failed"
+        context["status"] = "finished"
         context["error_code"] = "EMPTY_MESSAGE"
         context["error"] = "message is required"
         return context
     if len(message) > _MAX_MESSAGE_LEN:
-        context["pipeline_stop"] = True
-        context["status"] = "failed"
+        context["status"] = "finished"
         context["error_code"] = "MESSAGE_TOO_LONG"
         context["error"] = f"message length exceeds {_MAX_MESSAGE_LEN}"
         return context

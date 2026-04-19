@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flow.modules.agent_executor_graph.graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.agent_state import AgentState
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     """执行检索步骤。
