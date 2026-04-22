@@ -60,7 +60,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         knowledge = [str(item.get("text") or "") for item in list(merged_evidence.get("knowledge") or [])]
         evidence = "\n".join(row for row in [*logs, *knowledge] if row)
 
-    question = str(state.get("question") or context.get("question") or state.get("message") or "")
+    question = str(state.get("question") or context.get("question") or "")
     # 统一走 llm.llm.analyze_with_llm，便于后续做模型配置收口。
     analysis = analyze_with_llm(question=question, evidence=evidence)
     root_cause = str(analysis.get("root_cause") or "").strip()

@@ -4,6 +4,7 @@ embedding
 flow
 llm
 log
+qdrant
 skills
 src
 tests

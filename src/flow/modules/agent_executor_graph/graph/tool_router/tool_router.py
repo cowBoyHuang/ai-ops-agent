@@ -19,7 +19,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - payload: AgentState，需包含 plan_steps/current_step_index/结构化上下文。
 
     返参：
-    - AgentState: 写入 tool_name/tool_params/tool_route，并路由到 tool_execute。
+    - AgentState: 写入 tool_name/tool_params，并路由到 tool_execute。
     """
     state: AgentState = dict(payload)
     steps = list(state.get("plan_steps") or [])
@@ -45,20 +45,14 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             tool_name = str(step.get("tool_name") or "knowledge_lookup")
             tool_params = dict(step.get("params") or {})
-            tool_params.setdefault("query", state.get("normalized_question") or state.get("question") or "")
-            tool_params.setdefault("order_id", state.get("order_id") or context.get("order_id") or "")
-            tool_params.setdefault("request_id", state.get("request_id") or context.get("request_id") or "")
+            tool_params.setdefault("query", state.get("question") or "")
+            tool_params.setdefault("order_id", context.get("order_id") or "")
+            tool_params.setdefault("request_id", context.get("request_id") or "")
             tool_params.setdefault("step", step)
             route_reason = "按结构化计划步骤执行工具"
 
     state["tool_name"] = tool_name
     state["tool_params"] = tool_params
-    state["tool_route"] = {
-        "tool_name": tool_name,
-        "tool_params": tool_params,
-        "step_index": step_index,
-        "step_total": len(steps),
-        "reason": route_reason,
-    }
+    _ = route_reason
     state["route"] = "tool_execute"
     return dict(state)

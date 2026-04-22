@@ -1,7 +1,7 @@
 """意图识别节点。
 
 业务职责：
-- 基于上游 context_build 生成的 message 完成单次意图识别。
+- 基于上游构建的 question 完成单次意图识别。
 - 识别失败时构建历史提示词并交由图条件边触发节点级重试。
 - 不在方法内部执行循环重试。
 """
@@ -85,14 +85,12 @@ def _pick_best_intent_by_score(intent_result: dict[str, Any]) -> tuple[str, floa
 # - 业务：获取当前轮用于意图识别的问题文本。
 # - 入参：`state`(dict[str, Any])=子图状态字典。
 # - 出参：`str`=最终用于识别的用户问题文本。
-# - 逻辑：优先读取 `context.message`，未命中时回退到 `message`。
+# - 逻辑：优先读取 `question`，未命中时回退到 `structured_context.question`。
 def _pick_message_for_intent(state: dict[str, Any]) -> str:
-    context = state.get("context")
-    if isinstance(context, dict):
-        message = str(context.get("message") or "").strip()
-        if message:
-            return message
-    return str(state.get("message") or "").strip()
+    question = str(state.get("question") or "").strip()
+    if question:
+        return question
+    return str(dict(state.get("structured_context") or {}).get("question") or "").strip()
 
 
 # 方法注释（业务）:
@@ -127,7 +125,7 @@ def _build_intent_history_prompt(question: str, history_rows: list[dict[str, Any
 
 # 方法注释（业务）:
 # - 业务：执行单次意图识别并确定子图下一跳。
-# - 入参：`payload`(dict[str, Any])=子图输入状态，包含 message/context/structured_context 等字段。
+# - 入参：`payload`(dict[str, Any])=子图输入状态，包含 question/structured_context 等字段。
 # - 出参：`dict[str, Any]`=写回 `question`、`intent_type`、`intent_recognition`、`route` 等字段后的状态。
 # - 逻辑：
 #   1) 调用大模型做单次识别（优先使用 state.intent_history_prompt）；
@@ -137,7 +135,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
     structured_context = dict(state.get("structured_context") or {})
     question = _pick_message_for_intent(state)
-    max_retry = _to_int(state.get("max_retry", state.get("max_retries")), 2)
+    max_retry = _to_int(state.get("max_retries"), 2)
     retry_count = _to_int(state.get("intent_retry_count"), 0)
     history = state.get("conversation_context") or structured_context.get("recent_messages") or []
     conversation_context = [str(item) for item in history if str(item).strip()]
@@ -153,7 +151,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         best_intent = str(intent_result.get("best_intent") or "")
         best_score = _to_float(intent_result.get("confidence"), 0.0)
 
-    state["question"] = question
     state["conversation_context"] = conversation_context
     state["intent_recognition"] = {
         **intent_result,
@@ -180,10 +177,10 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         state["route"] = "intent_decide"
         state["structured_context"] = {
             **structured_context,
-            "question": question,
+            "question": str(state.get("question") or structured_context.get("question") or ""),
             "conversation_context": conversation_context,
-            "order_id": str(state.get("order_id") or structured_context.get("order_id") or ""),
-            "request_id": str(state.get("request_id") or structured_context.get("request_id") or ""),
+            "order_id": str(structured_context.get("order_id") or ""),
+            "request_id": str(structured_context.get("request_id") or ""),
             "intent_recognition": state["intent_recognition"],
         }
         return dict(state)
@@ -208,10 +205,10 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state["intent_retry_count"] = retry_count
     state["structured_context"] = {
         **structured_context,
-        "question": question,
+        "question": str(state.get("question") or structured_context.get("question") or ""),
         "conversation_context": conversation_context,
-        "order_id": str(state.get("order_id") or structured_context.get("order_id") or ""),
-        "request_id": str(state.get("request_id") or structured_context.get("request_id") or ""),
+        "order_id": str(structured_context.get("order_id") or ""),
+        "request_id": str(structured_context.get("request_id") or ""),
         "intent_recognition": state["intent_recognition"],
     }
 

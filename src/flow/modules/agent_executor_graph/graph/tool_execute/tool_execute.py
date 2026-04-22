@@ -51,9 +51,10 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - AgentState: 写入 tool_result/tool_history，并路由到 evidence_merge。
     """
     state: AgentState = dict(payload)
+    structured_context = dict(state.get("structured_context") or {})
     tool_name = str(state.get("tool_name") or "none")
     tool_params = dict(state.get("tool_params") or {})
-    question = str(state.get("normalized_question") or state.get("question") or "")
+    question = str(state.get("question") or "")
     tool_call_count = _as_int(state.get("tool_call_count"), 0)
     max_tool_calls = max(1, _as_int(state.get("max_tool_calls"), 6))
 
@@ -61,19 +62,22 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     if tool_call_count >= max_tool_calls:
         tool_result = _tool_failed(tool_name, "max_tool_calls_exceeded")
     # 测试开关：仅第一次调用模拟网络超时，用于验证 retry 分支。
-    elif bool(state.get("simulate_tool_timeout_once")) and not bool(state.get("_simulate_tool_timeout_used")):
-        state["_simulate_tool_timeout_used"] = True
+    elif bool(structured_context.get("simulate_tool_timeout_once")) and not bool(
+        structured_context.get("_simulate_tool_timeout_used")
+    ):
+        structured_context["_simulate_tool_timeout_used"] = True
+        state["structured_context"] = structured_context
         tool_result = _tool_failed(tool_name, "network timeout")
     # 占位工具实现：按 tool_name 构造模拟证据，保持字段结构稳定。
     elif tool_name == "log_query":
-        order_id = str(tool_params.get("order_id") or state.get("order_id") or "")
+        order_id = str(tool_params.get("order_id") or structured_context.get("order_id") or "")
         evidence_rows = [
             f"log_query命中：{question[:64]}",
             f"order_id={order_id or 'N/A'}",
         ]
         tool_result = _tool_success("log_query", evidence_rows)
     elif tool_name == "dependency_log_query":
-        request_id = str(tool_params.get("request_id") or state.get("request_id") or "")
+        request_id = str(tool_params.get("request_id") or structured_context.get("request_id") or "")
         tool_result = _tool_success(
             "dependency_log_query",
             [f"依赖调用日志：{question[:64]}", f"request_id={request_id or 'N/A'}"],

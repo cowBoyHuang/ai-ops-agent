@@ -91,6 +91,5 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         status = "NEED_REPLAN"
 
     state["analysis_status"] = status
-    state["analysis_ok"] = status == "SUCCESS"
     state["route"] = "retry_router"
     return dict(state)

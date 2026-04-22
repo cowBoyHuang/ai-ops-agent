@@ -22,5 +22,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - dict[str, Any]: 主图执行后的完整状态，包含分析结果、路由状态、回复内容等。
     """
     context = dict(payload)
+    # 保留上游原始上下文，字段映射统一下沉到 state_build 节点处理。
+    context["context"] = dict(payload)
     chain = build_langgraph_graph()
     return chain.invoke(context)

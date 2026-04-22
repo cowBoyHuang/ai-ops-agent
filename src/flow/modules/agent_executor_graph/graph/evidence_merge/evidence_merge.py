@@ -24,6 +24,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     """
     state: AgentState = dict(payload)
     docs = [dict(item) for item in list(state.get("rag_docs") or [])]
+    structured_context = dict(state.get("structured_context") or {})
     tool_result = dict(state.get("tool_result") or {})
     tool_evidence = list(tool_result.get("evidence") or [])
 
@@ -31,8 +32,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "logs": [],
         "knowledge": [],
         "context": {
-            "order_id": state.get("order_id") or "",
-            "request_id": state.get("request_id") or "",
+            "order_id": structured_context.get("order_id") or "",
+            "request_id": structured_context.get("request_id") or "",
             "intent_type": state.get("intent_type") or "UNKNOWN",
         },
     }
@@ -72,7 +73,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     state["merged_evidence"] = merged
     state["structured_context"] = {
-        **dict(state.get("structured_context") or {}),
+        **structured_context,
         "evidence_context": "\n".join(row for row in evidence_text_rows if row),
         "merged_evidence_summary": {
             "logs_count": len(merged["logs"]),

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, TypedDict
+from typing import Any
 
 from langchain_core.runnables import Runnable
 from langgraph.graph import END, START, StateGraph
@@ -28,69 +28,6 @@ from flow.modules.agent_executor_graph.graph.tool_execute.tool_execute import ru
 from flow.modules.agent_executor_graph.graph.tool_router.tool_router import run as tool_router_run
 
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
-
-
-class _GraphRuntimeState(TypedDict, total=False):
-    """LangGraph 运行时状态模式（避免未声明键在运行时被过滤）。"""
-
-    message: str
-    context: dict[str, Any]
-    query: str
-    chat_id: str
-    chatId: str
-    user_id: str
-    userId: str
-    error: str
-    error_code: str
-    result: bool
-
-    question: str
-    normalized_question: str
-    conversation_context: list[str]
-    intent_type: str
-    intent_recognition: dict[str, Any]
-    intent_history_prompt: str
-    intent_retry_results: list[dict[str, Any]]
-    intent_retry_count: int
-    structured_context: dict[str, Any]
-    order_id: str
-    request_id: str
-
-    rag_docs: list[dict[str, Any]]
-    rag_scores: list[float]
-
-    plan_steps: list[dict[str, Any]]
-    current_step_index: int
-
-    tool_name: str
-    tool_params: dict[str, Any]
-    tool_result: dict[str, Any]
-    tool_history: list[dict[str, Any]]
-    tool_call_count: int
-    max_tool_calls: int
-
-    merged_evidence: dict[str, Any]
-
-    analysis: dict[str, Any]
-    root_cause: str
-    confidence: float
-    solution: str
-    analysis_status: str
-
-    retry_count: int
-    max_retry: int
-    max_retries: int
-    replan_count: int
-    max_replan: int
-
-    final_answer: str
-    route: str
-    status: str
-    response: dict[str, Any]
-    planner_reset: bool
-    fixed_flow_hit: bool
-    simulate_tool_timeout_once: bool
-    _simulate_tool_timeout_used: bool
 
 
 def _finish_node(payload: AgentState) -> AgentState:
@@ -125,7 +62,7 @@ def _finish_node(payload: AgentState) -> AgentState:
         "reply": str(analysis.get("reply") or final_answer),
     }
     state["response"] = {
-        "chatId": state.get("chat_id") or state.get("chatId") or "",
+        "chatId": state.get("chat_id") or "",
         "status": "finished",
         "message": final_answer,
     }
@@ -149,7 +86,7 @@ def _fallback_node(payload: AgentState) -> AgentState:
         "reply": str(analysis.get("reply") or _FALLBACK_MESSAGE),
     }
     state["response"] = {
-        "chatId": state.get("chat_id") or state.get("chatId") or "",
+        "chatId": state.get("chat_id") or "",
         "status": "degraded",
         "message": _FALLBACK_MESSAGE,
     }
@@ -187,8 +124,8 @@ def build_langgraph_graph() -> Runnable:
     - Runnable: 可直接 `invoke(state)` 的执行图对象。
     """
 
-    # 运行时状态模式使用内部完整字段集合，避免键被过滤影响路由。
-    graph = StateGraph(_GraphRuntimeState)
+    # 统一使用 agent_state 作为图状态模型定义。
+    graph = StateGraph(AgentState)
     graph.add_node("state_build", state_build_run)
     graph.add_node("intent_decide", intent_decide_run)
     graph.add_node("fixed_flow_execute", fixed_flow_execute_run)

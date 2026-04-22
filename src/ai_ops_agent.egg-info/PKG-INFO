@@ -17,6 +17,7 @@ Requires-Dist: pydantic-settings>=2.8.0
 Requires-Dist: redis>=5.0.0
 Requires-Dist: pymysql>=1.1.0
 Requires-Dist: python-multipart>=0.0.20
+Requires-Dist: qdrant-client>=1.9.0
 Requires-Dist: sqlalchemy>=2.0.0
 Requires-Dist: torch>=2.0.0
 Requires-Dist: transformers>=4.30.0

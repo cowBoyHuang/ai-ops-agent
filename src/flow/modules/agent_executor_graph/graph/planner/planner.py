@@ -29,13 +29,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - payload: AgentState，至少包含 question、intent_type、replan_count。
 
     返参：
-    - AgentState: 写入 plan_steps/current_step_index/plan，并路由到 tool_router。
+    - AgentState: 写入 plan_steps/current_step_index，并路由到 tool_router。
     """
     state: AgentState = dict(payload)
-    question = str(state.get("normalized_question") or state.get("question") or state.get("message") or "").strip()
+    question = str(state.get("question") or "").strip()
     intent_type = str(state.get("intent_type") or "UNKNOWN")
     replan_count = _as_int(state.get("replan_count"), 0)
-    planner_reset = bool(state.pop("planner_reset", False))
 
     # 正常首轮计划：按问题类型给出结构化步骤模板。
     if intent_type == "OPS_ANALYSIS":
@@ -108,17 +107,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             },
         ]
 
-    # 当明确要求重置，或首次生成计划时，从第 0 步开始。
-    if planner_reset or not state.get("plan_steps"):
+    # 首次生成计划时，从第 0 步开始。
+    if not state.get("plan_steps"):
         state["current_step_index"] = 0
 
     state["plan_steps"] = plan_steps
-    state["plan"] = {
-        "question": question,
-        "intent_type": intent_type,
-        "steps": plan_steps,
-        "replan_count": replan_count,
-        "tool_goal": "补齐分析证据并收敛根因",
-    }
+    _ = question
     state["route"] = "tool_router"
     return dict(state)

@@ -20,7 +20,7 @@ def _fallback_reply(intent_type: str, question: str) -> str:
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
-    question = str(state.get("normalized_question") or state.get("question") or state.get("message") or "").strip()
+    question = str(state.get("question") or "").strip()
     intent_type = str(state.get("intent_type") or "UNKNOWN")
 
     system_prompt = load_prompt(_SYSTEM_PROMPT_FILE, default="")
@@ -43,6 +43,5 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state["root_cause"] = str(state.get("root_cause") or "")
     state["confidence"] = max(0.0, min(confidence, 1.0))
     state["analysis_status"] = "SUCCESS"
-    state["fixed_flow_hit"] = True
     state["route"] = "finish"
     return dict(state)

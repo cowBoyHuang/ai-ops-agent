@@ -35,7 +35,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
     analysis_status = str(state.get("analysis_status") or "FAIL")
     retry_count = _as_int(state.get("retry_count"), 0)
-    max_retry = max(0, _as_int(state.get("max_retry", state.get("max_retries")), 2))
+    max_retry = max(0, _as_int(state.get("max_retries"), 2))
     replan_count = _as_int(state.get("replan_count"), 0)
     max_replan = max(0, _as_int(state.get("max_replan"), 2))
     tool_call_count = _as_int(state.get("tool_call_count"), 0)
@@ -67,7 +67,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             return dict(state)
         if replan_count < max_replan:
             state["replan_count"] = replan_count + 1
-            state["planner_reset"] = True
+            state["current_step_index"] = 0
             state["route"] = "planner"
             return dict(state)
         state["route"] = "fallback"
@@ -77,7 +77,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     if analysis_status == "NEED_REPLAN":
         if replan_count < max_replan:
             state["replan_count"] = replan_count + 1
-            state["planner_reset"] = True
+            state["current_step_index"] = 0
             state["route"] = "planner"
             return dict(state)
         if has_more_plan_steps:
@@ -96,7 +96,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         return dict(state)
     if replan_count < max_replan:
         state["replan_count"] = replan_count + 1
-        state["planner_reset"] = True
+        state["current_step_index"] = 0
         state["route"] = "planner"
         return dict(state)
 
