@@ -1,7 +1,7 @@
 """LangGraph 单主图构建器。
 
 业务目标：
-- 定义固定主链路：intent -> rag -> planner -> tool -> merge -> analysis -> validate -> retry_router。
+- 定义固定主链路：state_build -> intent -> rag -> planner -> tool -> merge -> analysis -> validate -> retry_router。
 - 在 retry_router 做条件分流，形成 Retry/Replan/Finish/Fallback 四类出口。
 - 保证图最终一定进入 END，避免无限循环。
 """
@@ -17,11 +17,13 @@ from langgraph.graph import END, START, StateGraph
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from flow.modules.agent_executor_graph.graph.analysis_execute.analysis_execute import run as analysis_execute_run
 from flow.modules.agent_executor_graph.graph.evidence_merge.evidence_merge import run as evidence_merge_run
+from flow.modules.agent_executor_graph.graph.fixed_flow_execute.fixed_flow_execute import run as fixed_flow_execute_run
 from flow.modules.agent_executor_graph.graph.intent_decide.intent_decide import run as intent_decide_run
 from flow.modules.agent_executor_graph.graph.planner.planner import run as planner_run
 from flow.modules.agent_executor_graph.graph.rag_retrieve.rag_retrieve import run as rag_retrieve_run
 from flow.modules.agent_executor_graph.graph.result_validate.result_validate import run as result_validate_run
 from flow.modules.agent_executor_graph.graph.retry_router.retry_router import run as retry_router_run
+from flow.modules.agent_executor_graph.graph.state_build.state_build import run as state_build_run
 from flow.modules.agent_executor_graph.graph.tool_execute.tool_execute import run as tool_execute_run
 from flow.modules.agent_executor_graph.graph.tool_router.tool_router import run as tool_router_run
 
@@ -32,6 +34,7 @@ class _GraphRuntimeState(TypedDict, total=False):
     """LangGraph 运行时状态模式（避免未声明键在运行时被过滤）。"""
 
     message: str
+    context: dict[str, Any]
     query: str
     chat_id: str
     chatId: str
@@ -45,6 +48,10 @@ class _GraphRuntimeState(TypedDict, total=False):
     normalized_question: str
     conversation_context: list[str]
     intent_type: str
+    intent_recognition: dict[str, Any]
+    intent_history_prompt: str
+    intent_retry_results: list[dict[str, Any]]
+    intent_retry_count: int
     structured_context: dict[str, Any]
     order_id: str
     request_id: str
@@ -81,6 +88,7 @@ class _GraphRuntimeState(TypedDict, total=False):
     status: str
     response: dict[str, Any]
     planner_reset: bool
+    fixed_flow_hit: bool
     simulate_tool_timeout_once: bool
     _simulate_tool_timeout_used: bool
 
@@ -160,6 +168,17 @@ def _route_after_retry_router(state: dict[str, Any]) -> str:
     return "fallback"
 
 
+def _route_after_intent_decide(state: dict[str, Any]) -> str:
+    route = str(state.get("route") or "rag_retrieve")
+    if route == "intent_decide":
+        return "intent_decide"
+    if route == "fallback":
+        return "fallback"
+    if route == "fixed_flow_execute":
+        return "fixed_flow_execute"
+    return "rag_retrieve"
+
+
 @lru_cache(maxsize=1)
 def build_langgraph_graph() -> Runnable:
     """构建并编译主图。
@@ -170,7 +189,9 @@ def build_langgraph_graph() -> Runnable:
 
     # 运行时状态模式使用内部完整字段集合，避免键被过滤影响路由。
     graph = StateGraph(_GraphRuntimeState)
+    graph.add_node("state_build", state_build_run)
     graph.add_node("intent_decide", intent_decide_run)
+    graph.add_node("fixed_flow_execute", fixed_flow_execute_run)
     graph.add_node("rag_retrieve", rag_retrieve_run)
     graph.add_node("planner", planner_run)
     graph.add_node("tool_router", tool_router_run)
@@ -183,8 +204,19 @@ def build_langgraph_graph() -> Runnable:
     graph.add_node("fallback", _fallback_node)
 
     # 主路径：执行一轮“检索-规划-工具-分析-验证”。
-    graph.add_edge(START, "intent_decide")
-    graph.add_edge("intent_decide", "rag_retrieve")
+    graph.add_edge(START, "state_build")
+    graph.add_edge("state_build", "intent_decide")
+    graph.add_conditional_edges(
+        "intent_decide",
+        _route_after_intent_decide,
+        {
+            "intent_decide": "intent_decide",
+            "rag_retrieve": "rag_retrieve",
+            "fixed_flow_execute": "fixed_flow_execute",
+            "fallback": "fallback",
+        },
+    )
+    graph.add_edge("fixed_flow_execute", "finish")
     graph.add_edge("rag_retrieve", "planner")
     graph.add_edge("planner", "tool_router")
     graph.add_edge("tool_router", "tool_execute")

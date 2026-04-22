@@ -18,6 +18,7 @@ _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 _DEFAULT_MODEL = "azure/gpt-5.3-codex-2026-02-24"
 _DEFAULT_BASE_URL = "http://llm.api.corp.qunar.com/v1"
 _MAX_SUMMARY_LEN = 500
+_INTENT_LABELS = ("系统逻辑咨询", "线上问题咨询", "订单信息查询")
 
 _LLM_CLIENT: Any | None = None
 _LLM_INIT_DONE = False
@@ -78,6 +79,42 @@ def _default_summary(total_message: str, summary_message: str) -> str:
         return ""
     merged = f"{summary_text}\n{total_text}".strip()
     return merged[:_MAX_SUMMARY_LEN]
+
+
+def _fallback_intent_recognition(question: str) -> dict[str, Any]:
+    text = str(question or "").strip()
+    lowered = text.lower()
+    if not text:
+        best_intent = "系统逻辑咨询"
+        confidence = 0.5
+    elif any(token in lowered for token in ("失败", "错误", "异常", "故障", "排查", "timeout", "error", "一直")):
+        best_intent = "线上问题咨询"
+        confidence = 0.82
+    elif any(token in lowered for token in ("订单", "订单号", "航班", "乘机人", "状态", "信息", "详情", "查询")):
+        best_intent = "订单信息查询"
+        confidence = 0.8
+    else:
+        best_intent = "系统逻辑咨询"
+        confidence = 0.72
+
+    scores: dict[str, dict[str, float]] = {}
+    for label in _INTENT_LABELS:
+        base = 0.2
+        if label == best_intent:
+            base = confidence
+        scores[label] = {
+            "semantic_match": round(base, 3),
+            "keyword_match": round(base, 3),
+            "context_relevance": 0.5,
+            "question_type_match": round(base, 3),
+            "final_score": round(base, 3),
+        }
+    return {
+        "scores": scores,
+        "best_intent": best_intent,
+        "confidence": round(confidence, 3),
+        "reasoning": "fallback heuristic",
+    }
 
 
 def _build_llm_client() -> Any | None:
@@ -236,3 +273,46 @@ def check_sensitive_operation_with_llm(question: str) -> dict[str, Any]:
 
     reason = str(parsed.get("reason") or "").strip() or "llm sensitive check blocked"
     return {"passed": allow, "reason": reason}
+
+
+def recognize_intent(question: str, intent_history_prompt: str | None = None) -> dict[str, Any]:
+    question_text = str(question or "").strip()
+    if not question_text:
+        return _fallback_intent_recognition(question_text)
+
+    system_prompt = load_prompt("intent_recognition_system_prompt.txt", default="")
+    if str(intent_history_prompt or "").strip():
+        user_prompt = str(intent_history_prompt or "").strip()
+    else:
+        user_prompt = render_prompt(
+            "intent_recognition_user_prompt.txt",
+            question=question_text,
+        )
+    if not user_prompt:
+        return _fallback_intent_recognition(question_text)
+
+    text = _invoke_llm(system_prompt, user_prompt)
+    parsed = _parse_json_object(text) if text else None
+    if not isinstance(parsed, dict):
+        return _fallback_intent_recognition(question_text)
+
+    best_intent = str(parsed.get("best_intent") or "").strip()
+    if best_intent not in _INTENT_LABELS:
+        return _fallback_intent_recognition(question_text)
+
+    try:
+        confidence = float(parsed.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(confidence, 1.0))
+
+    scores = parsed.get("scores")
+    if not isinstance(scores, dict):
+        scores = {}
+
+    return {
+        "scores": scores,
+        "best_intent": best_intent,
+        "confidence": confidence,
+        "reasoning": str(parsed.get("reasoning") or "").strip(),
+    }
