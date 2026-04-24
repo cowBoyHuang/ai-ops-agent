@@ -185,7 +185,7 @@ def _execute_tool_call(
     state: dict[str, Any],
     structured_context: dict[str, Any],
 ) -> dict[str, Any]:
-    """执行单个工具调用，保持与原 tool_execute 的行为兼容。"""
+    """执行单个工具调用。"""
     normalized_tool = str(tool_name or "none").strip()
     if normalized_tool not in _ALLOWED_TOOL_NAMES:
         return _tool_failed(normalized_tool or "none", f"unsupported tool: {normalized_tool}")
