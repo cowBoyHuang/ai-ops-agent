@@ -50,12 +50,17 @@ class AgentState(TypedDict, total=False):
     # 4. 分析与证据融合
     # ==============================
     merged_evidence: Dict[str, Any]
+    evidence: Dict[str, Any]
+    execution_history: Dict[str, Any]
+    intermediate_results: Dict[str, Any]
+    extracted_keywords: List[str]
     analysis: Any
     analysis_status: str
     root_cause: str
     confidence: float
     solution: str
     rag_docs: List[Dict[str, Any]]
+    rag_parent_docs: List[Dict[str, Any]]
     rag_scores: List[float]
 
     # ==============================

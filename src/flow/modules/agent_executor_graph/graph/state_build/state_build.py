@@ -55,6 +55,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state["max_tool_calls"] = raw_context.get("max_tool_calls", state.get("max_tool_calls", 6))
     state["current_step_index"] = raw_context.get("current_step_index", state.get("current_step_index", 0))
     state["tool_history"] = raw_context.get("tool_history", state.get("tool_history", []))
+    state["execution_history"] = raw_context.get("execution_history", state.get("execution_history", {}))
+    state["intermediate_results"] = raw_context.get("intermediate_results", state.get("intermediate_results", {}))
+    state["extracted_keywords"] = raw_context.get("extracted_keywords", state.get("extracted_keywords", []))
     state["intent_retry_count"] = raw_context.get("intent_retry_count", state.get("intent_retry_count", 0))
     state["intent_history_prompt"] = str(
         raw_context.get("intent_history_prompt") or state.get("intent_history_prompt") or ""

@@ -1,0 +1,16 @@
+请基于以下上下文制定排障计划：
+
+【用户问题】
+{user_query}
+
+【技能定义（必须遵循）】
+{skills_context}
+
+【当前系统状态】
+{log_diagnosis_summary}
+
+【相关解决方案文档】
+{rag_solutions_summary}
+
+【完整参考文档】
+{full_docs_references}

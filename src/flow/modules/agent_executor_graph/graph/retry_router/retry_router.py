@@ -1,7 +1,7 @@
 """重试/重规划路由节点。
 
 业务职责：
-- 根据 analysis_status 决定下一跳（tool_execute/tool_router/planner/finish/fallback）。
+- 根据 analysis_status 决定下一跳（plan_execute/planner/finish/fallback）。
 - 控制 retry_count、replan_count、tool_call_count 三类预算。
 - 保证预算耗尽时强制走 fallback，防止无限循环。
 """
@@ -56,14 +56,14 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         state["route"] = "fallback"
         return dict(state)
 
-    # NEED_RETRY：优先尝试重试失败工具，其次继续后续步骤，再次考虑重规划。
+    # NEED_RETRY：优先继续执行计划，其次重规划，预算耗尽时 fallback。
     if analysis_status == "NEED_RETRY":
         if not tool_ok and retry_count < max_retry:
             state["retry_count"] = retry_count + 1
-            state["route"] = "tool_execute"
+            state["route"] = "plan_execute"
             return dict(state)
         if has_more_plan_steps:
-            state["route"] = "tool_router"
+            state["route"] = "plan_execute"
             return dict(state)
         if replan_count < max_replan:
             state["replan_count"] = replan_count + 1
@@ -81,7 +81,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             state["route"] = "planner"
             return dict(state)
         if has_more_plan_steps:
-            state["route"] = "tool_router"
+            state["route"] = "plan_execute"
             return dict(state)
         state["route"] = "fallback"
         return dict(state)
@@ -92,7 +92,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         return dict(state)
     if not tool_ok and retry_count < max_retry:
         state["retry_count"] = retry_count + 1
-        state["route"] = "tool_execute"
+        state["route"] = "plan_execute"
         return dict(state)
     if replan_count < max_replan:
         state["replan_count"] = replan_count + 1

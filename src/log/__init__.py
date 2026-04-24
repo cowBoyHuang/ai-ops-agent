@@ -14,6 +14,7 @@ from log.log import (
     query_external_logs,
     search_logs,
 )
+from log.log_content_cleaner import clean_log_content
 
 __all__ = [
     "EsResult",
@@ -28,4 +29,5 @@ __all__ = [
     "adapt_raw_response_to_es_results",
     "query_external_logs",
     "search_logs",
+    "clean_log_content",
 ]

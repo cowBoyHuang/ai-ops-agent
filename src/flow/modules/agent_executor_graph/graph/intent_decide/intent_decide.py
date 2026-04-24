@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from llm.llm import recognize_intent
 
+_LOGGER = logging.getLogger(__name__)
 _INTENT_MAP = {
     "系统逻辑咨询": "SYSTEM_LOGIC_CONSULT",
     "线上问题咨询": "OPS_ANALYSIS",
@@ -212,10 +214,17 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "intent_recognition": state["intent_recognition"],
     }
 
+    # 调用处说明：线上分析/系统咨询意图进入 rag_retrieve 节点执行检索。
     if intent_type in {"OPS_ANALYSIS", "SYSTEM_LOGIC_CONSULT"}:
         state["route"] = "rag_retrieve"
     elif intent_type == "UNKNOWN_INTENT":
         state["route"] = "fallback"
     else:
         state["route"] = "fixed_flow_execute"
+    _LOGGER.info(
+        "intent_decide 路由完成: intent_type=%s route=%s confidence=%.2f",
+        intent_type,
+        str(state.get("route") or ""),
+        best_score,
+    )
     return dict(state)

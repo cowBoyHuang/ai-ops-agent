@@ -1,31 +1,33 @@
 """RAG 检索节点。
 
 业务职责：
-- 根据原始问题执行 BM25（ES）与向量检索（Qdrant）。
-- 使用 RRF 对多路召回结果融合排序，并做去重筛选。
-- 输出 rag_docs/rag_scores，供 planner 与分析节点使用。
+- 根据原始问题执行向量检索（Qdrant）。
+- 基于首轮 RAG 结果提取错误信息，构建二阶段增强查询并再次检索。
+- 输出 rag_docs/rag_parent_docs/rag_scores，供 planner 与分析节点使用。
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
+import os
+from pathlib import Path
 import re
 import time
 from typing import Any
 
+from db import ChatDBStore
 from flow.modules.agent_executor_graph.agent_state import AgentState
-from log import QueryType, query_external_logs
 from qdrant import QdrantStore
 
 _LOGGER = logging.getLogger(__name__)
-_DEFAULT_ES_LOOKBACK_MINUTES = 15
-_MAX_BM25_DOCS = 30
-_MAX_BM25_DIAGNOSE_DOCS = 5
+_MAX_DIAGNOSE_DOCS = 5
 _MAX_RAG_DOCS = 30
 _MAX_RAG_PARENT_DOCS = 12
+_DEFAULT_PARENT_DOC_TOP_N = 6
+_MAX_LOG_QUESTION_LEN = 120
 _ERROR_CODE_PATTERN = re.compile(r"(?:error[_\s-]?code|错误码)\s*[:=]\s*([A-Za-z0-9_-]{2,64})", re.IGNORECASE)
 _EXCEPTION_PATTERN = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:Exception|Error))\b")
+_RAG_DOC_DB_STORE: ChatDBStore | None = None
 
 _INTENT_TO_CN = {
     "SYSTEM_LOGIC_CONSULT": "系统逻辑咨询",
@@ -34,6 +36,64 @@ _INTENT_TO_CN = {
     "UNKNOWN_INTENT": "未知意图",
     "UNKNOWN": "未知意图",
 }
+
+
+def _parent_doc_top_n() -> int:
+    """读取父文档回查 TopN，环境变量无效时回退默认值。"""
+    raw = str(os.getenv("RAG_RETRIEVE_PARENT_DOC_TOP_N", _DEFAULT_PARENT_DOC_TOP_N)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_PARENT_DOC_TOP_N
+    if value <= 0:
+        return _DEFAULT_PARENT_DOC_TOP_N
+    return value
+
+
+# 方法注释（业务）:
+# - 入参：`text`(str)=待输出到日志的文本；`max_len`(int)=最大保留长度。
+# - 出参：`str`=裁剪后的安全日志文本。
+# - 方法逻辑：避免把超长问题全文打到日志，降低噪声并减少敏感内容暴露面。
+def _clip_for_log(text: str, max_len: int = _MAX_LOG_QUESTION_LEN) -> str:
+    raw = str(text or "").strip()
+    if len(raw) <= max_len:
+        return raw
+    return f"{raw[:max_len]}..."
+
+
+# 方法注释（业务）:
+# - 入参：无。
+# - 出参：`ChatDBStore`=用于 `rag_document` 映射回查的 DB 访问实例。
+# - 方法逻辑：延迟初始化并复用单例，避免每次检索重复创建连接。
+def _get_rag_doc_db_store() -> ChatDBStore:
+    global _RAG_DOC_DB_STORE
+    if _RAG_DOC_DB_STORE is None:
+        _RAG_DOC_DB_STORE = ChatDBStore()
+        _LOGGER.info("rag_retrieve 初始化 rag_document DB 访问实例")
+    return _RAG_DOC_DB_STORE
+
+
+# 方法注释（业务）:
+# - 入参：`path`(str)=本地文档绝对路径。
+# - 出参：`str`=文件文本内容；读取失败或二进制文件返回空字符串。
+# - 方法逻辑：优先 utf-8，回退 gb18030；对异常与二进制内容统一降级为空文本。
+def _read_local_doc(path: str) -> str:
+    text_path = Path(str(path or "").strip())
+    if not text_path.is_file():
+        return ""
+    try:
+        raw = text_path.read_bytes()
+    except Exception:  # pragma: no cover - 文件系统异常统一降级
+        _LOGGER.warning("rag_retrieve 读取父文档失败: path=%s", text_path)
+        return ""
+    if b"\x00" in raw:
+        return ""
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            return raw.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore").strip()
 
 
 # 方法注释（业务）:
@@ -70,142 +130,24 @@ def _pick_intent_zh(state: dict[str, Any]) -> str:
 
 
 # 方法注释（业务）:
-# - 入参：`dicts`(list[dict[str, Any]])=候选字典列表；`keys`(tuple[str, ...])=按优先级查找的键名。
-# - 出参：`Any`=命中的第一个非空值；未命中返回 `None`。
-# - 方法逻辑：按“字典顺序 + 键顺序”扫描，过滤 `None` 与空白字符串。
-def _pick_value_from_dicts(dicts: list[dict[str, Any]], keys: tuple[str, ...]) -> Any:
-    for row in dicts:
-        for key in keys:
-            if key not in row:
-                continue
-            value = row.get(key)
-            if value is None:
-                continue
-            if isinstance(value, str) and not value.strip():
-                continue
-            return value
-    return None
-
-
-# 方法注释（业务）:
-# - 入参：`value`(Any)=时间字段原始值（datetime/字符串/None）。
-# - 出参：`dt.datetime | str | None`=标准化时间值。
-# - 方法逻辑：`datetime` 原样返回；字符串尝试按 ISO 解析，失败则保留原字符串；空值返回 `None`。
-def _normalize_datetime(value: Any) -> dt.datetime | str | None:
-    if value is None:
-        return None
-    if isinstance(value, dt.datetime):
-        return value
-    text = str(value).strip()
-    if not text:
-        return None
-    iso_candidate = text.replace("Z", "+00:00") if text.endswith("Z") else text
-    try:
-        return dt.datetime.fromisoformat(iso_candidate)
-    except ValueError:
-        return text
-
-
-# 方法注释（业务）:
-# - 入参：`state`(dict[str, Any])=当前 AgentState 字典。
-# - 出参：`dict[str, Any] | None`=ES 检索参数（app_code/logname/begin_time/end_time）；关键参数缺失时返回 `None`。
-# - 方法逻辑：从 `structured_context -> context -> state` 提取参数，并对时间字段做标准化及默认窗口补齐。
-def _extract_es_params(state: dict[str, Any]) -> dict[str, Any] | None:
-    structured_context = dict(state.get("structured_context") or {})
-    raw_context = dict(state.get("context") or {})
-    # 参数读取优先级：结构化上下文 > 原始上下文 > 顶层 state。
-    candidates = [structured_context, raw_context, state]
-
-    app_code = str(
-        _pick_value_from_dicts(candidates, ("app_code", "appCode", "app_core", "appCore")) or ""
-    ).strip()
-    logname = str(_pick_value_from_dicts(candidates, ("logname", "log_name")) or "").strip()
-    if not app_code or not logname:
-        return None
-
-    begin_raw = _pick_value_from_dicts(candidates, ("begin_time", "beginTime", "start_time", "startTime"))
-    end_raw = _pick_value_from_dicts(candidates, ("end_time", "endTime"))
-    begin_time = _normalize_datetime(begin_raw)
-    end_time = _normalize_datetime(end_raw)
-
-    # 未传时间范围时，兜底为“当前时间往前 15 分钟”窗口。
-    if end_time is None:
-        end_time = dt.datetime.now()
-    if begin_time is None:
-        begin_time = dt.datetime.now() - dt.timedelta(minutes=_DEFAULT_ES_LOOKBACK_MINUTES)
-
-    return {
-        "app_code": app_code,
-        "logname": logname,
-        "begin_time": begin_time,
-        "end_time": end_time,
-    }
-
-
-# 方法注释（业务）:
-# - 入参：`question`(str)=原始问题；`state`(dict[str, Any])=当前 AgentState。
-# - 出参：`list[dict[str, Any]]`=BM25 候选文档列表（统一成 id/score/source/text 结构）。
-# - 方法逻辑：提取 ES 参数后调用现有日志查询接口，按分数降序整理并限制最大返回条数；异常降级为空列表。
-def _search_es_bm25(question: str, state: dict[str, Any]) -> list[dict[str, Any]]:
-    if not question:
-        return []
-    params = _extract_es_params(state)
-    if params is None:
-        _LOGGER.info("rag_retrieve bm25 skipped: missing app_code/logname")
-        return []
-
-    try:
-        rows = query_external_logs(
-            app_code=str(params["app_code"]),
-            logname=str(params["logname"]),
-            begin_time=params["begin_time"],
-            end_time=params["end_time"],
-            content=question,
-            type=QueryType.MATCH.value,
-        )
-    except Exception as err:  # pragma: no cover - 外部依赖异常统一降级
-        _LOGGER.warning("bm25 log query failed: %s", err)
-        return []
-
-    # BM25 原分数由 ES 返回，先按分数降序再做统一结构映射。
-    ranked = sorted(
-        list(rows or []),
-        key=lambda item: float(getattr(item, "score", 0.0) or 0.0),
-        reverse=True,
-    )
-    docs: list[dict[str, Any]] = []
-    for idx, row in enumerate(ranked[:_MAX_BM25_DOCS], start=1):
-        text = str(getattr(row, "content", "") or "").strip()
-        if not text:
-            continue
-        try:
-            score = float(getattr(row, "score", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            score = 0.0
-        docs.append(
-            {
-                "id": f"bm25-{idx}",
-                "score": score,
-                "source": "bm25",
-                "text": text,
-            }
-        )
-    return docs
-
-
-# 方法注释（业务）:
 # - 入参：`query`(str)=RAG 检索查询词；`intent_zh`(str)=中文意图标签。
 # - 出参：`list[dict[str, Any]]`=RAG chunk 候选列表（含 payload.parent_id）。
 # - 方法逻辑：将“查询词+意图”拼接后调用 Qdrant，抽取文本与 payload 元信息，统一输出结构。
 def _search_qdrant_rag(query: str, intent_zh: str) -> list[dict[str, Any]]:
     if not query:
+        _LOGGER.info("rag_retrieve 跳过 Qdrant: query 为空")
         return []
     # 将意图拼入查询词，提升向量检索在多意图场景下的区分度。
     query_text = f"{query}\n意图：{intent_zh}".strip()
+    _LOGGER.info(
+        "rag_retrieve 开始 Qdrant 检索: intent=%s query=%s",
+        intent_zh,
+        _clip_for_log(query_text),
+    )
     try:
         rows = QdrantStore().search(query=query_text, limit=_MAX_RAG_DOCS)
     except Exception as err:  # pragma: no cover - 外部依赖异常统一降级
-        _LOGGER.warning("qdrant search failed: %s", err)
+        _LOGGER.warning("rag_retrieve Qdrant 查询失败: %s", err)
         return []
 
     docs: list[dict[str, Any]] = []
@@ -235,15 +177,16 @@ def _search_qdrant_rag(query: str, intent_zh: str) -> list[dict[str, Any]]:
                 "payload": payload,
             }
         )
+    _LOGGER.info("rag_retrieve Qdrant 检索完成: chunk 命中=%d", len(docs))
     return docs
 
 
 # 方法注释（业务）:
-# - 入参：`bm25_docs`(list[dict[str, Any]])=日志 BM25 命中结果。
+# - 入参：`docs`(list[dict[str, Any]])=首轮 RAG chunk 命中结果。
 # - 出参：`dict[str, Any]`=错误信息摘要（error_code/exception/keywords）。
-# - 方法逻辑：从高分日志中提取错误码与异常类名，并生成增强检索关键词。
-def _extract_error_info(bm25_docs: list[dict[str, Any]]) -> dict[str, Any]:
-    texts = [str(item.get("text") or "") for item in bm25_docs[:_MAX_BM25_DIAGNOSE_DOCS]]
+# - 方法逻辑：从高分 RAG 文档中提取错误码与异常类名，并生成增强检索关键词。
+def _extract_error_info(docs: list[dict[str, Any]]) -> dict[str, Any]:
+    texts = [str(item.get("text") or "") for item in docs[:_MAX_DIAGNOSE_DOCS]]
     merged = "\n".join(texts)
 
     error_code = ""
@@ -257,11 +200,17 @@ def _extract_error_info(bm25_docs: list[dict[str, Any]]) -> dict[str, Any]:
         exception = str(match_exception.group(1) or "").strip()
 
     keywords = " ".join(part for part in [error_code, exception] if part).strip()
-    return {
+    result = {
         "error_code": error_code,
         "exception": exception,
         "keywords": keywords,
     }
+    _LOGGER.info(
+        "rag_retrieve 文档诊断提取完成: error_code=%s exception=%s",
+        error_code,
+        exception,
+    )
+    return result
 
 
 # 方法注释（业务）:
@@ -271,7 +220,9 @@ def _extract_error_info(bm25_docs: list[dict[str, Any]]) -> dict[str, Any]:
 def _build_stage2_rag_query(question: str, error_info: dict[str, Any]) -> str:
     keywords = str(error_info.get("keywords") or "").strip()
     if keywords:
+        _LOGGER.info("rag_retrieve 二阶段检索词增强: keywords=%s", keywords)
         return f"{question} {keywords}".strip()
+    _LOGGER.info("rag_retrieve 二阶段检索词未增强: 使用原问题")
     return str(question or "").strip()
 
 
@@ -280,6 +231,7 @@ def _build_stage2_rag_query(question: str, error_info: dict[str, Any]) -> str:
 # - 出参：`list[dict[str, Any]]`=按父文档去重后的文档列表（每个 parent 仅保留最高分 chunk）。
 # - 方法逻辑：以 payload.parent_id 为主键聚合并保留最高分子块，最终按分数降序输出。
 def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    _LOGGER.info("rag_retrieve 开始按 parent_id 去重: 输入 chunk=%d", len(rag_chunk_docs))
     parent_best: dict[str, dict[str, Any]] = {}
     for row in rag_chunk_docs:
         payload = dict(row.get("payload") or {})
@@ -307,13 +259,60 @@ def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]]) -> list[dict[s
 
     docs = list(parent_best.values())
     docs.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return docs[:_MAX_RAG_PARENT_DOCS]
+    result = docs[:_MAX_RAG_PARENT_DOCS]
+    _LOGGER.info("rag_retrieve parent 去重完成: 输出 parent=%d", len(result))
+    return result
+
+
+# 方法注释（业务）:
+# - 入参：`rag_docs`(list[dict[str, Any]])=按 parent_id 去重后的 RAG 文档。
+# - 出参：`list[dict[str, Any]]`=父文档完整内容列表（parent_id/path/content）。
+# - 方法逻辑：取 TopN parent_id 回查 rag_document 映射，读取本地文件全文并挂上检索分数透传下游。
+def _load_parent_documents(rag_docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rag_docs:
+        _LOGGER.info("rag_retrieve 跳过父文档回查: rag_docs 为空")
+        return []
+    db_store = _get_rag_doc_db_store()
+    if not db_store.enabled:
+        _LOGGER.info("rag_retrieve 跳过父文档回查: rag_document DB 未启用")
+        return []
+
+    top_n = _parent_doc_top_n()
+    _LOGGER.info("rag_retrieve 开始回查父文档: 候选=%d top_n=%d", len(rag_docs), top_n)
+    rows: list[dict[str, Any]] = []
+    for item in rag_docs[:top_n]:
+        parent_id = str(item.get("parent_id") or item.get("id") or "").strip()
+        if not parent_id:
+            continue
+        try:
+            mapping = db_store.get_rag_document(parent_id=parent_id)
+        except Exception as err:  # pragma: no cover - 外部依赖异常统一降级
+            _LOGGER.warning("rag_retrieve 父文档映射查询失败: parent_id=%s err=%s", parent_id, err)
+            continue
+
+        doc_path = str((mapping or {}).get("path") or "").strip()
+        if not doc_path:
+            continue
+        full_content = _read_local_doc(doc_path)
+        if not full_content:
+            continue
+        rows.append(
+            {
+                "parent_id": parent_id,
+                "path": doc_path,
+                "content": full_content,
+                "score": float(item.get("score") or 0.0),
+                "chunk_id": str(item.get("chunk_id") or ""),
+            }
+        )
+    _LOGGER.info("rag_retrieve 父文档回查完成: full_docs=%d", len(rows))
+    return rows
 
 
 # 方法注释（业务）:
 # - 入参：`payload`(dict[str, Any])=AgentState，至少包含 question/intent 等上下文字段。
-# - 出参：`dict[str, Any]`=写回 `rag_docs/rag_scores/route` 后的状态。
-# - 方法逻辑：先做 BM25 日志诊断并提取错误信息，再基于增强查询词做 RAG 检索，最后按 parent_id 去重输出。
+# - 出参：`dict[str, Any]`=写回 `rag_docs/rag_parent_docs/rag_scores/route` 后的状态。
+# - 方法逻辑：先做首轮 RAG 检索并提取错误信息，再基于增强查询词做二阶段 RAG 检索、按 parent_id 去重，并回查父文档全文透传。
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     """执行检索步骤。
 
@@ -321,57 +320,68 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - payload: AgentState，需包含 question。
 
     返参：
-    - AgentState: 写入 rag_docs/rag_scores，并路由到 planner。
+    - AgentState: 写入 rag_docs/rag_parent_docs/rag_scores，并路由到 planner。
     """
     state: AgentState = dict(payload)
     run_started = time.perf_counter()
     question = _pick_question(state)
     intent_zh = _pick_intent_zh(state)
+    _LOGGER.info(
+        "rag_retrieve 开始执行: chat_id=%s intent=%s question=%s",
+        str(state.get("chat_id") or ""),
+        intent_zh,
+        _clip_for_log(question),
+    )
 
-    # 分阶段计时：便于区分 BM25 诊断与 RAG 解决两个环节的耗时瓶颈。
-    bm25_started = time.perf_counter()
-    bm25_docs = _search_es_bm25(question, state)
-    bm25_cost_ms = (time.perf_counter() - bm25_started) * 1000
-    _LOGGER.info("rag_retrieve bm25 done: docs=%d cost_ms=%.2f", len(bm25_docs), bm25_cost_ms)
+    # 阶段1：直接走 RAG 首轮召回，不调用日志查询接口。
+    stage1_started = time.perf_counter()
+    stage1_chunk_docs = _search_qdrant_rag(question, intent_zh)
+    stage1_cost_ms = (time.perf_counter() - stage1_started) * 1000
+    _LOGGER.info("rag_retrieve 阶段1完成: chunk_docs=%d cost_ms=%.2f", len(stage1_chunk_docs), stage1_cost_ms)
 
     diagnose_started = time.perf_counter()
-    error_info = _extract_error_info(bm25_docs)
+    error_info = _extract_error_info(stage1_chunk_docs)
     rag_query = _build_stage2_rag_query(question, error_info)
     diagnose_cost_ms = (time.perf_counter() - diagnose_started) * 1000
     _LOGGER.info(
-        "rag_retrieve diagnose done: error_code=%s exception=%s cost_ms=%.2f",
+        "rag_retrieve 诊断阶段完成: error_code=%s exception=%s cost_ms=%.2f",
         str(error_info.get("error_code") or ""),
         str(error_info.get("exception") or ""),
         diagnose_cost_ms,
     )
 
+    # 阶段2：基于增强词再次召回；无结果时回退阶段1结果，保证有可用输出。
     rag_started = time.perf_counter()
-    rag_chunk_docs = _search_qdrant_rag(rag_query, intent_zh)
+    stage2_chunk_docs = _search_qdrant_rag(rag_query, intent_zh)
+    rag_chunk_docs = stage2_chunk_docs if stage2_chunk_docs else stage1_chunk_docs
     rag_docs = _dedup_rag_by_parent_id(rag_chunk_docs)
+    parent_docs = _load_parent_documents(rag_docs)
     rag_cost_ms = (time.perf_counter() - rag_started) * 1000
     _LOGGER.info(
-        "rag_retrieve qdrant done: chunk_docs=%d parent_docs=%d cost_ms=%.2f intent=%s",
+        "rag_retrieve Qdrant 阶段完成: chunk_docs=%d parent_docs=%d full_docs=%d cost_ms=%.2f intent=%s",
         len(rag_chunk_docs),
         len(rag_docs),
+        len(parent_docs),
         rag_cost_ms,
         intent_zh,
     )
 
     # 输出以“解决文档”为主；诊断阶段结果通过 structured_context 透传便于调试。
     state["rag_docs"] = rag_docs
+    state["rag_parent_docs"] = parent_docs
     state["rag_scores"] = [float(item.get("score") or 0.0) for item in rag_docs]
     state["route"] = "planner"
     state["structured_context"] = {
         **dict(state.get("structured_context") or {}),
         "rag_diagnosis": {
-            "bm25_top_logs": [str(item.get("text") or "") for item in bm25_docs[:_MAX_BM25_DIAGNOSE_DOCS]],
+            "stage1_top_docs": [str(item.get("text") or "") for item in stage1_chunk_docs[:_MAX_DIAGNOSE_DOCS]],
             "error_info": error_info,
             "rag_query": rag_query,
         },
     }
     total_cost_ms = (time.perf_counter() - run_started) * 1000
     _LOGGER.info(
-        "rag_retrieve completed: output_docs=%d total_cost_ms=%.2f question_len=%d",
+        "rag_retrieve 执行完成: output_docs=%d total_cost_ms=%.2f question_len=%d",
         len(rag_docs),
         total_cost_ms,
         len(question),

@@ -1,7 +1,7 @@
 """LangGraph 单主图构建器。
 
 业务目标：
-- 定义固定主链路：state_build -> intent -> rag -> planner -> tool -> merge -> analysis -> validate -> retry_router。
+- 定义固定主链路：state_build -> intent -> rag -> planner -> plan_execute -> analysis -> validate -> retry_router。
 - 在 retry_router 做条件分流，形成 Retry/Replan/Finish/Fallback 四类出口。
 - 保证图最终一定进入 END，避免无限循环。
 """
@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 from typing import Any
 
 from langchain_core.runnables import Runnable
@@ -16,18 +17,17 @@ from langgraph.graph import END, START, StateGraph
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from flow.modules.agent_executor_graph.graph.analysis_execute.analysis_execute import run as analysis_execute_run
-from flow.modules.agent_executor_graph.graph.evidence_merge.evidence_merge import run as evidence_merge_run
 from flow.modules.agent_executor_graph.graph.fixed_flow_execute.fixed_flow_execute import run as fixed_flow_execute_run
 from flow.modules.agent_executor_graph.graph.intent_decide.intent_decide import run as intent_decide_run
+from flow.modules.agent_executor_graph.graph.plan_execute.plan_execute import run as plan_execute_run
 from flow.modules.agent_executor_graph.graph.planner.planner import run as planner_run
 from flow.modules.agent_executor_graph.graph.rag_retrieve.rag_retrieve import run as rag_retrieve_run
 from flow.modules.agent_executor_graph.graph.result_validate.result_validate import run as result_validate_run
 from flow.modules.agent_executor_graph.graph.retry_router.retry_router import run as retry_router_run
 from flow.modules.agent_executor_graph.graph.state_build.state_build import run as state_build_run
-from flow.modules.agent_executor_graph.graph.tool_execute.tool_execute import run as tool_execute_run
-from flow.modules.agent_executor_graph.graph.tool_router.tool_router import run as tool_router_run
 
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
+_LOGGER = logging.getLogger(__name__)
 
 
 def _finish_node(payload: AgentState) -> AgentState:
@@ -99,7 +99,7 @@ def _route_after_retry_router(state: dict[str, Any]) -> str:
     仅允许白名单节点，非法值统一降级到 fallback，避免图跑飞。
     """
     route = str(state.get("route") or "fallback")
-    supported = {"tool_router", "tool_execute", "planner", "finish", "fallback"}
+    supported = {"plan_execute", "planner", "finish", "fallback"}
     if route in supported:
         return route
     return "fallback"
@@ -108,11 +108,16 @@ def _route_after_retry_router(state: dict[str, Any]) -> str:
 def _route_after_intent_decide(state: dict[str, Any]) -> str:
     route = str(state.get("route") or "rag_retrieve")
     if route == "intent_decide":
+        _LOGGER.info("build_graph 意图节点路由: 保持在 intent_decide 重试")
         return "intent_decide"
     if route == "fallback":
+        _LOGGER.info("build_graph 意图节点路由: 进入 fallback")
         return "fallback"
     if route == "fixed_flow_execute":
+        _LOGGER.info("build_graph 意图节点路由: 进入 fixed_flow_execute")
         return "fixed_flow_execute"
+    # 调用处说明：默认进入 rag_retrieve 节点，执行 RAG 检索链路。
+    _LOGGER.info("build_graph 意图节点路由: 进入 rag_retrieve")
     return "rag_retrieve"
 
 
@@ -131,9 +136,7 @@ def build_langgraph_graph() -> Runnable:
     graph.add_node("fixed_flow_execute", fixed_flow_execute_run)
     graph.add_node("rag_retrieve", rag_retrieve_run)
     graph.add_node("planner", planner_run)
-    graph.add_node("tool_router", tool_router_run)
-    graph.add_node("tool_execute", tool_execute_run)
-    graph.add_node("evidence_merge", evidence_merge_run)
+    graph.add_node("plan_execute", plan_execute_run)
     graph.add_node("analysis_execute", analysis_execute_run)
     graph.add_node("result_validate", result_validate_run)
     graph.add_node("retry_router", retry_router_run)
@@ -155,10 +158,8 @@ def build_langgraph_graph() -> Runnable:
     )
     graph.add_edge("fixed_flow_execute", "finish")
     graph.add_edge("rag_retrieve", "planner")
-    graph.add_edge("planner", "tool_router")
-    graph.add_edge("tool_router", "tool_execute")
-    graph.add_edge("tool_execute", "evidence_merge")
-    graph.add_edge("evidence_merge", "analysis_execute")
+    graph.add_edge("planner", "plan_execute")
+    graph.add_edge("plan_execute", "analysis_execute")
     graph.add_edge("analysis_execute", "result_validate")
     graph.add_edge("result_validate", "retry_router")
 
@@ -167,8 +168,7 @@ def build_langgraph_graph() -> Runnable:
         "retry_router",
         _route_after_retry_router,
         {
-            "tool_router": "tool_router",
-            "tool_execute": "tool_execute",
+            "plan_execute": "plan_execute",
             "planner": "planner",
             "finish": "finish",
             "fallback": "fallback",

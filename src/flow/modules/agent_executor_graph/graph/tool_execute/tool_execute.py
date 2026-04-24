@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
+from tool.code_tool import clone_repo, pull_repo
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -39,6 +40,17 @@ def _tool_failed(tool: str, error: str) -> dict[str, Any]:
         "error": error,
         "evidence": [],
     }
+
+
+def _extract_git_url(tool_params: dict[str, Any], structured_context: dict[str, Any]) -> str:
+    value = (
+        tool_params.get("git_url")
+        or tool_params.get("repo_url")
+        or structured_context.get("git_url")
+        or dict(structured_context.get("code_repo") or {}).get("git_url")
+        or ""
+    )
+    return str(value).strip()
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -84,6 +96,38 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         )
     elif tool_name == "knowledge_lookup":
         tool_result = _tool_success("knowledge_lookup", [f"知识库证据：{question[:64]}"])
+    elif tool_name == "code_clone":
+        git_url = _extract_git_url(tool_params, structured_context)
+        if not git_url:
+            tool_result = _tool_failed("code_clone", "missing git_url")
+        else:
+            result = clone_repo(git_url=git_url)
+            if bool(result.get("ok")):
+                tool_result = _tool_success(
+                    "code_clone",
+                    [
+                        f"clone success: {str(result.get('target_dir') or '')}",
+                        f"status={str(result.get('status') or '')}",
+                    ],
+                )
+            else:
+                tool_result = _tool_failed("code_clone", str(result.get("message") or "clone failed"))
+    elif tool_name == "code_pull":
+        git_url = _extract_git_url(tool_params, structured_context)
+        if not git_url:
+            tool_result = _tool_failed("code_pull", "missing git_url")
+        else:
+            result = pull_repo(git_url=git_url)
+            if bool(result.get("ok")):
+                tool_result = _tool_success(
+                    "code_pull",
+                    [
+                        f"pull success: {str(result.get('target_dir') or '')}",
+                        f"status={str(result.get('status') or '')}",
+                    ],
+                )
+            else:
+                tool_result = _tool_failed("code_pull", str(result.get("message") or "pull failed"))
     else:
         tool_result = _tool_success("none", [])
 

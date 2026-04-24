@@ -8,3 +8,5 @@ This directory stores LLM prompt templates.
 - `summary_user_prompt.txt`: user prompt template for memory summary.
 - `sensitive_operation_system_prompt.txt`: system prompt for sensitive operation check.
 - `sensitive_operation_user_prompt.txt`: user prompt template for sensitive operation check.
+- `planner_system_prompt.txt`: system prompt for planner node.
+- `planner_user_prompt.txt`: user prompt template for planner node.

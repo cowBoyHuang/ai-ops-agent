@@ -1,0 +1,17 @@
+请解析当前步骤执行结果，并输出严格 JSON 对象，必须包含这些字段：
+summary（字符串）：一句话总结本步结果
+extracted_keywords（字符串数组）：关键技术词
+structured_facts（对象）：结构化关键信息
+retry_current_step（布尔）：是否建议立刻重试当前步骤
+retry_params（对象）：重试时建议补充或覆盖的参数
+continue_execution（布尔）：若当前步骤失败，是否建议继续后续步骤
+next_step_guidance（字符串）：给下一步执行的提示
+
+【当前步骤】
+{step_json}
+
+【工具返回】
+{result_json}
+
+【最近步骤历史】
+{history_preview}
