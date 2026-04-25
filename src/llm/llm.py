@@ -24,6 +24,14 @@ _LLM_CLIENT: Any | None = None
 _LLM_INIT_DONE = False
 
 
+def _pick_env(*keys: str, default: str = "") -> str:
+    for key in keys:
+        value = str(os.getenv(key, "")).strip()
+        if value:
+            return value
+    return default
+
+
 def load_prompt(prompt_file: str, default: str = "") -> str:
     path = _PROMPTS_DIR / prompt_file
     if not path.exists():
@@ -127,13 +135,15 @@ def _build_llm_client() -> Any | None:
         _LLM_CLIENT = None
         return None
 
-    api_key = str(os.getenv("OPENAI_API_KEY", "")).strip()
+    # 兼容历史环境变量：优先 OPENAI_API_KEY，其次 LLM_API_KEY。
+    api_key = _pick_env("OPENAI_API_KEY", "LLM_API_KEY", default="")
     if not api_key:
         _LLM_CLIENT = None
         return None
 
-    model = str(os.getenv("AIOPS_LLM_MODEL", _DEFAULT_MODEL)).strip() or _DEFAULT_MODEL
-    base_url = str(os.getenv("AIOPS_LLM_BASE_URL", _DEFAULT_BASE_URL)).strip() or _DEFAULT_BASE_URL
+    # 兼容历史环境变量：AIOPS_* 与 LLM_* 两套命名。
+    model = _pick_env("AIOPS_LLM_MODEL", "LLM_MODEL", default=_DEFAULT_MODEL) or _DEFAULT_MODEL
+    base_url = _pick_env("AIOPS_LLM_BASE_URL", "LLM_BASE_URL", default=_DEFAULT_BASE_URL) or _DEFAULT_BASE_URL
 
     try:
         _LLM_CLIENT = ChatOpenAI(

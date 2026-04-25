@@ -2,13 +2,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class AnalyzeRequest(BaseModel):
-    query: str = Field(default="", description="User question text.")
-    chatId: str = Field(default="", description="Optional chat id from caller.")
-    userId: str = Field(default="", description="Optional user id from caller.")
+    question: str = Field(
+        default="",
+        description="User question text.",
+        validation_alias=AliasChoices("question", "query", "message", "content"),
+    )
+    chat_id: str = Field(
+        default="",
+        description="Optional chat id from caller.",
+        validation_alias=AliasChoices("chat_id", "chatId"),
+    )
+    user_id: str = Field(
+        default="",
+        description="Optional user id from caller.",
+        validation_alias=AliasChoices("user_id", "userId"),
+    )
     extra: dict[str, Any] = Field(default_factory=dict, description="Pass-through fields.")
 
 

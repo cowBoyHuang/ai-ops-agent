@@ -78,7 +78,6 @@ build_es_pull_log_request(
     content: str,
     type: str,
     max_lines: int = 200,
-    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]
 ```
 
@@ -119,9 +118,23 @@ adapt_raw_item_to_es_result(raw_item: Any) -> EsResult
 - `QueryType.MATCH = "match"`
 - `QueryType.MATCH_PHRASE = "match_phrase"`
 
+## appCode 与日志文件映射
+
+1. `appCode: f_tts_trade_order`
+- 系统说明: 生单系统，总调用入口，负责机票子单、营销子单、辅营子单的生单并调起各子单生单入口。
+- 业务日志: `ttsorder.log`
+- 异常日志: `ttsorder_error.log`
+
+2. `appCode: f_tts_trade_core`
+- 系统说明: 机票子单生单系统，负责创建机票子订单的实际实现。
+- 业务日志: `tts.log`
+- 异常日志: `tts_error.log`
+
 ## 调用建议
 
-1. 常规查询优先使用 `query_external_logs`。
-2. 需要自定义请求结构时，先 `build_es_pull_log_request`，再 `pull_log_by_condition`。
-3. 统一把返回结果适配为 `list[EsResult]` 再进入后续流程。
-
+1. 先确定业务查询所需的 `appCode`、`logname`。
+2. 确定 `appCode`、`logname` 后，根据实际订单号时间或 `traceId` 控制查询时间范围为前后一小时。
+   - 订单号示例（固定格式）: `xep260425153507039`，可解析为 `2026-04-25 15` 点，查询窗口取该时间前后一小时。
+   - `tradeId` 示例: `ops_slugger_260425.153507.10.95.136.249.868956.1362287667_1`，可解析为 `2026-04-25 15` 点，查询窗口取该时间前后一小时。
+3. 如果既没有可解析的订单号也没有可解析的 `tradeId`，查询时间需要结合上下文自行判断。
+4. 其他查询字段（如 `content`、`type`）结合实际场景自行判断。

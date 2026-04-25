@@ -60,4 +60,3 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state["pending_insertions"] = []
     state["route"] = "executor"
     return dict(state)
-
