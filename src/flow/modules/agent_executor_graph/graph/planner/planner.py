@@ -406,7 +406,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     - payload: AgentState，至少包含 question、intent_type、replan_count，并携带 rag_retrieve 结果。
 
     返参：
-    - AgentState: 写入 plan_steps/current_step_index，并路由到 plan_execute。
+    - AgentState: 写入 plan_steps/current_step_index，并路由到 executor。
     """
     state: AgentState = dict(payload)
     question = str(state.get("question") or "").strip()
@@ -430,8 +430,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         plan_steps = _fallback_plan_steps(intent_type=intent_type, replan_count=replan_count)
         _LOGGER.info("planner 使用规则兜底计划: steps=%d intent=%s replan=%d", len(plan_steps), intent_type, replan_count)
 
-    # 首次规划或 replan 都从第 0 步开始执行新计划。
-    if not state.get("plan_steps") or replan_count > 0:
+    previous_plan = list(state.get("current_plan") or state.get("plan_steps") or [])
+    if not previous_plan or replan_count > 0:
         state["current_step_index"] = 0
 
     structured_context = dict(state.get("structured_context") or {})
@@ -486,5 +486,13 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     state["plan_steps"] = plan_steps
-    state["route"] = "plan_execute"
+    state["current_plan"] = [dict(item) for item in plan_steps]
+    if not state.get("original_plan") or replan_count > 0:
+        state["original_plan"] = [dict(item) for item in plan_steps]
+    state["needs_adjustment"] = False
+    state["adjustment_type"] = ""
+    state["proposed_changes"] = {}
+    state["pending_insertions"] = []
+    state.setdefault("adjustment_history", [])
+    state["route"] = "executor"
     return dict(state)

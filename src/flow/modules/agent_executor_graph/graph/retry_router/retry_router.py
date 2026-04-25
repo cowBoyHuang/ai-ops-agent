@@ -1,7 +1,7 @@
 """重试/重规划路由节点。
 
 业务职责：
-- 根据 analysis_status 决定下一跳（plan_execute/planner/finish/fallback）。
+- 根据 analysis_status 决定下一跳（executor/planner/finish/fallback）。
 - 控制 retry_count、replan_count、tool_call_count 三类预算。
 - 保证预算耗尽时强制走 fallback，防止无限循环。
 """
@@ -41,7 +41,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     tool_call_count = _as_int(state.get("tool_call_count"), 0)
     max_tool_calls = max(1, _as_int(state.get("max_tool_calls"), 6))
     current_step_index = _as_int(state.get("current_step_index"), 0)
-    plan_steps = list(state.get("plan_steps") or [])
+    plan_steps = list(state.get("current_plan") or state.get("plan_steps") or [])
     has_more_plan_steps = current_step_index < len(plan_steps)
     tool_result = dict(state.get("tool_result") or {})
     tool_ok = bool(tool_result.get("ok", True))
@@ -60,10 +60,10 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     if analysis_status == "NEED_RETRY":
         if not tool_ok and retry_count < max_retry:
             state["retry_count"] = retry_count + 1
-            state["route"] = "plan_execute"
+            state["route"] = "executor"
             return dict(state)
         if has_more_plan_steps:
-            state["route"] = "plan_execute"
+            state["route"] = "executor"
             return dict(state)
         if replan_count < max_replan:
             state["replan_count"] = replan_count + 1
@@ -81,7 +81,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             state["route"] = "planner"
             return dict(state)
         if has_more_plan_steps:
-            state["route"] = "plan_execute"
+            state["route"] = "executor"
             return dict(state)
         state["route"] = "fallback"
         return dict(state)
@@ -92,7 +92,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         return dict(state)
     if not tool_ok and retry_count < max_retry:
         state["retry_count"] = retry_count + 1
-        state["route"] = "plan_execute"
+        state["route"] = "executor"
         return dict(state)
     if replan_count < max_replan:
         state["replan_count"] = replan_count + 1

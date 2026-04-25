@@ -1,7 +1,7 @@
 """LangGraph 单主图构建器。
 
 业务目标：
-- 定义固定主链路：state_build -> intent -> rag -> planner -> plan_execute -> analysis -> validate -> retry_router。
+- 定义 Plan+React 主链路：state_build -> intent -> rag -> planner -> executor -> observer -> (reactor|planner|executor|analysis)。
 - 在 retry_router 做条件分流，形成 Retry/Replan/Finish/Fallback 四类出口。
 - 保证图最终一定进入 END，避免无限循环。
 """
@@ -17,11 +17,13 @@ from langgraph.graph import END, START, StateGraph
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from flow.modules.agent_executor_graph.graph.analysis_execute.analysis_execute import run as analysis_execute_run
+from flow.modules.agent_executor_graph.graph.executor.executor import run as executor_run
 from flow.modules.agent_executor_graph.graph.fixed_flow_execute.fixed_flow_execute import run as fixed_flow_execute_run
 from flow.modules.agent_executor_graph.graph.intent_decide.intent_decide import run as intent_decide_run
-from flow.modules.agent_executor_graph.graph.plan_execute.plan_execute import run as plan_execute_run
+from flow.modules.agent_executor_graph.graph.observer.observer import run as observer_run
 from flow.modules.agent_executor_graph.graph.planner.planner import run as planner_run
 from flow.modules.agent_executor_graph.graph.rag_retrieve.rag_retrieve import run as rag_retrieve_run
+from flow.modules.agent_executor_graph.graph.reactor.reactor import run as reactor_run
 from flow.modules.agent_executor_graph.graph.result_validate.result_validate import run as result_validate_run
 from flow.modules.agent_executor_graph.graph.retry_router.retry_router import run as retry_router_run
 from flow.modules.agent_executor_graph.graph.state_build.state_build import run as state_build_run
@@ -99,7 +101,15 @@ def _route_after_retry_router(state: dict[str, Any]) -> str:
     仅允许白名单节点，非法值统一降级到 fallback，避免图跑飞。
     """
     route = str(state.get("route") or "fallback")
-    supported = {"plan_execute", "planner", "finish", "fallback"}
+    supported = {"executor", "planner", "finish", "fallback"}
+    if route in supported:
+        return route
+    return "fallback"
+
+
+def _route_after_observer(state: dict[str, Any]) -> str:
+    route = str(state.get("route") or "analysis_execute")
+    supported = {"executor", "reactor", "planner", "analysis_execute", "fallback"}
     if route in supported:
         return route
     return "fallback"
@@ -136,7 +146,9 @@ def build_langgraph_graph() -> Runnable:
     graph.add_node("fixed_flow_execute", fixed_flow_execute_run)
     graph.add_node("rag_retrieve", rag_retrieve_run)
     graph.add_node("planner", planner_run)
-    graph.add_node("plan_execute", plan_execute_run)
+    graph.add_node("executor", executor_run)
+    graph.add_node("observer", observer_run)
+    graph.add_node("reactor", reactor_run)
     graph.add_node("analysis_execute", analysis_execute_run)
     graph.add_node("result_validate", result_validate_run)
     graph.add_node("retry_router", retry_router_run)
@@ -158,8 +170,20 @@ def build_langgraph_graph() -> Runnable:
     )
     graph.add_edge("fixed_flow_execute", "finish")
     graph.add_edge("rag_retrieve", "planner")
-    graph.add_edge("planner", "plan_execute")
-    graph.add_edge("plan_execute", "analysis_execute")
+    graph.add_edge("planner", "executor")
+    graph.add_edge("executor", "observer")
+    graph.add_conditional_edges(
+        "observer",
+        _route_after_observer,
+        {
+            "executor": "executor",
+            "reactor": "reactor",
+            "planner": "planner",
+            "analysis_execute": "analysis_execute",
+            "fallback": "fallback",
+        },
+    )
+    graph.add_edge("reactor", "executor")
     graph.add_edge("analysis_execute", "result_validate")
     graph.add_edge("result_validate", "retry_router")
 
@@ -168,7 +192,7 @@ def build_langgraph_graph() -> Runnable:
         "retry_router",
         _route_after_retry_router,
         {
-            "plan_execute": "plan_execute",
+            "executor": "executor",
             "planner": "planner",
             "finish": "finish",
             "fallback": "fallback",

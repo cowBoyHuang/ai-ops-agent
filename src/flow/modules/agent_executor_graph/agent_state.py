@@ -32,9 +32,17 @@ class AgentState(TypedDict, total=False):
     # ==============================
     current_plan_id: int
     plan_steps: List[PlanStep]
+    current_plan: List[PlanStep]
+    original_plan: List[PlanStep]
     status: str
     route: str
     current_step_index: int
+    needs_adjustment: bool
+    adjustment_type: str
+    proposed_changes: Dict[str, Any]
+    pending_insertions: List[PlanStep]
+    adjustment_history: List[Dict[str, Any]]
+    adjustment_applied: Dict[str, Any]
 
     # ==============================
     # 3. 工具调用历史（按轮次组织）
@@ -52,6 +60,8 @@ class AgentState(TypedDict, total=False):
     merged_evidence: Dict[str, Any]
     evidence: Dict[str, Any]
     execution_history: Dict[str, Any]
+    current_step_result: Dict[str, Any]
+    newly_discovered_clues: List[str]
     intermediate_results: Dict[str, Any]
     extracted_keywords: List[str]
     analysis: Any
