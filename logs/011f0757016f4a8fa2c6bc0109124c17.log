@@ -1,0 +1,2 @@
+2026-04-26 00:18:02 INFO [011f0757016f4a8fa2c6bc0109124c17] [aiops.request] request.start method=POST path=/api/v1/analyze query= body={"question":"日志文件校验","chat_id":"chat_log_test","user_id":"u_log_test"}
+2026-04-26 00:18:02 INFO [011f0757016f4a8fa2c6bc0109124c17] [aiops.request] request.end method=POST path=/api/v1/analyze status=200 duration_ms=1.08
