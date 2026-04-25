@@ -488,7 +488,8 @@ def query_external_logs(
     if final_begin is None or final_end is None:
         raise ValueError("begin_time/end_time are required")
 
-    return search_logs(
+    _LOGGER.info("log.query_external_logs.start app_code=%s logname=%s", final_app_code, str(logname or ""))
+    rows = search_logs(
         app_code=final_app_code,
         logname=logname,
         begin_time=final_begin,
@@ -497,6 +498,8 @@ def query_external_logs(
         type=type,
         config=config,
     )
+    _LOGGER.info("log.query_external_logs.end app_code=%s hit_count=%d", final_app_code, len(rows))
+    return rows
 
 
 def search_logs(

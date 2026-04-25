@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from llm.llm import chat_with_llm
 
+_LOG = logging.getLogger(__name__)
 _RETRYABLE_TOKENS = ("timeout", "network", "connection", "temporarily", "503", "429")
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
@@ -237,6 +239,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
     current_plan = list(state.get("current_plan") or state.get("plan_steps") or [])
     current_step_index = _as_int(state.get("current_step_index"), 0)
+    _LOG.info("observer.run step_index=%d plan_len=%d", current_step_index, len(current_plan))
     execution_history = dict(state.get("execution_history") or {})
     current_step_result = dict(state.get("current_step_result") or {})
     raw_result = dict(current_step_result.get("raw_result") or {})

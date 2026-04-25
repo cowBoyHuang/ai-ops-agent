@@ -44,6 +44,11 @@ def configure_runtime_logging() -> Path:
     return path
 
 
+def get_request_id() -> str:
+    """当前上下文中的 request_id；未绑定时为占位符。"""
+    return _REQUEST_ID_CTX.get("-")
+
+
 def bind_request_id(request_id: str) -> Token[str]:
     return _REQUEST_ID_CTX.set(str(request_id or "-"))
 
@@ -63,7 +68,9 @@ class _RequestIdFilter(logging.Filter):
 
 def build_request_file_handler(request_id: str) -> logging.FileHandler:
     rid = str(request_id or "-")
-    path = logs_dir() / f"{rid}.log"
+    req_dir = logs_dir() / rid
+    req_dir.mkdir(parents=True, exist_ok=True)
+    path = req_dir / "request.log"
     formatter = logging.Formatter(
         fmt="%(asctime)s %(levelname)s [%(request_id)s] [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",

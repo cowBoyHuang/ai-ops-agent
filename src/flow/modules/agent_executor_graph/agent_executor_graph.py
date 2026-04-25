@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from langgraph.errors import GraphRecursionError
 
 from flow.modules.agent_executor_graph.build_langgraph_graph import build_langgraph_graph
 
+_LOG = logging.getLogger(__name__)
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
 _MIN_RECURSION_LIMIT = 64
 _MAX_RECURSION_LIMIT = 240
@@ -48,9 +50,13 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     context["context"] = dict(payload)
     chain = build_langgraph_graph()
     recursion_limit = _compute_recursion_limit(context)
+    _LOG.info("agent_graph.invoke.start recursion_limit=%s", recursion_limit)
     try:
-        return chain.invoke(context, config={"recursion_limit": recursion_limit})
+        out = chain.invoke(context, config={"recursion_limit": recursion_limit})
+        _LOG.info("agent_graph.invoke.end route=%s", str((out or {}).get("route") or ""))
+        return out
     except GraphRecursionError as exc:
+        _LOG.warning("agent_graph.invoke.recursion_limit: %s", exc)
         analysis = dict(context.get("analysis") or {})
         chat_id = str(context.get("chat_id") or "")
         return {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 from langchain_core.runnables import Runnable, RunnableLambda
@@ -13,6 +14,8 @@ from flow.modules.error_handle.error_handle import run as error_handle_run
 from flow.modules.input_validate.input_validate import run as input_validate_run
 from flow.modules.memory.memory import run as memory_run
 from flow.modules.response_emit.response_emit import run as response_emit_run
+
+_MOD_LOG = logging.getLogger("aiops.flow.module")
 
 
 def _validate_module_result(module_name: str, before: dict[str, Any], after: Any) -> dict[str, Any]:
@@ -35,10 +38,13 @@ def _module_node(module_name: str, fn: Callable[[dict[str, Any]], dict[str, Any]
         incoming = dict(payload)
         # 全局停止规则：status=finished 时不再处理后续节点。
         if str(incoming.get("status") or "").lower() == "finished":
+            _MOD_LOG.info("module.skip name=%s reason=status_finished", module_name)
             return incoming
 
+        _MOD_LOG.info("module.enter name=%s", module_name)
         result = fn(incoming)
         context = _validate_module_result(module_name, incoming, result)
+        _MOD_LOG.info("module.exit name=%s status=%s", module_name, str(context.get("status") or ""))
         return context
 
     return _wrapped

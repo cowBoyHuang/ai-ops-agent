@@ -187,6 +187,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
     current_plan = list(state.get("current_plan") or state.get("plan_steps") or [])
     current_step_index = _as_int(state.get("current_step_index"), 0)
+    _LOGGER.info("executor.run step_index=%d plan_len=%d", current_step_index, len(current_plan))
     execution_history = dict(state.get("execution_history") or {})
     intermediate_results = dict(state.get("intermediate_results") or {})
     extracted_keywords = {str(item).strip() for item in list(state.get("extracted_keywords") or []) if str(item).strip()}

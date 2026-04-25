@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 
+_LOG = logging.getLogger(__name__)
 _MAX_INSERTIONS_PER_REACT = 3
 
 
@@ -20,6 +22,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
     current_plan = [dict(item) for item in list(state.get("current_plan") or state.get("plan_steps") or [])]
     current_step_index = _as_int(state.get("current_step_index"), 0)
+    _LOG.info("reactor.run step_index=%d plan_len=%d", current_step_index, len(current_plan))
     needs_adjustment = bool(state.get("needs_adjustment"))
     adjustment_type = str(state.get("adjustment_type") or "")
     pending_insertions = [dict(item) for item in list(state.get("pending_insertions") or [])[:_MAX_INSERTIONS_PER_REACT]]

@@ -19,49 +19,51 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def request_logging_middleware(request: Request, call_next):
-        request_id = uuid.uuid4().hex
-        token = bind_request_id(request_id)
-        root_logger = logging.getLogger()
-        request_handler = build_request_file_handler(request_id)
-        root_logger.addHandler(request_handler)
-
-        start = time.monotonic()
-        method = request.method.upper()
         path = request.url.path
-        query = str(request.url.query or "")
-        body_preview = ""
-        if method == "POST" and path == "/api/v1/analyze":
+        method = request.method.upper()
+        if path == "/api/v1/analyze" and method == "POST":
+            request_id = uuid.uuid4().hex
+            token = bind_request_id(request_id)
+            root_logger = logging.getLogger()
+            request_handler = build_request_file_handler(request_id)
+            root_logger.addHandler(request_handler)
+
+            start = time.monotonic()
+            query = str(request.url.query or "")
+            body_preview = ""
             try:
                 raw = (await request.body()).decode("utf-8", errors="ignore")
                 body_preview = raw[:1000]
             except Exception:  # noqa: BLE001
                 body_preview = "<failed to read body>"
-        _REQUEST_LOGGER.info("request.start method=%s path=%s query=%s body=%s", method, path, query, body_preview)
-        try:
-            response = await call_next(request)
-            elapsed_ms = (time.monotonic() - start) * 1000
-            _REQUEST_LOGGER.info(
-                "request.end method=%s path=%s status=%s duration_ms=%.2f",
-                method,
-                path,
-                response.status_code,
-                elapsed_ms,
-            )
-            response.headers["X-Request-Id"] = request_id
-            return response
-        except Exception:  # noqa: BLE001
-            elapsed_ms = (time.monotonic() - start) * 1000
-            _REQUEST_LOGGER.exception(
-                "request.error method=%s path=%s duration_ms=%.2f",
-                method,
-                path,
-                elapsed_ms,
-            )
-            raise
-        finally:
-            root_logger.removeHandler(request_handler)
-            request_handler.close()
-            reset_request_id(token)
+            _REQUEST_LOGGER.info("request.start method=%s path=%s query=%s body=%s", method, path, query, body_preview)
+            try:
+                response = await call_next(request)
+                elapsed_ms = (time.monotonic() - start) * 1000
+                _REQUEST_LOGGER.info(
+                    "request.end method=%s path=%s status=%s duration_ms=%.2f",
+                    method,
+                    path,
+                    response.status_code,
+                    elapsed_ms,
+                )
+                response.headers["X-Request-Id"] = request_id
+                return response
+            except Exception:  # noqa: BLE001
+                elapsed_ms = (time.monotonic() - start) * 1000
+                _REQUEST_LOGGER.exception(
+                    "request.error method=%s path=%s duration_ms=%.2f",
+                    method,
+                    path,
+                    elapsed_ms,
+                )
+                raise
+            finally:
+                root_logger.removeHandler(request_handler)
+                request_handler.close()
+                reset_request_id(token)
+
+        return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -140,7 +142,7 @@ def create_app() -> FastAPI:
     <main class="wrap">
       <section class="card">
         <h1>问题调试</h1>
-        <p style="margin:0 0 10px;color:#52637a;">请求日志目录：__LOGS_DIR__（单次请求一个日志文件）</p>
+        <p style="margin:0 0 10px;color:#52637a;">请求日志根目录：__LOGS_DIR__（单次请求子目录内 request.log）</p>
         <div class="field">
           <label for="chat_id">chat_id</label>
           <input id="chat_id" placeholder="例如: chat_123" />

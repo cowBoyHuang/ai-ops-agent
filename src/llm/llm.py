@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ _INTENT_LABELS = ("系统逻辑咨询", "线上问题咨询", "订单信息查�
 
 _LLM_CLIENT: Any | None = None
 _LLM_INIT_DONE = False
+_LLM_LOG = logging.getLogger("aiops.llm")
 
 
 def _pick_env(*keys: str, default: str = "") -> str:
@@ -160,14 +162,20 @@ def _build_llm_client() -> Any | None:
 def _invoke_llm(system_prompt: str, user_prompt: str) -> str:
     llm = _build_llm_client()
     if llm is None:
+        _LLM_LOG.warning("llm.invoke.skip reason=no_client")
         return ""
+    u_len, s_len = len(str(user_prompt or "")), len(str(system_prompt or ""))
+    _LLM_LOG.info("llm.invoke.start user_chars=%d system_chars=%d", u_len, s_len)
     try:
         if system_prompt.strip():
             result = llm.invoke([("system", system_prompt), ("user", user_prompt)])
         else:
             result = llm.invoke(user_prompt)
-        return _coerce_text(getattr(result, "content", result)).strip()
+        out = _coerce_text(getattr(result, "content", result)).strip()
+        _LLM_LOG.info("llm.invoke.end out_chars=%d", len(out))
+        return out
     except Exception:  # noqa: BLE001
+        _LLM_LOG.exception("llm.invoke.error")
         return ""
 
 
