@@ -18,13 +18,17 @@ from flow.modules.agent_executor_graph.plan_step import PlanStep
 from llm.llm import chat_with_llm, load_prompt, render_prompt
 
 _LOGGER = logging.getLogger(__name__)
-_MAX_LOG_DOCS_FOR_PROMPT = 3
 _MAX_RAG_DOCS_FOR_PROMPT = 5
-_MAX_LOG_TEXT_LEN = 200
 _MAX_RAG_TEXT_LEN = 300
 _MAX_QUERY_LEN = 500
 _MAX_PLAN_STEPS = 6
+_MAX_HISTORY_ROWS = 10
+_MAX_HISTORY_TEXT_LEN = 1200
+_MAX_FULL_DOCS_FOR_PROMPT = 5
+_MAX_FULL_DOC_TEXT_LEN = 1500
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
+_LOG_QUERY_TOOLS = {"log_query", "dependency_log_query"}
+_LOG_KEYWORD_PARAM_KEYS = ("keywords", "keyword", "query", "content")
 _SKILLS_DIR = Path(__file__).resolve().parents[5] / "skills"
 _MAX_SKILL_TEXT_LEN = 1200
 _MAX_SKILL_TOTAL_LEN = 12000
@@ -149,33 +153,40 @@ def _pick_user_query(state: dict[str, Any]) -> str:
     return str(state.get("question") or "").strip()
 
 
-def _normalize_bm25_log_docs(rag_diagnosis: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = list(rag_diagnosis.get("bm25_log_docs") or [])
-    result: list[dict[str, Any]] = []
-    for item in rows[:_MAX_LOG_DOCS_FOR_PROMPT]:
+def _prepare_history_dialogues(state: dict[str, Any]) -> str:
+    rows: list[str] = []
+    for item in list(state.get("conversation_context") or [])[:_MAX_HISTORY_ROWS]:
+        text = str(item or "").strip()
+        if text:
+            rows.append(text)
+    if not rows:
+        structured_context = dict(state.get("structured_context") or {})
+        for item in list(structured_context.get("recent_messages") or [])[:_MAX_HISTORY_ROWS]:
+            text = str(item or "").strip()
+            if text:
+                rows.append(text)
+    merged = "\n".join(rows).strip()
+    return _clip_text(merged, _MAX_HISTORY_TEXT_LEN) or "无历史对话信息"
+
+
+def _prepare_full_docs_content(parent_docs: list[dict[str, Any]]) -> str:
+    sections: list[str] = []
+    for idx, item in enumerate(parent_docs[:_MAX_FULL_DOCS_FOR_PROMPT], start=1):
         if not isinstance(item, dict):
             continue
-        text = _clip_text(item.get("text"), _MAX_LOG_TEXT_LEN)
-        if not text:
+        path = str(item.get("path") or "").strip()
+        parent_id = str(item.get("parent_id") or "").strip()
+        score = _to_float(item.get("score"), 0.0)
+        content = _clip_text(item.get("content"), _MAX_FULL_DOC_TEXT_LEN)
+        if not content:
             continue
-        result.append(
-            {
-                "path": str(item.get("path") or ""),
-                "text": text,
-                "score": _to_float(item.get("score"), 0.0),
-            }
+        sections.append(
+            (
+                f"[完整文档{idx}] parent_id={parent_id or 'N/A'} "
+                f"path={path or 'N/A'} score={score:.4f}\n{content}"
+            ).strip()
         )
-
-    # 兼容 rag_retrieve 当前输出结构：bm25_top_logs / stage1_top_docs（字符串列表）。
-    if result:
-        return result
-    top_logs = list(rag_diagnosis.get("bm25_top_logs") or rag_diagnosis.get("stage1_top_docs") or [])
-    for item in top_logs[:_MAX_LOG_DOCS_FOR_PROMPT]:
-        text = _clip_text(item, _MAX_LOG_TEXT_LEN)
-        if not text:
-            continue
-        result.append({"path": "", "text": text, "score": 0.0})
-    return result
+    return "\n\n".join(sections).strip() or "无完整文档内容"
 
 
 # 方法注释（业务）:
@@ -184,27 +195,12 @@ def _normalize_bm25_log_docs(rag_diagnosis: dict[str, Any]) -> list[dict[str, An
 # - 方法逻辑：从 structured_context 与顶层字段提取并裁剪检索结果，按优先级组织成低 token 成本摘要。
 def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]) -> dict[str, Any]:
     structured_context = dict(state.get("structured_context") or {})
-    rag_diagnosis = dict(structured_context.get("rag_diagnosis") or {})
     user_query = _clip_text(_pick_user_query(state), _MAX_QUERY_LEN)
     if not user_query:
         user_query = _clip_text(state.get("question"), _MAX_QUERY_LEN)
 
-    bm25_docs = _normalize_bm25_log_docs(rag_diagnosis)
-    error_info = dict(rag_diagnosis.get("error_info") or {})
-    error_code = str(error_info.get("error_code") or rag_diagnosis.get("error_code") or "").strip()
-    exception_type = str(error_info.get("exception") or rag_diagnosis.get("exception_type") or "").strip()
-    rag_query = str(rag_diagnosis.get("rag_query") or "").strip()
-
-    log_rows: list[str] = []
-    if error_code or exception_type:
-        log_rows.append(f"错误摘要: error_code={error_code or 'N/A'}, exception={exception_type or 'N/A'}")
-    if rag_query:
-        log_rows.append(f"增强检索词: {rag_query}")
-    for idx, item in enumerate(bm25_docs, start=1):
-        log_rows.append(
-            f"[日志{idx}] path={item['path'] or 'N/A'} score={item['score']:.4f} text={item['text']}"
-        )
-    log_diagnosis_summary = "\n".join(log_rows).strip() or "无日志诊断信息"
+    # 仅保留核心 RAG 文档链路，不再处理 legacy 的 error_info/bm25 诊断摘要。
+    log_diagnosis_summary = "无额外日志诊断信息"
 
     rag_docs = list(structured_context.get("rag_docs") or state.get("rag_docs") or [])
     rag_rows: list[str] = []
@@ -222,6 +218,8 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
     rag_solutions_summary = "\n".join(rag_rows).strip() or "无 RAG 文档摘要"
 
     parent_docs = list(structured_context.get("rag_parent_docs") or state.get("rag_parent_docs") or [])
+    history_dialogues = _prepare_history_dialogues(state)
+    full_docs_content = _prepare_full_docs_content(parent_docs)
     ref_rows: list[str] = []
     for idx, item in enumerate(parent_docs, start=1):
         if not isinstance(item, dict):
@@ -240,12 +238,11 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
         "log_diagnosis_summary": log_diagnosis_summary,
         "rag_solutions_summary": rag_solutions_summary,
         "full_docs_references": full_docs_references,
+        "history_dialogues": history_dialogues,
+        "full_docs_content": full_docs_content,
         "skills_context": skills_context,
         "skills_count": len(skills),
         "skills_catalog": [str(item.get("path") or "") for item in skills],
-        "error_code": error_code,
-        "exception_type": exception_type,
-        "rag_query": rag_query,
     }
 
 
@@ -253,10 +250,12 @@ def _build_planner_user_prompt(context: dict[str, Any]) -> str:
     return render_prompt(
         "planner_user_prompt.txt",
         user_query=str(context.get("user_query") or ""),
+        history_dialogues=str(context.get("history_dialogues") or ""),
         skills_context=str(context.get("skills_context") or ""),
         log_diagnosis_summary=str(context.get("log_diagnosis_summary") or ""),
         rag_solutions_summary=str(context.get("rag_solutions_summary") or ""),
         full_docs_references=str(context.get("full_docs_references") or ""),
+        full_docs_content=str(context.get("full_docs_content") or ""),
     )
 
 
@@ -308,6 +307,30 @@ def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
     return result
 
 
+def _has_non_empty_log_keywords(params: dict[str, Any]) -> bool:
+    for key in _LOG_KEYWORD_PARAM_KEYS:
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, list):
+            if any(isinstance(item, str) and item.strip() for item in value):
+                return True
+    return False
+
+
+def _validate_plan_steps_strict(plan_steps: list[PlanStep]) -> tuple[bool, str]:
+    for idx, step in enumerate(plan_steps, start=1):
+        if str(step.get("action_type")) != "tool_call":
+            continue
+        tool_name = str(step.get("tool_name") or "")
+        if tool_name not in _LOG_QUERY_TOOLS:
+            continue
+        params = dict(step.get("params") or {})
+        if not _has_non_empty_log_keywords(params):
+            return False, f"step#{idx} {tool_name} missing log keywords in params"
+    return True, ""
+
+
 def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
     if replan_count > 0:
         return [
@@ -338,19 +361,40 @@ def _plan_with_llm(context: dict[str, Any]) -> tuple[list[PlanStep], dict[str, A
     user_prompt = _build_planner_user_prompt(context)
     if not user_prompt:
         _LOGGER.warning("planner prompt 缺失: planner_user_prompt.txt")
-        return [], {"raw_output": "", "parse_ok": False}
+        return [], {"raw_output": "", "parse_ok": False, "system_prompt": system_prompt, "user_prompt": user_prompt}
     raw_output = chat_with_llm(question=user_prompt, system_prompt=system_prompt)
     parsed = _parse_json_object(raw_output)
     if not parsed:
-        return [], {"raw_output": raw_output, "parse_ok": False}
+        return [], {
+            "raw_output": raw_output,
+            "parse_ok": False,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "parsed_output": {},
+        }
     steps = _normalize_plan_steps(parsed.get("plan_steps"))
+    strict_ok, strict_reason = _validate_plan_steps_strict(steps)
+    if not strict_ok:
+        _LOGGER.warning("planner LLM 计划强校验失败: %s", strict_reason)
+        return [], {
+            "raw_output": raw_output,
+            "parse_ok": False,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "parsed_output": parsed,
+            "validation_error": strict_reason,
+        }
     plan_meta = {
         "raw_output": raw_output,
         "parse_ok": True,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "parsed_output": parsed,
         "problem_analysis": str(parsed.get("problem_analysis") or "").strip(),
         "solution_steps": list(parsed.get("solution_steps") or []),
         "validation": str(parsed.get("validation") or "").strip(),
         "references": list(parsed.get("references") or []),
+        "validation_error": "",
     }
     return steps, plan_meta
 
@@ -391,6 +435,21 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         state["current_step_index"] = 0
 
     structured_context = dict(state.get("structured_context") or {})
+    llm_request = {
+        "system_prompt": str(llm_plan_meta.get("system_prompt") or ""),
+        "user_prompt": str(llm_plan_meta.get("user_prompt") or ""),
+        "request_context": context_for_llm,
+    }
+    llm_response = {
+        "raw_output": str(llm_plan_meta.get("raw_output") or ""),
+        "parsed_output": dict(llm_plan_meta.get("parsed_output") or {}),
+        "parse_ok": bool(llm_plan_meta.get("parse_ok")),
+        "validation_error": str(llm_plan_meta.get("validation_error") or ""),
+    }
+    program_plan = {
+        "plan_steps": plan_steps,
+        "plan_source": "llm" if llm_plan_steps else "fallback",
+    }
     state["structured_context"] = {
         **structured_context,
         "user_query": str(context_for_llm.get("user_query") or ""),
@@ -409,7 +468,15 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             "references": list(llm_plan_meta.get("references") or []),
             "parse_ok": bool(llm_plan_meta.get("parse_ok")),
         },
+        "planner_llm_trace": {
+            "llm_request": llm_request,
+            "llm_response": llm_response,
+            "program_plan": program_plan,
+        },
     }
+    _LOGGER.info("planner llm_request=%s", json.dumps(llm_request, ensure_ascii=False))
+    _LOGGER.info("planner llm_response=%s", json.dumps(llm_response, ensure_ascii=False))
+    _LOGGER.info("planner program_plan=%s", json.dumps(program_plan, ensure_ascii=False))
     _LOGGER.info(
         "planner 上下文摘要: skills=%d rag_docs=%d rag_parent_docs=%d parse_ok=%s",
         _as_int(context_for_llm.get("skills_count"), 0),

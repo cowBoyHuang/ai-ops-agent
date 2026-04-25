@@ -312,7 +312,7 @@ def _load_parent_documents(rag_docs: list[dict[str, Any]]) -> list[dict[str, Any
 # 方法注释（业务）:
 # - 入参：`payload`(dict[str, Any])=AgentState，至少包含 question/intent 等上下文字段。
 # - 出参：`dict[str, Any]`=写回 `rag_docs/rag_parent_docs/rag_scores/route` 后的状态。
-# - 方法逻辑：先做首轮 RAG 检索并提取错误信息，再基于增强查询词做二阶段 RAG 检索、按 parent_id 去重，并回查父文档全文透传。
+# - 方法逻辑：执行单阶段 RAG 检索并按 parent_id 去重，然后回查父文档全文透传下游。
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     """执行检索步骤。
 
@@ -333,27 +333,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         _clip_for_log(question),
     )
 
-    # 阶段1：直接走 RAG 首轮召回，不调用日志查询接口。
-    stage1_started = time.perf_counter()
-    stage1_chunk_docs = _search_qdrant_rag(question, intent_zh)
-    stage1_cost_ms = (time.perf_counter() - stage1_started) * 1000
-    _LOGGER.info("rag_retrieve 阶段1完成: chunk_docs=%d cost_ms=%.2f", len(stage1_chunk_docs), stage1_cost_ms)
-
-    diagnose_started = time.perf_counter()
-    error_info = _extract_error_info(stage1_chunk_docs)
-    rag_query = _build_stage2_rag_query(question, error_info)
-    diagnose_cost_ms = (time.perf_counter() - diagnose_started) * 1000
-    _LOGGER.info(
-        "rag_retrieve 诊断阶段完成: error_code=%s exception=%s cost_ms=%.2f",
-        str(error_info.get("error_code") or ""),
-        str(error_info.get("exception") or ""),
-        diagnose_cost_ms,
-    )
-
-    # 阶段2：基于增强词再次召回；无结果时回退阶段1结果，保证有可用输出。
+    # 单阶段：仅做文档检索，不做错误码/异常提取与二阶段增强查询。
     rag_started = time.perf_counter()
-    stage2_chunk_docs = _search_qdrant_rag(rag_query, intent_zh)
-    rag_chunk_docs = stage2_chunk_docs if stage2_chunk_docs else stage1_chunk_docs
+    rag_chunk_docs = _search_qdrant_rag(question, intent_zh)
     rag_docs = _dedup_rag_by_parent_id(rag_chunk_docs)
     parent_docs = _load_parent_documents(rag_docs)
     rag_cost_ms = (time.perf_counter() - rag_started) * 1000
@@ -366,19 +348,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         intent_zh,
     )
 
-    # 输出以“解决文档”为主；诊断阶段结果通过 structured_context 透传便于调试。
+    # 输出以“完整文档召回”为主，不注入额外诊断提取信息。
     state["rag_docs"] = rag_docs
     state["rag_parent_docs"] = parent_docs
     state["rag_scores"] = [float(item.get("score") or 0.0) for item in rag_docs]
     state["route"] = "planner"
-    state["structured_context"] = {
-        **dict(state.get("structured_context") or {}),
-        "rag_diagnosis": {
-            "stage1_top_docs": [str(item.get("text") or "") for item in stage1_chunk_docs[:_MAX_DIAGNOSE_DOCS]],
-            "error_info": error_info,
-            "rag_query": rag_query,
-        },
-    }
     total_cost_ms = (time.perf_counter() - run_started) * 1000
     _LOGGER.info(
         "rag_retrieve 执行完成: output_docs=%d total_cost_ms=%.2f question_len=%d",

@@ -8,8 +8,8 @@
   "validation": "验证方法（中文）",
   "references": ["参考文档路径或名称"],
   "plan_steps": [
-    {"action_type": "tool_call", "tool_name": "log_query", "params": {}},
-    {"action_type": "tool_call", "tool_name": "dependency_log_query", "params": {}},
+    {"action_type": "tool_call", "tool_name": "log_query", "params": {"keywords": ["关键词1", "关键词2"]}},
+    {"action_type": "tool_call", "tool_name": "dependency_log_query", "params": {"keywords": ["关键词A"]}},
     {"action_type": "merge_evidence", "tool_name": null, "params": {}}
   ]
 }
@@ -21,3 +21,4 @@
 4. 如果证据不足，优先先查日志再查知识库。
 5. plan_steps 必须与技能定义中的能力边界一致，不能输出技能未覆盖的工具调用。
 6. 当用户需求涉及拉取或更新代码时，优先在 plan_steps 中使用 code_clone 或 code_pull，并在 params 中传入 git_url。
+7. 对于 `log_query` 或 `dependency_log_query`，`params` 中必须包含可用于日志查询的关键词（推荐字段 `keywords`，也可用 keyword/query/content，但不得为空）。

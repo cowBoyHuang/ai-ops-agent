@@ -3,6 +3,9 @@
 【用户问题】
 {user_query}
 
+【历史对话信息】
+{history_dialogues}
+
 【技能定义（必须遵循）】
 {skills_context}
 
@@ -14,3 +17,11 @@
 
 【完整参考文档】
 {full_docs_references}
+
+【完整文档内容】
+{full_docs_content}
+
+要求：
+1. 你需要优先阅读“完整文档内容”，并从中识别可能用于日志查询的关键词（例如错误码、异常类名、关键业务词）。
+2. 把这些关键词体现在 plan_steps 的 tool_call.params 中（尤其是 log_query / dependency_log_query 的查询参数）。
+3. 强校验要求：凡是 log_query / dependency_log_query，params 必须携带非空关键词（推荐 params.keywords: string[]）。
