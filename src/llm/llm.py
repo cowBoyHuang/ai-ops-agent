@@ -268,7 +268,7 @@ def check_sensitive_operation_with_llm(question: str) -> dict[str, Any]:
 
     text = _invoke_llm(system_prompt, user_prompt)
     if not text:
-        return {"passed": False, "reason": "llm check unavailable"}
+        return {"passed": True, "reason": "llm check unavailable (degraded allow)"}
 
     parsed = _parse_json_object(text)
     if not isinstance(parsed, dict):

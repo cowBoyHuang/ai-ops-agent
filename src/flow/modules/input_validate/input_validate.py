@@ -21,6 +21,16 @@ _DANGEROUS_COMMAND_BLACKLIST = (
     "wget | sh",
 )
 
+
+def _is_llm_check_unavailable(reason: str) -> bool:
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    if text in {"llm check unavailable", "llm unavailable", "llm not available"}:
+        return True
+    return ("llm" in text and "unavailable" in text) or ("llm" in text and "not available" in text)
+
+
 # 方法注释（业务）:
 # - 业务：在校验失败时统一写入失败状态和错误信息。
 # - 入参：`context`(dict)=流程上下文；`error_code`(str)=错误码；`error`(str)=错误文案；
@@ -83,15 +93,25 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
     llm_check = check_sensitive_operation_with_llm(message)
+    llm_reason = str(llm_check.get("reason") or "")
+    if _is_llm_check_unavailable(llm_reason):
+        # LLM 风险校验不可用时降级放行，仍保留黑名单拦截能力。
+        context["sensitive_check"] = {
+            "passed": True,
+            "mode": "blacklist+llm_degraded",
+            "reason": "llm unavailable, skipped llm check",
+        }
+        return context
+
     if not bool(llm_check.get("passed")):
         return _mark_validate_failed(
             context=context,
             error_code="SENSITIVE_LLM_BLOCKED",
-            error=str(llm_check.get("reason") or "llm sensitive check blocked"),
+            error=str(llm_reason or "llm sensitive check blocked"),
             sensitive_check={
                 "passed": False,
                 "mode": "llm",
-                "reason": str(llm_check.get("reason") or ""),
+                "reason": llm_reason,
             },
         )
 
