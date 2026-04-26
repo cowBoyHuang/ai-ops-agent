@@ -52,6 +52,7 @@ _APP_CODE_PATTERN = re.compile(r"\b(f_tts_trade_(?:order|core))\b", re.IGNORECAS
 _XEP_ORDER_PATTERN = re.compile(r"\bxep\s*(\d{6})(\d{6})\d*\b", re.IGNORECASE)
 _OPS_SLUGGER_PATTERN = re.compile(r"\bops[\s_.-]*slugger[\s_.-]*(\d{6})[\s_.-]*(\d{6})\b", re.IGNORECASE)
 _GENERIC_DT_PATTERN = re.compile(r"\b(\d{6})[\s_.-]+(\d{6})\b")
+_TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
 _DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 _SRC_ROOT = Path(__file__).resolve().parents[5]
 _PROJECT_ROOT = _SRC_ROOT.parent
@@ -579,6 +580,16 @@ def _normalize_log_params(
 
     normalized["app_code"] = app_code
     normalized["logname"] = logname
+
+    existing_keywords = normalized.get("keywords")
+    if not (isinstance(existing_keywords, list) and any(str(item).strip() for item in existing_keywords)):
+        trace_hits = _TRACE_ID_PATTERN.findall(user_query)
+        if trace_hits:
+            normalized["keywords"] = ["生单请求参数为", str(trace_hits[0]).strip()]
+        else:
+            short_query = str(user_query or "").strip()
+            if short_query:
+                normalized["keywords"] = [short_query[:80]]
 
     has_begin = bool(str(normalized.get("begin_time") or normalized.get("beginTime") or "").strip())
     has_end = bool(str(normalized.get("end_time") or normalized.get("endTime") or "").strip())

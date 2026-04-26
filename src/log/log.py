@@ -26,6 +26,7 @@ _DEFAULT_ES_HOST = "jinkelalinkflight.corp.qunar.com"
 _DEFAULT_ES_USERNAME = "system_f_pangu-ordertool"
 _DEFAULT_ES_PASSWORD = "iVa!ChHlx%7dJN8"
 _DEFAULT_ES_API_KEY = ""
+_DEFAULT_LOG_QUERY_MAX_LINES = 1000
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -187,46 +188,73 @@ def _get_index_name(app_code: str) -> str:
     return f"log_{app_code}-*"
 
 
-def _build_content_clause(content: str, query_type: QueryType) -> dict[str, Any]:
-    if query_type == QueryType.MATCH:
-        # 针对“关键词+大JSON”场景：短语优先 + BM25 兜底。
-        return {
-            "bool": {
-                "should": [
-                    {
-                        "match_phrase": {
-                            "content": {
-                                "query": content,
-                                "boost": 2.0,
-                            },
-                        }
-                    },
-                    {
-                        "match": {
-                            "content": {
-                                "query": content,
-                                "analyzer": "ik_max_word",
-                                "minimum_should_match": "20%",
-                                "boost": 1.0,
-                            }
-                        }
-                    },
-                ],
-                "minimum_should_match": 1,
+def _normalize_content_terms(content: str | list[str]) -> list[str]:
+    if isinstance(content, list):
+        terms = [str(item or "").strip() for item in content]
+    else:
+        terms = [str(content or "").strip()]
+    return [term for term in terms if term]
+
+
+def _normalize_query_lists(content: str | list[str] | dict[str, Any]) -> tuple[list[str], list[str]]:
+    if isinstance(content, dict):
+        phrase_list = _normalize_content_terms(
+            content.get("match_phrase_list")
+            or content.get("precise_terms")
+            or []
+        )
+        match_list = _normalize_content_terms(
+            content.get("match_list")
+            or content.get("semantic_terms")
+            or content.get("user_query")
+            or []
+        )
+        return phrase_list, match_list
+
+    terms = _normalize_content_terms(content)
+    return [], terms
+
+
+def _build_content_clause(
+    *, match_phrase_list: list[str], match_list: list[str]
+) -> dict[str, Any] | None:
+    phrase_rules = [
+        {"match_phrase": {"content": {"query": term, "boost": 10.0}}}
+        for term in match_phrase_list
+    ]
+    match_rules = [
+        {
+            "match": {
+                "content": {
+                    "query": term,
+                    "analyzer": "ik_max_word",
+                    "boost": 2.0,
+                }
             }
         }
-    else:  # QueryType.MATCH_PHRASE
-        return {query_type.value: {"content": content}}
+        for term in match_list
+    ]
+
+    sub_conditions: list[dict[str, Any]] = []
+    if phrase_rules:
+        sub_conditions.append({"bool": {"must": phrase_rules}})
+    if match_rules:
+        sub_conditions.append({"bool": {"should": match_rules, "minimum_should_match": 1}})
+    if not sub_conditions:
+        return None
+    if len(sub_conditions) == 1:
+        return sub_conditions[0]
+    return {"bool": {"must": sub_conditions}}
 
 def build_pull_log_request(
     *,
     app_code: str,
-    keyword: str = "",
+    keyword: str | list[str] = "",
     start_time: dt.datetime | None = None,
     end_time: dt.datetime | None = None,
     window_minutes: int = 15,
     page_no: int = 1,  # compatibility placeholder
-    page_size: int = 200,
+    page_size: int = _DEFAULT_LOG_QUERY_MAX_LINES,
     log_name: str,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -239,8 +267,7 @@ def build_pull_log_request(
         logname=log_name,
         begin_time=start_time,
         end_time=end_time,
-        content=keyword,
-        type=QueryType.MATCH.value,
+        content={"match_phrase_list": [], "match_list": _normalize_content_terms(keyword)},
         max_lines=page_size,
         extra=extra,
     )
@@ -252,24 +279,26 @@ def build_es_pull_log_request(
     logname: str,
     begin_time: dt.datetime | str,
     end_time: dt.datetime | str,
-    content: str,
-    type: str,
-    max_lines: int = 200,
+    content: str | list[str] | dict[str, Any],
+    type: str | None = None,
+    max_lines: int = _DEFAULT_LOG_QUERY_MAX_LINES,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     ES 请求封装方法（方法1内部调用）。
 
     必要参数：
-    - app_code, logname, begin_time(beginTime), end_time(endTime), content, type(match_phrase|match)
+    - app_code, logname, begin_time(beginTime), end_time(endTime)
+    - content 中通过 `match_phrase_list`/`match_list` 注入查询条件（二者可为空其一）
     """
     if not app_code.strip():
         raise ValueError("app_code is required")
     if not logname.strip():
         raise ValueError("logname is required")
-    if not content.strip():
+    del type  # 历史兼容参数，不再参与查询逻辑。
+    match_phrase_list, match_list = _normalize_query_lists(content)
+    if not match_phrase_list and not match_list:
         raise ValueError("content is required")
-    query_type = _parse_query_type(type)
 
     begin_text = _coerce_time_text(begin_time, "begin_time")
     end_text = _coerce_time_text(end_time, "end_time")
@@ -283,29 +312,32 @@ def build_es_pull_log_request(
         pass
     normalized_log_name = _normalize_log_name_for_es(logname)
 
+    must_conditions: list[dict[str, Any]] = [
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": begin_text,
+                    "lte": end_text,
+                    "time_zone": "+08:00",
+                    "format": "yyyy-MM-dd HH:mm:ss||strict_date_optional_time",
+                }
+            }
+        },
+        {"term": {"log_name": normalized_log_name}},
+    ]
+    content_clause = _build_content_clause(
+        match_phrase_list=match_phrase_list,
+        match_list=match_list,
+    )
+    if content_clause:
+        must_conditions.insert(1, content_clause)
+
     body: dict[str, Any] = {
         "size": max(1, int(max_lines)),
         "sort": [{"@timestamp": {"order": "asc"}}],
         "_source": ["content"],
         "track_scores": True,
-        "query": {
-            "bool": {
-                "must": [
-                    {
-                        "range": {
-                            "@timestamp": {
-                                "gte": begin_text,
-                                "lte": end_text,
-                                "time_zone": "+08:00",
-                                "format": "yyyy-MM-dd HH:mm:ss||strict_date_optional_time",
-                            }
-                        }
-                    },
-                    _build_content_clause(content.strip(), query_type),
-                    {"term": {"log_name": normalized_log_name}},
-                ]
-            }
-        },
+        "query": {"bool": {"must": must_conditions}},
     }
     request_payload: dict[str, Any] = {
         "index": _get_index_name(app_code.strip()),
@@ -314,8 +346,10 @@ def build_es_pull_log_request(
         "beginTime": begin_text,
         "endTime": end_text,
         "logname": logname.strip(),
-        "content": content.strip(),
-        "type": query_type.value,
+        "content": {
+            "match_phrase_list": match_phrase_list,
+            "match_list": match_list,
+        },
     }
     if extra:
         request_payload.update(extra)
@@ -329,7 +363,7 @@ def build_legacy_pull_log_request_for_api(
     begin_time: dt.datetime | str,
     end_time: dt.datetime | str,
     log_name: str,
-    max_lines: int = 200,
+    max_lines: int = _DEFAULT_LOG_QUERY_MAX_LINES,
 ) -> dict[str, Any]:
     """
     兼容旧结构：如需回退老接口格式可复用此方法（当前主链路不使用）。
@@ -396,11 +430,11 @@ def pull_log_by_condition(condition: dict[str, Any], config: LogApiConfig | None
 def build_external_log_request(
     *,
     app_core: str,
-    content: str,
+    content: str | list[str] | dict[str, Any],
     start_time: dt.datetime,
     end_time: dt.datetime,
     logname: str,
-    type: str,
+    type: str | None = None,
 ) -> dict[str, Any]:
     """构建外部日志查询请求（必填参数版本）。"""
     payload = build_es_pull_log_request(
@@ -410,7 +444,7 @@ def build_external_log_request(
         end_time=end_time,
         content=content,
         type=type,
-        max_lines=200,
+        max_lines=_DEFAULT_LOG_QUERY_MAX_LINES,
     )
     payload["appCore"] = app_core  # 兼容旧调用方字段。
     return payload
@@ -483,8 +517,8 @@ def query_external_logs(
     logname: str = "",
     begin_time: dt.datetime | str | None = None,
     end_time: dt.datetime | str | None = None,
-    content: str = "",
-    type: str = "",
+    content: str | list[str] | dict[str, Any] = "",
+    type: str | None = None,
     config: LogApiConfig | None = None,
     # legacy aliases
     app_core: str | None = None,
@@ -515,6 +549,13 @@ def query_external_logs(
         config=config,
     )
     _LOGGER.info("log.query_external_logs.end app_code=%s hit_count=%d", final_app_code, len(rows))
+    for idx, row in enumerate(rows, start=1):
+        _LOGGER.info(
+            "log.query_external_logs.item idx=%d score=%.4f content=%s",
+            idx,
+            float(getattr(row, "score", 0.0) or 0.0),
+            str(getattr(row, "content", "") or ""),
+        )
     return rows
 
 
@@ -524,8 +565,8 @@ def search_logs(
     logname: str,
     begin_time: dt.datetime | str,
     end_time: dt.datetime | str,
-    content: str,
-    type: str,
+    content: str | list[str] | dict[str, Any],
+    type: str | None = None,
     config: LogApiConfig | None = None,
 ) -> list[EsResult]:
     """
