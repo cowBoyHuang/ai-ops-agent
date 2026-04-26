@@ -15,7 +15,6 @@ import re
 import time
 from typing import Any
 
-from db import ChatDBStore
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from qdrant import QdrantStore
 
@@ -27,7 +26,6 @@ _DEFAULT_PARENT_DOC_TOP_N = 6
 _MAX_LOG_QUESTION_LEN = 120
 _ERROR_CODE_PATTERN = re.compile(r"(?:error[_\s-]?code|错误码)\s*[:=]\s*([A-Za-z0-9_-]{2,64})", re.IGNORECASE)
 _EXCEPTION_PATTERN = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:Exception|Error))\b")
-_RAG_DOC_DB_STORE: ChatDBStore | None = None
 
 _INTENT_TO_CN = {
     "SYSTEM_LOGIC_CONSULT": "系统逻辑咨询",
@@ -59,18 +57,6 @@ def _clip_for_log(text: str, max_len: int = _MAX_LOG_QUESTION_LEN) -> str:
     if len(raw) <= max_len:
         return raw
     return f"{raw[:max_len]}..."
-
-
-# 方法注释（业务）:
-# - 入参：无。
-# - 出参：`ChatDBStore`=用于 `rag_document` 映射回查的 DB 访问实例。
-# - 方法逻辑：延迟初始化并复用单例，避免每次检索重复创建连接。
-def _get_rag_doc_db_store() -> ChatDBStore:
-    global _RAG_DOC_DB_STORE
-    if _RAG_DOC_DB_STORE is None:
-        _RAG_DOC_DB_STORE = ChatDBStore()
-        _LOGGER.info("rag_retrieve 初始化 rag_document DB 访问实例")
-    return _RAG_DOC_DB_STORE
 
 
 # 方法注释（业务）:
@@ -267,30 +253,20 @@ def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]]) -> list[dict[s
 # 方法注释（业务）:
 # - 入参：`rag_docs`(list[dict[str, Any]])=按 parent_id 去重后的 RAG 文档。
 # - 出参：`list[dict[str, Any]]`=父文档完整内容列表（parent_id/path/content）。
-# - 方法逻辑：取 TopN parent_id 回查 rag_document 映射，读取本地文件全文并挂上检索分数透传下游。
+# - 方法逻辑：使用 chunk payload 中的 path 直接读取父文档全文并挂上检索分数透传下游。
 def _load_parent_documents(rag_docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not rag_docs:
         _LOGGER.info("rag_retrieve 跳过父文档回查: rag_docs 为空")
         return []
-    db_store = _get_rag_doc_db_store()
-    if not db_store.enabled:
-        _LOGGER.info("rag_retrieve 跳过父文档回查: rag_document DB 未启用")
-        return []
 
     top_n = _parent_doc_top_n()
-    _LOGGER.info("rag_retrieve 开始回查父文档: 候选=%d top_n=%d", len(rag_docs), top_n)
+    _LOGGER.info("rag_retrieve 开始加载父文档: 候选=%d top_n=%d", len(rag_docs), top_n)
     rows: list[dict[str, Any]] = []
     for item in rag_docs[:top_n]:
         parent_id = str(item.get("parent_id") or item.get("id") or "").strip()
         if not parent_id:
             continue
-        try:
-            mapping = db_store.get_rag_document(parent_id=parent_id)
-        except Exception as err:  # pragma: no cover - 外部依赖异常统一降级
-            _LOGGER.warning("rag_retrieve 父文档映射查询失败: parent_id=%s err=%s", parent_id, err)
-            continue
-
-        doc_path = str((mapping or {}).get("path") or "").strip()
+        doc_path = str(item.get("path") or "").strip()
         if not doc_path:
             continue
         full_content = _read_local_doc(doc_path)
@@ -305,7 +281,7 @@ def _load_parent_documents(rag_docs: list[dict[str, Any]]) -> list[dict[str, Any
                 "chunk_id": str(item.get("chunk_id") or ""),
             }
         )
-    _LOGGER.info("rag_retrieve 父文档回查完成: full_docs=%d", len(rows))
+    _LOGGER.info("rag_retrieve 父文档加载完成: full_docs=%d", len(rows))
     return rows
 
 

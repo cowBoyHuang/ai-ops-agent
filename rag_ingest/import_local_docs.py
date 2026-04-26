@@ -1,4 +1,4 @@
-"""导入本地排障文档到 Qdrant，并记录 parent 文档映射。"""
+"""导入本地排障文档到 Qdrant。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 import xml.etree.ElementTree as ET
 
 # 兼容直接从仓库根目录执行：python rag_ingest/import_local_docs.py
@@ -24,7 +24,6 @@ if str(_SRC_DIR) not in sys.path:
 
 from pydantic import SecretStr
 
-from db.db_store import ChatDBStore
 from qdrant import QdrantStore
 
 try:
@@ -46,6 +45,13 @@ _DOCX_NS = {
 _DOCX_REL_ATTR_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 _MULTIMODAL_CLIENT: Any | None = None
 _MULTIMODAL_INIT_DONE = False
+_TITLE_PATTERNS = (
+    re.compile(r"^\s{0,3}#{1,6}\s+\S+"),  # markdown headings: #/##/...
+    re.compile(r"^[一二三四五六七八九十百]+[、.．]\s*\S+"),  # Chinese ordered title
+    re.compile(r"^\d+([.)）]|[.．、])\s*\S+"),  # numeric ordered title
+    re.compile(r"^[（(]?[一二三四五六七八九十百\d]+[)）]\s*\S+"),  # (1)/(一)
+    re.compile(r"^[A-Za-z][.)]\s+\S+"),  # A. / a)
+)
 
 
 @dataclass
@@ -175,47 +181,79 @@ def _split_long_paragraph(text: str, *, chunk_size: int, chunk_overlap: int) -> 
     return chunks
 
 
+def _split_sentences(text: str) -> list[str]:
+    content = str(text or "").strip()
+    if not content:
+        return []
+    parts = re.split(r"(?<=[。！？!?；;])\s*", content)
+    rows = [str(item or "").strip() for item in parts if str(item or "").strip()]
+    if rows:
+        return rows
+    return [content]
+
+
+def _is_title_like_paragraph(text: str, next_text: str = "") -> bool:
+    current = str(text or "").strip()
+    if not current:
+        return False
+    # Heuristic: short standalone line is likely a title.
+    if any(pattern.match(current) for pattern in _TITLE_PATTERNS):
+        return True
+    max_title_len = 24
+    if len(current) <= max_title_len and not re.search(r"[。！？!?；;，,：:]", current):
+        nxt = str(next_text or "").strip()
+        if len(nxt) >= 16:
+            return True
+    return False
+
+
+def _merge_title_with_body_paragraphs(paragraphs: list[str]) -> list[str]:
+    rows = [str(item or "").strip() for item in list(paragraphs or []) if str(item or "").strip()]
+    merged: list[str] = []
+    i = 0
+    while i < len(rows):
+        current = rows[i]
+        next_text = rows[i + 1] if i + 1 < len(rows) else ""
+        if _is_title_like_paragraph(current, next_text) and next_text:
+            body = next_text
+            merged.append(f"{current}\n{body}".strip())
+            i += 2
+            continue
+        merged.append(current)
+        i += 1
+    return merged
+
+
+def _pick_first_sentence(text: str) -> str:
+    rows = _split_sentences(text)
+    return rows[0] if rows else ""
+
+
+def _pick_last_sentence(text: str) -> str:
+    rows = _split_sentences(text)
+    return rows[-1] if rows else ""
+
+
 # 方法注释（业务）:
 # - 入参：`paragraphs`(list[str])=段落文本列表；`chunk_size`/`chunk_overlap`=切分参数。
 # - 出参：`list[str]`=chunk 列表。
-# - 方法逻辑：按段落聚合为 chunk，超长单段走长度兜底切分。
+# - 方法逻辑：严格一段一块；每块拼接上一段最后一句与下一段第一句作为 overlap 语义增强。
 def _split_chunks_by_paragraphs(
     paragraphs: list[str],
     *,
     chunk_size: int,
     chunk_overlap: int,
 ) -> list[str]:
-    size = max(1, int(chunk_size))
+    _ = chunk_size, chunk_overlap  # 保留参数兼容性；严格段落切分时不使用长度窗口。
+    cleaned = _merge_title_with_body_paragraphs(paragraphs)
     chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    def _flush_current() -> None:
-        nonlocal current, current_len
-        if not current:
-            return
-        chunk_text = "\n\n".join(current).strip()
+    for idx, current in enumerate(cleaned):
+        prev_tail = _pick_last_sentence(cleaned[idx - 1]) if idx > 0 else ""
+        next_head = _pick_first_sentence(cleaned[idx + 1]) if idx + 1 < len(cleaned) else ""
+        chunk_parts = [part for part in (prev_tail, current, next_head) if part]
+        chunk_text = "\n".join(chunk_parts).strip()
         if chunk_text:
             chunks.append(chunk_text)
-        current = []
-        current_len = 0
-
-    for paragraph in list(paragraphs or []):
-        text = str(paragraph or "").strip()
-        if not text:
-            continue
-        if len(text) > size:
-            _flush_current()
-            chunks.extend(_split_long_paragraph(text, chunk_size=size, chunk_overlap=chunk_overlap))
-            continue
-
-        addition = len(text) + (2 if current else 0)
-        if current and current_len + addition > size:
-            _flush_current()
-        current.append(text)
-        current_len += addition
-
-    _flush_current()
     return chunks
 
 
@@ -472,13 +510,15 @@ def _build_upsert_items(
     chunk_size: int,
     chunk_overlap: int,
 ) -> tuple[str, list[dict[str, Any]]]:
-    parent_id = uuid4().hex
+    # Use stable parent_id per absolute file path so one article keeps one parent_id
+    # across repeated imports.
+    abs_path = str(doc_path.resolve())
+    parent_id = uuid5(NAMESPACE_URL, abs_path).hex
     chunks = _split_chunks_by_paragraphs(
         paragraphs,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    abs_path = str(doc_path.resolve())
 
     items: list[dict[str, Any]] = []
     for idx, chunk in enumerate(chunks):
@@ -489,6 +529,7 @@ def _build_upsert_items(
                 "payload": {
                     "parent_id": parent_id,
                     "path": abs_path,
+                    "source_file_abs_path": abs_path,
                     "chunk_index": idx,
                     "file_name": doc_path.name,
                 },
@@ -517,13 +558,11 @@ def run_import_entry(
         suffixes=normalized_suffixes,
     )
 
-    db_store = ChatDBStore()
     qdrant_store = QdrantStore()
 
     file_count = 0
     chunk_count = 0
     image_desc_count = 0
-    db_rows = 0
     skipped_files: list[str] = []
 
     for doc_path in files:
@@ -545,7 +584,7 @@ def run_import_entry(
             skipped_files.append(str(doc_path))
             continue
 
-        parent_id, items = _build_upsert_items(
+        _parent_id, items = _build_upsert_items(
             doc_path=doc_path,
             paragraphs=merged_paragraphs,
             chunk_size=chunk_size,
@@ -555,7 +594,6 @@ def run_import_entry(
             skipped_files.append(str(doc_path))
             continue
 
-        db_rows += db_store.upsert_rag_document(parent_id=parent_id, path=str(doc_path.resolve()))
         qdrant_store.upsert_texts(items)
 
         file_count += 1
@@ -570,8 +608,6 @@ def run_import_entry(
         "files_ingested": file_count,
         "chunks_ingested": chunk_count,
         "image_descriptions_generated": image_desc_count,
-        "rag_document_rows_affected": db_rows,
-        "db_enabled": bool(db_store.enabled),
         "qdrant_collection": qdrant_store.config.collection_name,
         "skipped_files": skipped_files,
     }
@@ -601,7 +637,7 @@ def run_import(
 # - 出参：`None`。
 # - 方法逻辑：解析参数后执行导入，并将结构化结果打印为 JSON。
 def main() -> None:
-    parser = argparse.ArgumentParser(description="导入本地文档到 Qdrant，并写入 rag_document 映射表")
+    parser = argparse.ArgumentParser(description="导入本地文档到 Qdrant")
     parser.add_argument(
         "--source-dir",
         default="",

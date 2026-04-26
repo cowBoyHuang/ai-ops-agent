@@ -8,10 +8,15 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
+from zoneinfo import ZoneInfo
+import zipfile
+import xml.etree.ElementTree as ET
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from flow.modules.agent_executor_graph.plan_step import PlanStep
@@ -32,6 +37,24 @@ _LOG_KEYWORD_PARAM_KEYS = ("keywords", "keyword", "query", "content")
 _SKILLS_DIR = Path(__file__).resolve().parents[5] / "skills"
 _MAX_SKILL_TEXT_LEN = 1200
 _MAX_SKILL_TOTAL_LEN = 12000
+_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+_LOG_FILE_TO_APP_CODE = {
+    "ttsorder.log": "f_tts_trade_order",
+    "ttsorder_error.log": "f_tts_trade_order",
+    "tts.log": "f_tts_trade_core",
+    "tts_error.log": "f_tts_trade_core",
+}
+_APP_CODE_TO_BUSINESS_LOG = {
+    "f_tts_trade_order": "ttsorder.log",
+    "f_tts_trade_core": "tts.log",
+}
+_APP_CODE_PATTERN = re.compile(r"\b(f_tts_trade_(?:order|core))\b", re.IGNORECASE)
+_XEP_ORDER_PATTERN = re.compile(r"\bxep\s*(\d{6})(\d{6})\d*\b", re.IGNORECASE)
+_OPS_SLUGGER_PATTERN = re.compile(r"\bops[\s_.-]*slugger[\s_.-]*(\d{6})[\s_.-]*(\d{6})\b", re.IGNORECASE)
+_GENERIC_DT_PATTERN = re.compile(r"\b(\d{6})[\s_.-]+(\d{6})\b")
+_DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+_SRC_ROOT = Path(__file__).resolve().parents[5]
+_PROJECT_ROOT = _SRC_ROOT.parent
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -86,6 +109,153 @@ def _read_text_safely(path: Path) -> str:
             return path.read_text(encoding="utf-8", errors="ignore").strip()
         except Exception:
             return ""
+
+
+def _read_docx_text_safely(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            if "word/document.xml" not in zf.namelist():
+                return ""
+            root = ET.fromstring(zf.read("word/document.xml"))
+    except Exception:
+        return ""
+
+    rows: list[str] = []
+    for para in root.findall(".//w:p", _DOCX_NS):
+        text = "".join(node.text or "" for node in para.findall(".//w:t", _DOCX_NS)).strip()
+        if text:
+            rows.append(" ".join(text.split()))
+    return "\n".join(rows).strip()
+
+
+def _resolve_doc_path(path_text: str) -> Path | None:
+    raw = str(path_text or "").strip()
+    if not raw:
+        return None
+    base = Path(raw)
+    candidates = [base]
+    if not base.is_absolute():
+        candidates.append(_PROJECT_ROOT / base)
+        candidates.append(_SRC_ROOT / base)
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _read_full_doc_by_path(path_text: str) -> str:
+    path = _resolve_doc_path(path_text)
+    if path is None:
+        return ""
+    if path.suffix.lower() == ".docx":
+        return _read_docx_text_safely(path)
+    try:
+        raw = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\x00" in raw:
+        return ""
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            return raw.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore").strip()
+
+
+def _merge_parent_docs_from_chunk_paths(
+    *,
+    rag_docs: list[dict[str, Any]],
+    parent_docs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    path_to_index: dict[str, int] = {}
+    for item in list(parent_docs or []):
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        path = str(row.get("path") or "").strip()
+        if path:
+            content = str(row.get("content") or "").strip()
+            if not content:
+                full_content = _read_full_doc_by_path(path)
+                if full_content:
+                    row["content"] = full_content
+            if path not in path_to_index:
+                path_to_index[path] = len(merged)
+        merged.append(row)
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in list(rag_docs or []):
+        if not isinstance(item, dict):
+            continue
+        payload = dict(item.get("payload") or {})
+        path = str(payload.get("path") or item.get("path") or "").strip()
+        if not path:
+            continue
+        row = grouped.setdefault(
+            path,
+            {
+                "path": path,
+                "parent_id": str(payload.get("parent_id") or item.get("id") or "").strip(),
+                "score": _to_float(item.get("score"), 0.0),
+                "chunk_texts": [],
+            },
+        )
+        row["score"] = max(_to_float(row.get("score"), 0.0), _to_float(item.get("score"), 0.0))
+        text = str(item.get("text") or "").strip()
+        if text:
+            chunk_texts = list(row.get("chunk_texts") or [])
+            chunk_texts.append(text)
+            row["chunk_texts"] = chunk_texts
+
+    loaded_rows: list[dict[str, Any]] = []
+    sorted_paths = sorted(grouped.values(), key=lambda row: _to_float(row.get("score"), 0.0), reverse=True)
+    for row in sorted_paths:
+        path = str(row.get("path") or "").strip()
+        if not path:
+            continue
+        existing_index = path_to_index.get(path)
+        if existing_index is not None:
+            existing_row = merged[existing_index]
+            existing_row["score"] = max(
+                _to_float(existing_row.get("score"), 0.0),
+                _to_float(row.get("score"), 0.0),
+            )
+            if str(existing_row.get("content") or "").strip():
+                continue
+            full_content = _read_full_doc_by_path(path)
+            if not full_content:
+                chunk_rows = [str(item).strip() for item in list(row.get("chunk_texts") or []) if str(item).strip()]
+                if chunk_rows:
+                    full_content = "\n".join(chunk_rows)
+            if full_content:
+                existing_row["content"] = full_content
+            continue
+
+        full_content = _read_full_doc_by_path(path)
+        if not full_content:
+            # 文件不可直接读取时，退化为该文件命中 chunk 的拼接内容，保证上下文不为空。
+            chunk_rows = [str(item).strip() for item in list(row.get("chunk_texts") or []) if str(item).strip()]
+            if chunk_rows:
+                full_content = "\n".join(chunk_rows)
+        if not full_content:
+            continue
+        loaded_rows.append(
+            {
+                "parent_id": str(row.get("parent_id") or ""),
+                "path": path,
+                "content": full_content,
+                "score": _to_float(row.get("score"), 0.0),
+            }
+        )
+
+    merged.extend(loaded_rows)
+    merged.sort(key=lambda item: _to_float(item.get("score"), 0.0), reverse=True)
+    return merged
 
 
 # 方法注释（业务）:
@@ -218,6 +388,7 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
     rag_solutions_summary = "\n".join(rag_rows).strip() or "无 RAG 文档摘要"
 
     parent_docs = list(structured_context.get("rag_parent_docs") or state.get("rag_parent_docs") or [])
+    parent_docs = _merge_parent_docs_from_chunk_paths(rag_docs=rag_docs, parent_docs=parent_docs)
     history_dialogues = _prepare_history_dialogues(state)
     full_docs_content = _prepare_full_docs_content(parent_docs)
     ref_rows: list[str] = []
@@ -331,6 +502,117 @@ def _validate_plan_steps_strict(plan_steps: list[PlanStep]) -> tuple[bool, str]:
     return True, ""
 
 
+def _build_time_from_yymmdd_hhmmss(yymmdd: str, hhmmss: str) -> dt.datetime | None:
+    if len(yymmdd) != 6 or len(hhmmss) != 6:
+        return None
+    try:
+        year = 2000 + int(yymmdd[0:2])
+        month = int(yymmdd[2:4])
+        day = int(yymmdd[4:6])
+        hour = int(hhmmss[0:2])
+        minute = int(hhmmss[2:4])
+        second = int(hhmmss[4:6])
+        return dt.datetime(year, month, day, hour, minute, second, tzinfo=_LOCAL_TZ)
+    except ValueError:
+        return None
+
+
+def _extract_event_time(user_query: str) -> dt.datetime | None:
+    text = str(user_query or "").strip()
+    if not text:
+        return None
+    for pattern in (_XEP_ORDER_PATTERN, _OPS_SLUGGER_PATTERN, _GENERIC_DT_PATTERN):
+        matched = pattern.search(text)
+        if not matched:
+            continue
+        event_time = _build_time_from_yymmdd_hhmmss(str(matched.group(1)), str(matched.group(2)))
+        if event_time is not None:
+            return event_time
+    return None
+
+
+def _pick_explicit_app_code(text: str) -> str:
+    matched = _APP_CODE_PATTERN.search(str(text or ""))
+    if not matched:
+        return ""
+    return str(matched.group(1) or "").lower()
+
+
+def _pick_explicit_logname(candidates: list[str]) -> str:
+    merged = " ".join(str(item or "") for item in candidates).lower()
+    for log_name in _LOG_FILE_TO_APP_CODE:
+        if log_name in merged:
+            return log_name
+    return ""
+
+
+def _normalize_log_params(
+    *,
+    tool_name: str,
+    params: dict[str, Any],
+    user_query: str,
+    event_time: dt.datetime | None,
+) -> dict[str, Any]:
+    normalized = dict(params or {})
+    app_code = str(
+        normalized.get("app_code")
+        or normalized.get("appCode")
+        or ""
+    ).strip().lower()
+    logname = str(normalized.get("logname") or "").strip().lower()
+
+    keywords = normalized.get("keywords")
+    keyword_text = " ".join(str(item).strip() for item in keywords if str(item).strip()) if isinstance(keywords, list) else str(keywords or "")
+    explicit_app = _pick_explicit_app_code(" ".join([user_query, keyword_text, logname]))
+    explicit_log = _pick_explicit_logname([user_query, keyword_text, logname])
+
+    if not app_code and explicit_app:
+        app_code = explicit_app
+    if not logname and explicit_log:
+        logname = explicit_log
+    if not app_code and logname:
+        app_code = _LOG_FILE_TO_APP_CODE.get(logname, "")
+    if not app_code:
+        app_code = "f_tts_trade_core" if tool_name == "dependency_log_query" else "f_tts_trade_order"
+    if not logname:
+        logname = _APP_CODE_TO_BUSINESS_LOG.get(app_code, "ttsorder.log")
+
+    normalized["app_code"] = app_code
+    normalized["logname"] = logname
+
+    has_begin = bool(str(normalized.get("begin_time") or normalized.get("beginTime") or "").strip())
+    has_end = bool(str(normalized.get("end_time") or normalized.get("endTime") or "").strip())
+    if event_time is not None and (not has_begin or not has_end):
+        begin_time = (event_time - dt.timedelta(hours=1)).isoformat()
+        end_time = (event_time + dt.timedelta(hours=1)).isoformat()
+        normalized.setdefault("begin_time", begin_time)
+        normalized.setdefault("end_time", end_time)
+    return normalized
+
+
+def _enrich_plan_steps_for_log_queries(plan_steps: list[PlanStep], user_query: str) -> list[PlanStep]:
+    event_time = _extract_event_time(user_query)
+    enriched: list[PlanStep] = []
+    for step in list(plan_steps or []):
+        row = dict(step or {})
+        if str(row.get("action_type") or "") != "tool_call":
+            enriched.append(row)
+            continue
+        tool_name = str(row.get("tool_name") or "")
+        if tool_name not in _LOG_QUERY_TOOLS:
+            enriched.append(row)
+            continue
+        params = dict(row.get("params") or {})
+        row["params"] = _normalize_log_params(
+            tool_name=tool_name,
+            params=params,
+            user_query=user_query,
+            event_time=event_time,
+        )
+        enriched.append(row)
+    return enriched
+
+
 def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
     if replan_count > 0:
         return [
@@ -429,6 +711,10 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         plan_steps = _fallback_plan_steps(intent_type=intent_type, replan_count=replan_count)
         _LOGGER.info("planner 使用规则兜底计划: steps=%d intent=%s replan=%d", len(plan_steps), intent_type, replan_count)
+    plan_steps = _enrich_plan_steps_for_log_queries(
+        plan_steps=plan_steps,
+        user_query=str(context_for_llm.get("user_query") or question),
+    )
 
     previous_plan = list(state.get("current_plan") or state.get("plan_steps") or [])
     if not previous_plan or replan_count > 0:

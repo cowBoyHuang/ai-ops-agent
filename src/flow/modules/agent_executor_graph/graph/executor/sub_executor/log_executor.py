@@ -28,9 +28,9 @@ def _as_datetime(value: Any, default: dt.datetime) -> dt.datetime:
 
 def _pick_query_type(value: Any) -> str:
     raw = str(value or "").strip().lower()
-    if raw == QueryType.MATCH.value:
-        return QueryType.MATCH.value
-    return QueryType.MATCH_PHRASE.value
+    if raw == QueryType.MATCH_PHRASE.value:
+        return QueryType.MATCH_PHRASE.value
+    return QueryType.MATCH.value
 
 
 def _extract_effective_info(tool_name: str, query_word: str, rows: list[EsResult]) -> dict[str, Any]:
@@ -127,4 +127,3 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
         "effective_info": extracted,
         "log_hit_count": len(rows),
     }
-

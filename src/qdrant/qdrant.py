@@ -131,19 +131,44 @@ class QdrantStore:
         self.ensure_collection()
         client = self._ensure_client()
         query_vector = text_embedding(query_text, dim=self.config.vector_dim)
-        points = client.search(
-            collection_name=self.config.collection_name,
-            query_vector=query_vector,
-            limit=max(1, int(limit)),
-            score_threshold=score_threshold,
-        )
+        max_limit = max(1, int(limit))
+        if hasattr(client, "query_points"):
+            # qdrant-client>=1.7 使用 query_points，结果在 QueryResponse.points
+            response = client.query_points(
+                collection_name=self.config.collection_name,
+                query=query_vector,
+                limit=max_limit,
+                score_threshold=score_threshold,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points = list(getattr(response, "points", None) or [])
+        elif hasattr(client, "search"):
+            # 兼容较老版本 qdrant-client
+            points = client.search(
+                collection_name=self.config.collection_name,
+                query_vector=query_vector,
+                limit=max_limit,
+                score_threshold=score_threshold,
+            )
+        else:
+            raise RuntimeError("Qdrant client has neither query_points nor search")
         rows: list[dict[str, Any]] = []
         for row in list(points or []):
+            row_id = getattr(row, "id", None)
+            if row_id is None and isinstance(row, dict):
+                row_id = row.get("id")
+            row_score = getattr(row, "score", 0.0)
+            if row_score is None and isinstance(row, dict):
+                row_score = row.get("score", 0.0)
+            payload = getattr(row, "payload", None)
+            if payload is None and isinstance(row, dict):
+                payload = row.get("payload")
             rows.append(
                 {
-                    "id": getattr(row, "id", None),
-                    "score": float(getattr(row, "score", 0.0) or 0.0),
-                    "payload": dict(getattr(row, "payload", {}) or {}),
+                    "id": row_id,
+                    "score": float(row_score or 0.0),
+                    "payload": dict(payload or {}),
                 }
             )
         return rows

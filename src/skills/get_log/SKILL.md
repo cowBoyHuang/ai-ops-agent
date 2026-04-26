@@ -126,13 +126,13 @@ adapt_raw_item_to_es_result(raw_item: Any) -> EsResult
 
 1. `appCode: f_tts_trade_order`
 - 系统说明: 生单系统，总调用入口，负责机票子单、营销子单、辅营子单的生单并调起各子单生单入口。
-- 业务日志: `ttsorder.log`
-- 异常日志: `ttsorder_error.log`
+- 业务日志: `ttsorder`
+- 异常日志: `ttsorder_error`
 
 2. `appCode: f_tts_trade_core`
 - 系统说明: 机票子单生单系统，负责创建机票子订单的实际实现。
-- 业务日志: `tts.log`
-- 异常日志: `tts_error.log`
+- 业务日志: `tts`
+- 异常日志: `tts_error`
 
 ## 调用建议
 

@@ -189,14 +189,30 @@ def _get_index_name(app_code: str) -> str:
 
 def _build_content_clause(content: str, query_type: QueryType) -> dict[str, Any]:
     if query_type == QueryType.MATCH:
-        # 使用 BM25 进行全文搜索，分词后词条有2个以上或者70%以上
+        # 针对“关键词+大JSON”场景：短语优先 + BM25 兜底。
         return {
-            "match": {
-                "content": {
-                    "query": content,
-                    "analyzer":"ik_max_word",
-                    "minimum_should_match": "2<70%"
-                }
+            "bool": {
+                "should": [
+                    {
+                        "match_phrase": {
+                            "content": {
+                                "query": content,
+                                "boost": 2.0,
+                            },
+                        }
+                    },
+                    {
+                        "match": {
+                            "content": {
+                                "query": content,
+                                "analyzer": "ik_max_word",
+                                "minimum_should_match": "20%",
+                                "boost": 1.0,
+                            }
+                        }
+                    },
+                ],
+                "minimum_should_match": 1,
             }
         }
     else:  # QueryType.MATCH_PHRASE

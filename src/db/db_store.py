@@ -104,53 +104,7 @@ class ChatDBStore:
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                     """
                 )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS rag_document (
-                        parent_id VARCHAR(64) NOT NULL,
-                        path VARCHAR(1024) NOT NULL,
-                        PRIMARY KEY (parent_id),
-                        KEY idx_rag_document_path (path(255))
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                    """
-                )
         return True
-
-    # ===== rag_document CRUD =====
-    def upsert_rag_document(self, *, parent_id: str, path: str) -> int:
-        if not self._enabled:
-            return 0
-        parent = str(parent_id or "").strip()
-        full_path = str(path or "").strip()
-        if not parent or not full_path:
-            return 0
-
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO rag_document(parent_id, path)
-                    VALUES (%s, %s)
-                    ON DUPLICATE KEY UPDATE path = VALUES(path)
-                    """,
-                    (parent, full_path),
-                )
-                return int(cur.rowcount or 0)
-
-    def get_rag_document(self, *, parent_id: str) -> dict[str, Any] | None:
-        if not self._enabled:
-            return None
-        parent = str(parent_id or "").strip()
-        if not parent:
-            return None
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT parent_id, path FROM rag_document WHERE parent_id = %s",
-                    (parent,),
-                )
-                row = cur.fetchone()
-                return dict(row) if row else None
 
     # ===== total_message CRUD =====
     def create_total_message(self, *, chat_id: str, role: str, content: str) -> int:
