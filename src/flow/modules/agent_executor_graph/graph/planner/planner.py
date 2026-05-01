@@ -33,7 +33,7 @@ _MAX_FULL_DOCS_FOR_PROMPT = 5
 _MAX_FULL_DOC_TEXT_LEN = 1500
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
 _LOG_QUERY_TOOLS = {"log_query", "dependency_log_query"}
-_LOG_KEYWORD_PARAM_KEYS = ("keywords", "keyword", "query", "content")
+_LOG_QUERY_LIST_PARAM_KEYS = ("match_phrase_list", "match_list")
 _SKILLS_DIR = Path(__file__).resolve().parents[5] / "skills"
 _MAX_SKILL_TEXT_LEN = 1200
 _MAX_SKILL_TOTAL_LEN = 12000
@@ -479,14 +479,19 @@ def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
     return result
 
 
-def _has_non_empty_log_keywords(params: dict[str, Any]) -> bool:
-    for key in _LOG_KEYWORD_PARAM_KEYS:
-        value = params.get(key)
-        if isinstance(value, str) and value.strip():
+def _normalize_str_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return []
+
+
+def _has_non_empty_log_query_lists(params: dict[str, Any]) -> bool:
+    for key in _LOG_QUERY_LIST_PARAM_KEYS:
+        if _normalize_str_list(params.get(key)):
             return True
-        if isinstance(value, list):
-            if any(isinstance(item, str) and item.strip() for item in value):
-                return True
     return False
 
 
@@ -498,8 +503,8 @@ def _validate_plan_steps_strict(plan_steps: list[PlanStep]) -> tuple[bool, str]:
         if tool_name not in _LOG_QUERY_TOOLS:
             continue
         params = dict(step.get("params") or {})
-        if not _has_non_empty_log_keywords(params):
-            return False, f"step#{idx} {tool_name} missing log keywords in params"
+        if not _has_non_empty_log_query_lists(params):
+            return False, f"step#{idx} {tool_name} missing match_phrase_list/match_list in params"
     return True, ""
 
 
@@ -555,6 +560,8 @@ def _normalize_log_params(
     event_time: dt.datetime | None,
 ) -> dict[str, Any]:
     normalized = dict(params or {})
+    match_phrase_list = _normalize_str_list(normalized.get("match_phrase_list"))
+    match_list = _normalize_str_list(normalized.get("match_list"))
     app_code = str(
         normalized.get("app_code")
         or normalized.get("appCode")
@@ -562,8 +569,7 @@ def _normalize_log_params(
     ).strip().lower()
     logname = str(normalized.get("logname") or "").strip().lower()
 
-    keywords = normalized.get("keywords")
-    keyword_text = " ".join(str(item).strip() for item in keywords if str(item).strip()) if isinstance(keywords, list) else str(keywords or "")
+    keyword_text = " ".join([*match_phrase_list, *match_list]).strip()
     explicit_app = _pick_explicit_app_code(" ".join([user_query, keyword_text, logname]))
     explicit_log = _pick_explicit_logname([user_query, keyword_text, logname])
 
@@ -581,15 +587,16 @@ def _normalize_log_params(
     normalized["app_code"] = app_code
     normalized["logname"] = logname
 
-    existing_keywords = normalized.get("keywords")
-    if not (isinstance(existing_keywords, list) and any(str(item).strip() for item in existing_keywords)):
+    if not match_phrase_list and not match_list:
         trace_hits = _TRACE_ID_PATTERN.findall(user_query)
         if trace_hits:
-            normalized["keywords"] = ["生单请求参数为", str(trace_hits[0]).strip()]
+            match_phrase_list = [str(trace_hits[0]).strip()]
         else:
             short_query = str(user_query or "").strip()
             if short_query:
-                normalized["keywords"] = [short_query[:80]]
+                match_list = [short_query[:80]]
+    normalized["match_phrase_list"] = match_phrase_list
+    normalized["match_list"] = match_list
 
     has_begin = bool(str(normalized.get("begin_time") or normalized.get("beginTime") or "").strip())
     has_end = bool(str(normalized.get("end_time") or normalized.get("endTime") or "").strip())

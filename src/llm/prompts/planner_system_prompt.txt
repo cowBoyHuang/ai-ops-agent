@@ -8,8 +8,8 @@
   "validation": "验证方法（中文）",
   "references": ["参考文档路径或名称"],
   "plan_steps": [
-    {"action_type": "tool_call", "tool_name": "log_query", "params": {"keywords": ["关键词1", "关键词2"]}},
-    {"action_type": "tool_call", "tool_name": "dependency_log_query", "params": {"keywords": ["关键词A"]}},
+    {"action_type": "tool_call", "tool_name": "log_query", "params": {"match_phrase_list": ["traceId"], "match_list": ["关键词1", "关键词2"]}},
+    {"action_type": "tool_call", "tool_name": "dependency_log_query", "params": {"match_phrase_list": ["traceId"], "match_list": ["关键词A"]}},
     {"action_type": "merge_evidence", "tool_name": null, "params": {}}
   ]
 }
@@ -21,4 +21,5 @@
 4. 如果证据不足，优先先查日志再查知识库。
 5. plan_steps 必须与技能定义中的能力边界一致，不能输出技能未覆盖的工具调用。
 6. 当用户需求涉及拉取或更新代码时，优先在 plan_steps 中使用 code_clone 或 code_pull，并在 params 中传入 git_url。
-7. 对于 `log_query` 或 `dependency_log_query`，`params` 中必须包含可用于日志查询的关键词（推荐字段 `keywords`，也可用 keyword/query/content，但不得为空）。
+7. 对于 `log_query` 或 `dependency_log_query`，`params` 必须使用 `match_phrase_list` 和 `match_list` 两个字段来表达查询条件；两者至少一个非空。
+8. traceId/订单号等强约束标识放入 `match_phrase_list`；错误词、业务词等扩召回关键词放入 `match_list`。

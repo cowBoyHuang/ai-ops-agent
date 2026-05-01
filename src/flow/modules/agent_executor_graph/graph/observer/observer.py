@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
@@ -13,6 +14,7 @@ _LOG = logging.getLogger(__name__)
 _RETRYABLE_TOKENS = ("timeout", "network", "connection", "temporarily", "503", "429")
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
+_TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -102,6 +104,31 @@ def _extract_effective_info(raw_result: dict[str, Any]) -> tuple[list[str], dict
     return keywords, facts
 
 
+def _normalize_terms(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return []
+
+
+def _split_terms_for_query(terms: list[str]) -> tuple[list[str], list[str]]:
+    phrase_terms: list[str] = []
+    fuzzy_terms: list[str] = []
+    for term in terms:
+        text = str(term or "").strip()
+        if not text:
+            continue
+        if _TRACE_ID_PATTERN.search(text):
+            if text not in phrase_terms:
+                phrase_terms.append(text)
+            continue
+        if text not in fuzzy_terms:
+            fuzzy_terms.append(text)
+    return phrase_terms, fuzzy_terms
+
+
 def _is_new_problem(raw_result: dict[str, Any], effective_facts: dict[str, Any]) -> bool:
     for key in ("new_problem", "new_issue", "new_situation", "problem_mismatch"):
         if bool(effective_facts.get(key)):
@@ -126,17 +153,30 @@ def _build_local_adjustment_step(
         tool_name = ""
     params = decision.get("params")
     params_dict = dict(params) if isinstance(params, dict) else {}
+    match_phrase_list = _normalize_terms(params_dict.get("match_phrase_list"))
+    match_list = _normalize_terms(params_dict.get("match_list"))
 
     if not tool_name:
         if str(step.get("tool_name") or "") == "log_query":
             tool_name = "dependency_log_query"
             if observed_keywords:
-                params_dict.setdefault("keywords", observed_keywords[:5])
+                phrase_terms, fuzzy_terms = _split_terms_for_query(observed_keywords[:5])
+                if not match_phrase_list and phrase_terms:
+                    match_phrase_list = phrase_terms
+                if not match_list and fuzzy_terms:
+                    match_list = fuzzy_terms
         else:
             tool_name = str(step.get("tool_name") or "")
 
-    if tool_name == "dependency_log_query" and observed_keywords and not list(params_dict.get("keywords") or []):
-        params_dict["keywords"] = observed_keywords[:5]
+    if tool_name == "dependency_log_query" and observed_keywords and not match_phrase_list and not match_list:
+        phrase_terms, fuzzy_terms = _split_terms_for_query(observed_keywords[:5])
+        match_phrase_list = phrase_terms
+        match_list = fuzzy_terms
+
+    params_dict["match_phrase_list"] = match_phrase_list
+    params_dict["match_list"] = match_list
+    params_dict.pop("keywords", None)
+    params_dict.pop("keyword", None)
 
     if not tool_name:
         return None

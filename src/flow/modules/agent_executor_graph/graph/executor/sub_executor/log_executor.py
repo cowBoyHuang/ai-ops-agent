@@ -39,6 +39,31 @@ def _extract_backup_keywords(question: str) -> list[str]:
     return [short] if short else []
 
 
+def _normalize_terms(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return []
+
+
+def _split_terms_for_query(terms: list[str]) -> tuple[list[str], list[str]]:
+    phrase_terms: list[str] = []
+    fuzzy_terms: list[str] = []
+    for term in terms:
+        text = str(term or "").strip()
+        if not text:
+            continue
+        if _TRACE_ID_PATTERN.search(text):
+            if text not in phrase_terms:
+                phrase_terms.append(text)
+            continue
+        if text not in fuzzy_terms:
+            fuzzy_terms.append(text)
+    return phrase_terms, fuzzy_terms
+
+
 def _extract_effective_info(tool_name: str, query_word: str, rows: list[EsResult]) -> dict[str, Any]:
     log_rows = [str(item.content or "") for item in rows[:_MAX_LOG_ROWS]]
     if not log_rows:
@@ -84,22 +109,14 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     logname = str(params.get("logname") or structured_context.get("logname") or "").strip()
     raw_phrase_list = params.get("match_phrase_list")
     raw_match_list = params.get("match_list")
-    match_phrase_list = [str(item).strip() for item in list(raw_phrase_list or []) if str(item).strip()]
-    match_list = [str(item).strip() for item in list(raw_match_list or []) if str(item).strip()]
+    match_phrase_list = _normalize_terms(raw_phrase_list)
+    match_list = _normalize_terms(raw_match_list)
 
     if not match_phrase_list and not match_list:
-        keywords = params.get("keywords") or params.get("keyword") or params.get("query") or ""
-        if not keywords:
-            backup = _extract_backup_keywords(str(state.get("question") or ""))
-            keywords = backup if backup else (state.get("question") or "")
-        if isinstance(keywords, list):
-            query_terms = [str(item).strip() for item in keywords if str(item).strip()]
-            match_phrase_list = query_terms
-            match_list = query_terms
-        else:
-            term = str(keywords or "").strip()
-            if term:
-                match_list = [term]
+        backup_terms = _extract_backup_keywords(str(state.get("question") or ""))
+        if not backup_terms:
+            backup_terms = _normalize_terms(state.get("question"))
+        match_phrase_list, match_list = _split_terms_for_query(backup_terms)
 
     query_word_for_prompt = " ".join([*match_phrase_list, *match_list]).strip()
 
@@ -107,7 +124,7 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
         return {
             "tool": tool_name,
             "ok": False,
-            "error": "missing query keywords for log executor",
+            "error": "missing match_phrase_list/match_list for log executor",
             "evidence": [],
         }
 
