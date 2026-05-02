@@ -6,6 +6,9 @@
 【历史对话信息】
 {history_dialogues}
 
+【消息缓存上下文（message_context）】
+{message_context}
+
 【技能定义（必须遵循）】
 {skills_context}
 
@@ -25,3 +28,5 @@
 1. 你需要优先阅读“完整文档内容”，并从中识别可能用于日志查询的关键词（例如错误码、异常类名、关键业务词）。
 2. 对于 log_query / dependency_log_query，把强约束标识（如 traceId/订单号）放入 params.match_phrase_list，把扩召回关键词放入 params.match_list。
 3. 强校验要求：凡是 log_query / dependency_log_query，params 必须包含 match_phrase_list 和 match_list 字段，且两者至少一个非空。
+4. 如果 plan_steps 中包含 log_query / dependency_log_query，必须增加代码步骤（code_pull 或 code_clone）以拉取并读取本地代码，形成“异常定位/判断依据”。
+5. 在 solution_steps 与 validation 中明确体现依据来源：至少包含“日志依据”和“代码依据”两个维度。

@@ -29,10 +29,13 @@ _MAX_QUERY_LEN = 500
 _MAX_PLAN_STEPS = 6
 _MAX_HISTORY_ROWS = 10
 _MAX_HISTORY_TEXT_LEN = 1200
+_MAX_MESSAGE_CONTEXT_ROUNDS = 8
+_MAX_MESSAGE_CONTEXT_TEXT_LEN = 1600
 _MAX_FULL_DOCS_FOR_PROMPT = 5
 _MAX_FULL_DOC_TEXT_LEN = 1500
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
 _LOG_QUERY_TOOLS = {"log_query", "dependency_log_query"}
+_CODE_QUERY_TOOLS = {"code_clone", "code_pull"}
 _LOG_QUERY_LIST_PARAM_KEYS = ("match_phrase_list", "match_list")
 _SKILLS_DIR = Path(__file__).resolve().parents[5] / "skills"
 _MAX_SKILL_TEXT_LEN = 1200
@@ -340,6 +343,41 @@ def _prepare_history_dialogues(state: dict[str, Any]) -> str:
     return _clip_text(merged, _MAX_HISTORY_TEXT_LEN) or "无历史对话信息"
 
 
+def _prepare_message_context(state: dict[str, Any]) -> str:
+    raw_context = dict(state.get("context") or {})
+    raw_message_context = raw_context.get("message_context")
+    if raw_message_context is None:
+        raw_message_context = state.get("message_context")
+
+    summary = ""
+    rounds: list[Any] = []
+    if isinstance(raw_message_context, dict):
+        summary = str(raw_message_context.get("summary") or "").strip()
+        rounds = list(raw_message_context.get("rounds") or [])
+    elif raw_message_context is not None:
+        summary = str(getattr(raw_message_context, "summary", "") or "").strip()
+        rounds = list(getattr(raw_message_context, "rounds", []) or [])
+
+    lines: list[str] = []
+    if summary:
+        lines.append(f"summary: {summary}")
+
+    for idx, row in enumerate(rounds[-_MAX_MESSAGE_CONTEXT_ROUNDS:], start=1):
+        if isinstance(row, dict):
+            user_text = str(row.get("message") or "").strip()
+            ai_text = str(row.get("aiResponse") or "").strip()
+        else:
+            user_text = str(getattr(row, "message", "") or "").strip()
+            ai_text = str(getattr(row, "aiResponse", "") or "").strip()
+        if user_text:
+            lines.append(f"round{idx}.user: {user_text}")
+        if ai_text:
+            lines.append(f"round{idx}.assistant: {ai_text}")
+
+    merged = "\n".join(lines).strip()
+    return _clip_text(merged, _MAX_MESSAGE_CONTEXT_TEXT_LEN) or "无消息缓存上下文"
+
+
 def _prepare_full_docs_content(parent_docs: list[dict[str, Any]]) -> str:
     sections: list[str] = []
     for idx, item in enumerate(parent_docs[:_MAX_FULL_DOCS_FOR_PROMPT], start=1):
@@ -391,6 +429,7 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
     parent_docs = list(structured_context.get("rag_parent_docs") or state.get("rag_parent_docs") or [])
     parent_docs = _merge_parent_docs_from_chunk_paths(rag_docs=rag_docs, parent_docs=parent_docs)
     history_dialogues = _prepare_history_dialogues(state)
+    message_context = _prepare_message_context(state)
     full_docs_content = _prepare_full_docs_content(parent_docs)
     ref_rows: list[str] = []
     for idx, item in enumerate(parent_docs, start=1):
@@ -411,6 +450,7 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
         "rag_solutions_summary": rag_solutions_summary,
         "full_docs_references": full_docs_references,
         "history_dialogues": history_dialogues,
+        "message_context": message_context,
         "full_docs_content": full_docs_content,
         "skills_context": skills_context,
         "skills_count": len(skills),
@@ -423,6 +463,7 @@ def _build_planner_user_prompt(context: dict[str, Any]) -> str:
         "planner_user_prompt.txt",
         user_query=str(context.get("user_query") or ""),
         history_dialogues=str(context.get("history_dialogues") or ""),
+        message_context=str(context.get("message_context") or ""),
         skills_context=str(context.get("skills_context") or ""),
         log_diagnosis_summary=str(context.get("log_diagnosis_summary") or ""),
         rag_solutions_summary=str(context.get("rag_solutions_summary") or ""),
@@ -452,9 +493,11 @@ def _map_tool_name(raw_name: Any) -> str:
 def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
     rows = list(raw_steps or []) if isinstance(raw_steps, list) else []
     result: list[PlanStep] = []
+    has_candidate_steps = False
     for item in rows[:_MAX_PLAN_STEPS]:
         if not isinstance(item, dict):
             continue
+        has_candidate_steps = True
         action_type = str(item.get("action_type") or "").strip()
         if action_type == "merge_evidence":
             result.append({"action_type": "merge_evidence", "tool_name": None, "params": {}})
@@ -471,8 +514,11 @@ def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
             }
         )
 
-    has_tool_call = any(str(step.get("action_type")) == "tool_call" for step in result)
-    if not has_tool_call:
+    # 允许“按需不调工具”的计划：LLM 无步骤时，默认保留 merge_evidence 单步收口。
+    # 但若 LLM 给了候选步骤却全部无效，仍回退为空，交由上层走 fallback 规则计划。
+    if not result and not has_candidate_steps:
+        return [{"action_type": "merge_evidence", "tool_name": None, "params": {}}]
+    if not result:
         return []
     if not result or str(result[-1].get("action_type")) != "merge_evidence":
         result.append({"action_type": "merge_evidence", "tool_name": None, "params": {}})
@@ -608,6 +654,64 @@ def _normalize_log_params(
     return normalized
 
 
+def _is_placeholder_git_url(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    placeholder_tokens = (
+        "待补充",
+        "todo",
+        "to be filled",
+        "tbd",
+        "placeholder",
+    )
+    return any(token in text for token in placeholder_tokens)
+
+
+def _pick_primary_app_code_from_log_steps(plan_steps: list[PlanStep]) -> str:
+    for item in list(plan_steps or []):
+        if str(item.get("action_type") or "") != "tool_call":
+            continue
+        if str(item.get("tool_name") or "") not in _LOG_QUERY_TOOLS:
+            continue
+        params = dict(item.get("params") or {})
+        app_code = str(params.get("app_code") or "").strip().lower()
+        if app_code:
+            return app_code
+    return "f_tts_trade_order"
+
+
+def _normalize_existing_code_steps(
+    *,
+    plan_steps: list[dict[str, Any]],
+    app_code: str,
+    structured_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    context_git_url = str(
+        structured_context.get("git_url")
+        or dict(structured_context.get("code_repo") or {}).get("git_url")
+        or ""
+    ).strip()
+    for item in plan_steps:
+        if str(item.get("action_type") or "") != "tool_call":
+            continue
+        if str(item.get("tool_name") or "") not in _CODE_QUERY_TOOLS:
+            continue
+        params = dict(item.get("params") or {})
+        step_app_code = str(params.get("app_code") or "").strip().lower() or app_code
+        params["app_code"] = step_app_code
+        params["repo_name"] = str(params.get("repo_name") or "").strip() or step_app_code
+
+        git_url = str(params.get("git_url") or "").strip()
+        if _is_placeholder_git_url(git_url):
+            params.pop("git_url", None)
+            git_url = ""
+        if not git_url and context_git_url:
+            params["git_url"] = context_git_url
+        item["params"] = params
+    return plan_steps
+
+
 def _enrich_plan_steps_for_log_queries(plan_steps: list[PlanStep], user_query: str) -> list[PlanStep]:
     event_time = _extract_event_time(user_query)
     enriched: list[PlanStep] = []
@@ -629,6 +733,56 @@ def _enrich_plan_steps_for_log_queries(plan_steps: list[PlanStep], user_query: s
         )
         enriched.append(row)
     return enriched
+
+
+def _ensure_code_step_for_log_queries(
+    *,
+    plan_steps: list[PlanStep],
+    structured_context: dict[str, Any],
+) -> list[PlanStep]:
+    rows = [dict(item or {}) for item in list(plan_steps or [])]
+    has_log = any(
+        str(item.get("action_type") or "") == "tool_call"
+        and str(item.get("tool_name") or "") in _LOG_QUERY_TOOLS
+        for item in rows
+    )
+    has_code = any(
+        str(item.get("action_type") or "") == "tool_call"
+        and str(item.get("tool_name") or "") in _CODE_QUERY_TOOLS
+        for item in rows
+    )
+    if not has_log:
+        return rows
+
+    app_code = _pick_primary_app_code_from_log_steps(rows)
+    if has_code:
+        return _normalize_existing_code_steps(
+            plan_steps=rows,
+            app_code=app_code,
+            structured_context=structured_context,
+        )
+
+    code_params: dict[str, Any] = {"app_code": app_code, "repo_name": app_code}
+    git_url = str(
+        structured_context.get("git_url")
+        or dict(structured_context.get("code_repo") or {}).get("git_url")
+        or ""
+    ).strip()
+    if git_url:
+        code_params["git_url"] = git_url
+
+    code_step: PlanStep = {
+        "action_type": "tool_call",
+        "tool_name": "code_pull",
+        "params": code_params,
+    }
+    insert_index = len(rows)
+    for idx, item in enumerate(rows):
+        if str(item.get("action_type") or "") == "merge_evidence":
+            insert_index = idx
+            break
+    rows.insert(insert_index, code_step)
+    return rows
 
 
 def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
@@ -732,6 +886,10 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     plan_steps = _enrich_plan_steps_for_log_queries(
         plan_steps=plan_steps,
         user_query=str(context_for_llm.get("user_query") or question),
+    )
+    plan_steps = _ensure_code_step_for_log_queries(
+        plan_steps=plan_steps,
+        structured_context=dict(state.get("structured_context") or {}),
     )
 
     previous_plan = list(state.get("current_plan") or state.get("plan_steps") or [])

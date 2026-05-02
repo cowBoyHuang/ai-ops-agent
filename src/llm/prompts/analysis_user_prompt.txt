@@ -1,5 +1,10 @@
 请根据问题与证据生成根因分析结果，输出严格 JSON，字段包含：
 root_cause, confidence(high|medium|low), reply。
+
+要求：
+1. reply 中必须体现判断依据，优先包含“日志依据”与“代码依据”。
+2. 若证据出现 `code_file:` 或代码摘要，reply 必须明确引用相应代码依据（可用文件路径或代码行为描述）。
+
 问题:
 {question}
 

@@ -121,3 +121,31 @@ def pull_repo(git_url: str, repo_root: str | Path = _DEFAULT_CODE_REPO_DIR) -> d
         "target_dir": str(target_dir),
     }
 
+
+def pull_repo_local(repo_name: str, repo_root: str | Path = _DEFAULT_CODE_REPO_DIR) -> dict[str, Any]:
+    """Pull latest changes for repository in src/code_repo by local repo name."""
+    name = str(repo_name or "").strip()
+    if not name:
+        return {"ok": False, "message": "empty repo_name"}
+
+    root = Path(repo_root).expanduser().resolve()
+    target_dir = root / name
+    git_dir = target_dir / ".git"
+    if not git_dir.is_dir():
+        return {
+            "ok": False,
+            "action": "pull_local",
+            "status": "failed",
+            "repo_name": name,
+            "target_dir": str(target_dir),
+            "message": "repository not found in local code_repo",
+        }
+
+    run_result = _run_git_command(["git", "pull", "--ff-only"], cwd=target_dir)
+    return {
+        **run_result,
+        "action": "pull_local",
+        "status": "updated" if bool(run_result.get("ok")) else "failed",
+        "repo_name": name,
+        "target_dir": str(target_dir),
+    }
