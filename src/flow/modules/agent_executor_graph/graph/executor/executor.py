@@ -81,7 +81,7 @@ def _execute_tool_call(
         return _tool_failed(normalized_tool or "none", f"unsupported tool: {normalized_tool}")
 
     tool_call_count = _as_int(state.get("tool_call_count"), 0)
-    max_tool_calls = max(1, _as_int(state.get("max_tool_calls"), 6))
+    max_tool_calls = max(1, _as_int(state.get("max_tool_calls"), 8))
     question = str(state.get("question") or "")
     if tool_call_count >= max_tool_calls:
         return _tool_failed(normalized_tool, "max_tool_calls_exceeded", extra={"budget_exhausted": True})
@@ -280,4 +280,3 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state["route"] = "observer"
     _LOGGER.info("executor 单步执行完成: step=%d tool=%s ok=%s", current_step_index, str(step.get("tool_name") or "none"), bool(raw_result.get("ok")))
     return dict(state)
-

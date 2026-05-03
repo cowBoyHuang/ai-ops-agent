@@ -23,4 +23,4 @@
 6. 当用户需求涉及拉取或更新代码时，优先在 plan_steps 中使用 code_clone 或 code_pull，并在 params 中传入 git_url。
 7. 对于 `log_query` 或 `dependency_log_query`，`params` 必须使用 `match_phrase_list` 和 `match_list` 两个字段来表达查询条件；两者至少一个非空。
 8. traceId/订单号等强约束标识放入 `match_phrase_list`；错误词、业务词等扩召回关键词放入 `match_list`。
-9. 只要 plan_steps 中出现 `log_query` 或 `dependency_log_query`，必须追加一次代码步骤（`code_pull` 或 `code_clone`），用于拉取并读取本地代码，输出异常定位/判断依据。
+9. 当日志检索已出现明确异常或关键线索，且需要进一步定位实现逻辑时，可追加代码步骤（`code_pull` 或 `code_clone`）；若暂无代码线索，可直接进入 `merge_evidence`。

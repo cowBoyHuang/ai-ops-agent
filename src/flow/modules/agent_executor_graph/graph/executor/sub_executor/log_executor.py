@@ -13,6 +13,22 @@ from log.log import EsResult, query_external_logs
 _DEFAULT_WINDOW_MINUTES = 30
 _MAX_LOG_ROWS = 8
 _TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
+_BIZ_CODE_PATTERN = re.compile(r"\b\d{2}_[0-9A-Z]{3,}_[0-9A-Z]{3,}_[0-9]{4}\b")
+_DECISIVE_HINTS = (
+    "校验不通过",
+    "人数限制",
+    "很抱歉",
+    "生单失败",
+    "失败",
+    "超时",
+    "timeout",
+    "connection refused",
+    "连接失败",
+    '"errormsg":"',
+    '"errmsg":"',
+    "failres",
+    "block_reason",
+)
 
 
 def _as_datetime(value: Any, default: dt.datetime) -> dt.datetime:
@@ -64,8 +80,55 @@ def _split_terms_for_query(terms: list[str]) -> tuple[list[str], list[str]]:
     return phrase_terms, fuzzy_terms
 
 
+def _score_row_for_evidence(text: str) -> int:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return -99
+    score = 0
+    for token in _DECISIVE_HINTS:
+        if token in lowered:
+            score += 6
+    if '"success":false' in lowered or '"resultok":false' in lowered:
+        score += 2
+    if "需为" in text and "人" in text:
+        score += 8
+    if "bizerrorcode" in lowered and _BIZ_CODE_PATTERN.search(text):
+        has_human_reason = any(token in lowered for token in ("errormsg", "errmsg", "failres", "block_reason", "很抱歉", "失败"))
+        if not has_human_reason:
+            score -= 6
+    return score
+
+
+def _select_rows_for_evidence(rows: list[EsResult]) -> list[EsResult]:
+    if len(rows) <= _MAX_LOG_ROWS:
+        return rows
+
+    scored: list[tuple[int, int]] = []
+    for idx, item in enumerate(rows):
+        scored.append((_score_row_for_evidence(str(item.content or "")), idx))
+
+    selected_indices: list[int] = []
+    # 先挑“可常识判断”的关键失败行。
+    for score, idx in sorted(scored, key=lambda pair: (-pair[0], pair[1])):
+        if score < 8:
+            break
+        if idx not in selected_indices:
+            selected_indices.append(idx)
+        if len(selected_indices) >= _MAX_LOG_ROWS:
+            break
+
+    # 再按原顺序补足上下文。
+    for idx in range(len(rows)):
+        if len(selected_indices) >= _MAX_LOG_ROWS:
+            break
+        if idx not in selected_indices:
+            selected_indices.append(idx)
+
+    return [rows[idx] for idx in selected_indices]
+
+
 def _extract_effective_info(tool_name: str, query_word: str, rows: list[EsResult]) -> dict[str, Any]:
-    log_rows = [str(item.content or "") for item in rows[:_MAX_LOG_ROWS]]
+    log_rows = [str(item.content or "") for item in rows]
     if not log_rows:
         return {
             "summary": "未检索到日志命中",
@@ -160,8 +223,9 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     except Exception as exc:  # noqa: BLE001
         return {"tool": tool_name, "ok": False, "error": str(exc), "evidence": []}
 
-    extracted = _extract_effective_info(tool_name, query_word_for_prompt, rows)
-    evidence = [str(item.content or "") for item in rows[:_MAX_LOG_ROWS]]
+    evidence_rows = _select_rows_for_evidence(rows)
+    extracted = _extract_effective_info(tool_name, query_word_for_prompt, evidence_rows)
+    evidence = [str(item.content or "") for item in evidence_rows]
     if extracted.get("summary"):
         evidence.insert(0, f"[summary] {str(extracted['summary'])}")
     return {

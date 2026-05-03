@@ -48,11 +48,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         raw_context.get("conversation_context") or state.get("conversation_context") or []
     )
     state["retry_count"] = raw_context.get("retry_count", state.get("retry_count", 0))
-    state["max_retries"] = raw_context.get("max_retries", raw_context.get("max_retry", state.get("max_retries", 2)))
+    state["max_retries"] = raw_context.get("max_retries", raw_context.get("max_retry", state.get("max_retries", 0)))
     state["replan_count"] = raw_context.get("replan_count", state.get("replan_count", 0))
     state["max_replan"] = raw_context.get("max_replan", state.get("max_replan", 2))
     state["tool_call_count"] = raw_context.get("tool_call_count", state.get("tool_call_count", 0))
-    state["max_tool_calls"] = raw_context.get("max_tool_calls", state.get("max_tool_calls", 6))
+    state["max_tool_calls"] = raw_context.get("max_tool_calls", state.get("max_tool_calls", 8))
     state["current_step_index"] = raw_context.get("current_step_index", state.get("current_step_index", 0))
     state["current_plan"] = raw_context.get("current_plan", state.get("current_plan", state.get("plan_steps", [])))
     state["original_plan"] = raw_context.get("original_plan", state.get("original_plan", []))

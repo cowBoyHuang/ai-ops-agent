@@ -14,6 +14,7 @@ _LOG = logging.getLogger(__name__)
 _RETRYABLE_TOKENS = ("timeout", "network", "connection", "temporarily", "503", "429")
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
+_CODE_QUERY_TOOLS = {"code_clone", "code_pull"}
 _TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
 
 
@@ -102,6 +103,19 @@ def _extract_effective_info(raw_result: dict[str, Any]) -> tuple[list[str], dict
     keywords = [str(item).strip() for item in list(info.get("keywords") or []) if str(item).strip()]
     facts = dict(info.get("facts") or {})
     return keywords, facts
+
+
+def _has_log_evidence_from_history(execution_history: dict[str, Any]) -> bool:
+    for key in sorted(execution_history.keys(), key=lambda item: _as_int(str(item).split("_")[-1], 0)):
+        item = dict(execution_history.get(key) or {})
+        raw_result = dict(item.get("raw_result") or {})
+        tool_name = str(raw_result.get("tool") or dict(item.get("step") or {}).get("tool_name") or "").strip()
+        if tool_name not in {"log_query", "dependency_log_query"}:
+            continue
+        evidence_rows = [str(row).strip() for row in list(raw_result.get("evidence") or []) if str(row).strip()]
+        if evidence_rows:
+            return True
+    return False
 
 
 def _normalize_terms(value: Any) -> list[str]:
@@ -294,6 +308,13 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     tool_error = str(raw_result.get("error") or "")
     evidence_rows = [str(item).strip() for item in list(raw_result.get("evidence") or []) if str(item).strip()]
     recent_failures = _count_recent_failures(execution_history, window=2)
+    current_tool = str(raw_result.get("tool") or step.get("tool_name") or "").strip()
+    code_failed_with_log_context = (
+        (current_tool in _CODE_QUERY_TOOLS)
+        and (not tool_ok)
+        and (not evidence_rows)
+        and _has_log_evidence_from_history(execution_history)
+    )
     replan_scope = str(effective_facts.get("replan_scope") or "").strip().lower()
     if replan_scope == "global":
         return _route_replan_with_budget(state, "effective_info_global_replan")
@@ -303,7 +324,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not tool_ok and _is_retryable_error(tool_error):
         retry_count = _as_int(state.get("retry_count"), 0)
-        max_retries = max(0, _as_int(state.get("max_retries"), 2))
+        max_retries = max(0, _as_int(state.get("max_retries"), 0))
         if retry_count < max_retries:
             state["retry_count"] = retry_count + 1
             state["current_step_index"] = max(0, current_step_index - 1)
@@ -314,7 +335,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     if recent_failures >= 2:
         return _route_replan_with_budget(state, "consecutive_step_failures")
 
-    if not tool_ok and not evidence_rows:
+    if not tool_ok and not evidence_rows and not code_failed_with_log_context:
         return _route_replan_with_budget(state, "no_logs_or_evidence")
 
     next_step = current_plan[current_step_index] if current_step_index < len(current_plan) else {}
@@ -325,7 +346,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         and str(step.get("tool_name") or "") == "log_query"
         and next_tool != "dependency_log_query"
     )
-    should_call_llm = (not tool_ok) or followup_mismatch
+    should_call_llm = ((not tool_ok) and (not code_failed_with_log_context)) or followup_mismatch
     if should_call_llm:
         decision = _decide_adjust_or_replan_with_llm(
             state=state,

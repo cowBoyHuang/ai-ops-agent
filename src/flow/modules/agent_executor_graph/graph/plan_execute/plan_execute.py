@@ -191,7 +191,7 @@ def _execute_tool_call(
         return _tool_failed(normalized_tool or "none", f"unsupported tool: {normalized_tool}")
 
     tool_call_count = _as_int(state.get("tool_call_count"), 0)
-    max_tool_calls = max(1, _as_int(state.get("max_tool_calls"), 6))
+    max_tool_calls = max(1, _as_int(state.get("max_tool_calls"), 8))
     question = str(state.get("question") or "")
 
     if tool_call_count >= max_tool_calls:

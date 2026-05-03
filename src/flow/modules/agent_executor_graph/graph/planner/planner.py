@@ -740,48 +740,20 @@ def _ensure_code_step_for_log_queries(
     plan_steps: list[PlanStep],
     structured_context: dict[str, Any],
 ) -> list[PlanStep]:
+    """规范化已有代码步骤，不再因日志步骤强制插入代码步骤。"""
     rows = [dict(item or {}) for item in list(plan_steps or [])]
-    has_log = any(
-        str(item.get("action_type") or "") == "tool_call"
-        and str(item.get("tool_name") or "") in _LOG_QUERY_TOOLS
-        for item in rows
-    )
     has_code = any(
         str(item.get("action_type") or "") == "tool_call"
         and str(item.get("tool_name") or "") in _CODE_QUERY_TOOLS
         for item in rows
     )
-    if not has_log:
-        return rows
-
-    app_code = _pick_primary_app_code_from_log_steps(rows)
     if has_code:
+        app_code = _pick_primary_app_code_from_log_steps(rows)
         return _normalize_existing_code_steps(
             plan_steps=rows,
             app_code=app_code,
             structured_context=structured_context,
         )
-
-    code_params: dict[str, Any] = {"app_code": app_code, "repo_name": app_code}
-    git_url = str(
-        structured_context.get("git_url")
-        or dict(structured_context.get("code_repo") or {}).get("git_url")
-        or ""
-    ).strip()
-    if git_url:
-        code_params["git_url"] = git_url
-
-    code_step: PlanStep = {
-        "action_type": "tool_call",
-        "tool_name": "code_pull",
-        "params": code_params,
-    }
-    insert_index = len(rows)
-    for idx, item in enumerate(rows):
-        if str(item.get("action_type") or "") == "merge_evidence":
-            insert_index = idx
-            break
-    rows.insert(insert_index, code_step)
     return rows
 
 

@@ -9,9 +9,26 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
+
+_FAILURE_HINTS = (
+    "校验不通过",
+    "生单失败",
+    "order_failed",
+    "errormsg",
+    "success\":false",
+    "resultok\":false",
+    "block_reason",
+)
+_UNCERTAIN_HINTS = ("无法确定", "不确定", "未知", "unknown", "need more", "更多信息")
+_BIZ_CODE_PATTERN = re.compile(r"\b\d{2}_[0-9A-Z]{3,}_[0-9A-Z]{3,}_[0-9]{4}\b")
+_REASON_PATTERNS = (
+    re.compile(r'"(?:errorMsg|errMsg|failRes|block_reason|reason|msg)"\s*:\s*"([^"]{4,220})"'),
+    re.compile(r"(?:校验不通过|失败)[^:：]{0,24}[:：]\s*(?:\([^,，]*[,，])?([^)\n]{4,220})"),
+)
 
 
 def _has_retryable_error(error_text: str) -> bool:
@@ -24,8 +41,7 @@ def _has_retryable_error(error_text: str) -> bool:
 def _has_uncertain_answer(root_cause: str, solution: str) -> bool:
     """分析文案是否表达了“不确定/信息不足”。"""
     text = f"{root_cause} {solution}".lower()
-    uncertain_hints = ("无法确定", "不确定", "未知", "unknown", "need more", "更多信息")
-    return any(token in text for token in uncertain_hints)
+    return any(token in text for token in _UNCERTAIN_HINTS)
 
 
 def _to_confidence(value: Any) -> float:
@@ -41,6 +57,34 @@ def _to_confidence(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _extract_decisive_log_reason(merged_evidence: dict[str, Any]) -> str:
+    """从日志证据中提取“可直接给结论”的失败原因。"""
+    logs = list(merged_evidence.get("logs") or [])
+    knowledge = list(merged_evidence.get("knowledge") or [])
+    rows = [*logs, *knowledge]
+    for item in rows:
+        raw = str(dict(item or {}).get("text") or "").strip()
+        if not raw:
+            continue
+        normalized = raw.replace('\\"', '"')
+        lowered = normalized.lower()
+        if not any(token in lowered for token in _FAILURE_HINTS):
+            continue
+
+        for pattern in _REASON_PATTERNS:
+            matched = pattern.search(normalized)
+            if not matched:
+                continue
+            reason = str(matched.group(1) or "").strip(" ,，:：'\"")
+            # bizCode 只作为辅助证据，不能单独作为“关键定位证据”。
+            if _BIZ_CODE_PATTERN.fullmatch(reason):
+                continue
+            if reason and not any(hint in reason.lower() for hint in _UNCERTAIN_HINTS):
+                return reason
+
+    return ""
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -64,16 +108,33 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     tool_error = str(tool_result.get("error") or "")
 
     tool_call_count = int(state.get("tool_call_count") or 0)
-    max_tool_calls = max(1, int(state.get("max_tool_calls") or 6))
+    max_tool_calls = max(1, int(state.get("max_tool_calls") or 8))
     current_step_index = int(state.get("current_step_index") or 0)
     plan_steps = list(state.get("current_plan") or state.get("plan_steps") or [])
     has_more_plan_steps = current_step_index < len(plan_steps)
     logs = list(merged_evidence.get("logs") or [])
     knowledge = list(merged_evidence.get("knowledge") or [])
     has_evidence = bool(logs or knowledge)
+    decisive_reason = _extract_decisive_log_reason(merged_evidence)
+    if decisive_reason:
+        root_cause = root_cause or decisive_reason
+        solution = solution or f"日志已明确给出失败原因：{decisive_reason}。请按该原因调整请求参数或业务规则后重试。"
+        confidence = max(confidence, 0.9)
+        state["root_cause"] = root_cause
+        state["solution"] = solution
+        state["confidence"] = confidence
+        state["analysis"] = {
+            **analysis,
+            "root_cause": root_cause,
+            "reply": solution,
+            "confidence": "high",
+            "decision_source": "decisive_log_evidence",
+        }
 
     # 判定顺序遵循“先硬限制，再可重试，再成功，再重规划”。
-    if tool_call_count >= max_tool_calls:
+    if decisive_reason:
+        status = "SUCCESS"
+    elif tool_call_count >= max_tool_calls:
         status = "FAIL"
     elif not tool_ok and _has_retryable_error(tool_error):
         status = "NEED_RETRY"

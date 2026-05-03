@@ -137,7 +137,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
     structured_context = dict(state.get("structured_context") or {})
     question = _pick_message_for_intent(state)
-    max_retry = _to_int(state.get("max_retries"), 2)
+    max_retry = _to_int(state.get("max_retries"), 0)
     retry_count = _to_int(state.get("intent_retry_count"), 0)
     history = state.get("conversation_context") or structured_context.get("recent_messages") or []
     conversation_context = [str(item) for item in history if str(item).strip()]
