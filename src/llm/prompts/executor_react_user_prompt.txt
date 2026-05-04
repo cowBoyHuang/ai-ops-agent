@@ -1,0 +1,16 @@
+请基于以下上下文进行单轮 ReAct 决策，并返回严格 JSON：
+
+【用户问题】
+{question}
+
+【当前子任务】
+{current_subtask_json}
+
+【上一步观察结果（Observation）】
+{previous_observation_json}
+
+【可用工具定义（Function Schema）】
+{tool_schemas_json}
+
+【最近执行历史】
+{history_preview}

@@ -34,6 +34,17 @@ _MAX_MESSAGE_CONTEXT_TEXT_LEN = 1600
 _MAX_FULL_DOCS_FOR_PROMPT = 5
 _MAX_FULL_DOC_TEXT_LEN = 1500
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
+_TOOL_HINT_NAME_MAP = {
+    "query_log": "query_log",
+    "log_query": "query_log",
+    "dependency_log_query": "dependency_log_query",
+    "query_dependency_log": "dependency_log_query",
+    "knowledge_lookup": "knowledge_lookup",
+    "fetch_code": "fetch_code",
+    "code_pull": "fetch_code",
+    "code_clone": "clone_code",
+    "clone_code": "clone_code",
+}
 _LOG_QUERY_TOOLS = {"log_query", "dependency_log_query"}
 _CODE_QUERY_TOOLS = {"code_clone", "code_pull"}
 _LOG_QUERY_LIST_PARAM_KEYS = ("match_phrase_list", "match_list")
@@ -490,6 +501,60 @@ def _map_tool_name(raw_name: Any) -> str:
     return ""
 
 
+def _normalize_tool_hints(value: Any) -> list[str]:
+    if isinstance(value, str):
+        rows = [value]
+    elif isinstance(value, list):
+        rows = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        rows = []
+
+    hints: list[str] = []
+    for item in rows:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        normalized = _TOOL_HINT_NAME_MAP.get(lowered, lowered)
+        if normalized and normalized not in hints:
+            hints.append(normalized)
+    return hints
+
+
+def _normalize_react_subtask_step(item: dict[str, Any]) -> PlanStep | None:
+    subtask = str(
+        item.get("subtask")
+        or item.get("task")
+        or item.get("step")
+        or item.get("title")
+        or ""
+    ).strip()
+    hypothesis = str(item.get("hypothesis") or item.get("reasoning") or item.get("why") or "").strip()
+    success_criteria = str(
+        item.get("success_criteria")
+        or item.get("done_when")
+        or item.get("expected_signal")
+        or ""
+    ).strip()
+    suggested_tools = _normalize_tool_hints(
+        item.get("suggested_tools")
+        or item.get("tool_candidates")
+        or item.get("preferred_tools")
+        or item.get("tool_hint")
+    )
+    if not subtask and not hypothesis and not success_criteria:
+        return None
+    return {
+        "action_type": "react_subtask",
+        "tool_name": None,
+        "params": {},
+        "subtask": subtask,
+        "hypothesis": hypothesis,
+        "success_criteria": success_criteria,
+        "suggested_tools": suggested_tools,
+    }
+
+
 def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
     rows = list(raw_steps or []) if isinstance(raw_steps, list) else []
     result: list[PlanStep] = []
@@ -504,6 +569,9 @@ def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
             continue
         tool_name = _map_tool_name(item.get("tool_name"))
         if not tool_name:
+            react_step = _normalize_react_subtask_step(item)
+            if react_step:
+                result.append(react_step)
             continue
         params = dict(item.get("params") or {})
         result.append(
@@ -581,6 +649,30 @@ def _extract_event_time(user_query: str) -> dt.datetime | None:
         if event_time is not None:
             return event_time
     return None
+
+
+def _has_any_non_empty_value(mapping: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def _ensure_structured_log_window(structured_context: dict[str, Any], user_query: str) -> dict[str, Any]:
+    context = dict(structured_context or {})
+    has_begin = _has_any_non_empty_value(context, ("begin_time", "beginTime", "start_time", "startTime"))
+    has_end = _has_any_non_empty_value(context, ("end_time", "endTime", "finish_time", "finishTime"))
+    if has_begin and has_end:
+        return context
+    event_time = _extract_event_time(user_query)
+    if event_time is None:
+        return context
+    if not has_begin:
+        context["begin_time"] = (event_time - dt.timedelta(hours=1)).isoformat()
+    if not has_end:
+        context["end_time"] = (event_time + dt.timedelta(hours=1)).isoformat()
+    return context
 
 
 def _pick_explicit_app_code(text: str) -> str:
@@ -859,16 +951,19 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         plan_steps=plan_steps,
         user_query=str(context_for_llm.get("user_query") or question),
     )
+    structured_context = _ensure_structured_log_window(
+        dict(state.get("structured_context") or {}),
+        str(context_for_llm.get("user_query") or question),
+    )
     plan_steps = _ensure_code_step_for_log_queries(
         plan_steps=plan_steps,
-        structured_context=dict(state.get("structured_context") or {}),
+        structured_context=structured_context,
     )
 
     previous_plan = list(state.get("current_plan") or state.get("plan_steps") or [])
     if not previous_plan or replan_count > 0:
         state["current_step_index"] = 0
 
-    structured_context = dict(state.get("structured_context") or {})
     llm_request = {
         "system_prompt": str(llm_plan_meta.get("system_prompt") or ""),
         "user_prompt": str(llm_plan_meta.get("user_prompt") or ""),

@@ -10,3 +10,5 @@ This directory stores LLM prompt templates.
 - `sensitive_operation_user_prompt.txt`: user prompt template for sensitive operation check.
 - `planner_system_prompt.txt`: system prompt for planner node.
 - `planner_user_prompt.txt`: user prompt template for planner node.
+- `executor_react_system_prompt.txt`: system prompt for executor ReAct decision node.
+- `executor_react_user_prompt.txt`: user prompt template for executor ReAct decision node.

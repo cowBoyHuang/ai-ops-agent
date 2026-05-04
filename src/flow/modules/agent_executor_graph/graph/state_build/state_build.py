@@ -26,6 +26,22 @@ def _pick_question(raw_context: dict[str, Any], state: dict[str, Any], structure
     return ""
 
 
+def _pick_upstream_value(
+    raw_context: dict[str, Any],
+    structured_context: dict[str, Any],
+    keys: tuple[str, ...],
+) -> Any:
+    for key in keys:
+        value = raw_context.get(key)
+        if value is not None and str(value).strip():
+            return value
+    for key in keys:
+        value = structured_context.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return ""
+
+
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     """构建子图公共状态（仅字段搬运 + 固定默认值）。"""
     state: AgentState = dict(payload)
@@ -33,12 +49,24 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     structured_context = dict(state.get("structured_context") or {})
 
     question = _pick_question(raw_context, state, structured_context)
+    begin_time = _pick_upstream_value(
+        raw_context,
+        structured_context,
+        ("begin_time", "beginTime", "start_time", "startTime"),
+    )
+    end_time = _pick_upstream_value(
+        raw_context,
+        structured_context,
+        ("end_time", "endTime", "finish_time", "finishTime"),
+    )
     state["question"] = question
     state["structured_context"] = {
         **structured_context,
         "question": question,
         "order_id": str(raw_context.get("order_id") or structured_context.get("order_id") or ""),
         "request_id": str(raw_context.get("request_id") or structured_context.get("request_id") or ""),
+        "begin_time": begin_time,
+        "end_time": end_time,
         "simulate_tool_timeout_once": bool(
             raw_context.get("simulate_tool_timeout_once") or structured_context.get("simulate_tool_timeout_once")
         ),
@@ -52,7 +80,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state["replan_count"] = raw_context.get("replan_count", state.get("replan_count", 0))
     state["max_replan"] = raw_context.get("max_replan", state.get("max_replan", 2))
     state["tool_call_count"] = raw_context.get("tool_call_count", state.get("tool_call_count", 0))
-    state["max_tool_calls"] = raw_context.get("max_tool_calls", state.get("max_tool_calls", 8))
+    # Plan-ReAct 会在同一步内做有限重试，默认预算需覆盖“多步 + 重规划”场景，避免过早触发预算熔断。
+    state["max_tool_calls"] = raw_context.get("max_tool_calls", state.get("max_tool_calls", 24))
+    state["in_place_retry_count"] = raw_context.get("in_place_retry_count", state.get("in_place_retry_count", 0))
     state["current_step_index"] = raw_context.get("current_step_index", state.get("current_step_index", 0))
     state["current_plan"] = raw_context.get("current_plan", state.get("current_plan", state.get("plan_steps", [])))
     state["original_plan"] = raw_context.get("original_plan", state.get("original_plan", []))

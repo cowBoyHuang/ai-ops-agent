@@ -69,6 +69,30 @@ def _route_replan_with_budget(state: dict[str, Any], reason: str) -> dict[str, A
     replan_count = _as_int(state.get("replan_count"), 0)
     max_replan = max(0, _as_int(state.get("max_replan"), 2))
     if replan_count >= max_replan:
+        execution_history = dict(state.get("execution_history") or {})
+        merged_evidence, evidence_context = _build_merged_evidence(state=state, execution_history=execution_history)
+        has_any_evidence = bool(list(merged_evidence.get("logs") or []) or list(merged_evidence.get("knowledge") or []))
+        if has_any_evidence:
+            structured_context = dict(state.get("structured_context") or {})
+            state["merged_evidence"] = merged_evidence
+            state["evidence"] = merged_evidence
+            state["structured_context"] = {
+                **structured_context,
+                "evidence_context": evidence_context,
+                "merged_evidence_summary": {
+                    "logs_count": len(list(merged_evidence.get("logs") or [])),
+                    "knowledge_count": len(list(merged_evidence.get("knowledge") or [])),
+                    "keywords_count": len(list(state.get("extracted_keywords") or [])),
+                },
+            }
+            analysis = dict(state.get("analysis") or {})
+            state["analysis"] = {
+                **analysis,
+                "reply": str(analysis.get("reply") or "排查预算已用尽，已输出当前阶段证据结论。"),
+            }
+            _clear_adjustment_fields(state)
+            state["route"] = "analysis_execute"
+            return dict(state)
         analysis = dict(state.get("analysis") or {})
         state["analysis"] = {**analysis, "reply": str(analysis.get("reply") or _FALLBACK_MESSAGE)}
         state["final_answer"] = _FALLBACK_MESSAGE
@@ -343,7 +367,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     followup_mismatch = (
         not plan_complete
         and bool(observed_keywords)
-        and str(step.get("tool_name") or "") == "log_query"
+        and current_tool == "log_query"
         and next_tool != "dependency_log_query"
     )
     should_call_llm = ((not tool_ok) and (not code_failed_with_log_context)) or followup_mismatch

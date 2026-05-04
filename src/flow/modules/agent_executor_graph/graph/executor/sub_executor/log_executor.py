@@ -10,7 +10,6 @@ from typing import Any
 from llm.llm import chat_with_llm
 from log.log import EsResult, query_external_logs
 
-_DEFAULT_WINDOW_MINUTES = 30
 _MAX_LOG_ROWS = 8
 _TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
 _BIZ_CODE_PATTERN = re.compile(r"\b\d{2}_[0-9A-Z]{3,}_[0-9A-Z]{3,}_[0-9]{4}\b")
@@ -31,17 +30,31 @@ _DECISIVE_HINTS = (
 )
 
 
-def _as_datetime(value: Any, default: dt.datetime) -> dt.datetime:
+def _as_datetime(value: Any) -> dt.datetime | None:
     if isinstance(value, dt.datetime):
         return value
     text = str(value or "").strip()
     if not text:
-        return default
+        return None
     candidate = text.replace("Z", "+00:00") if text.endswith("Z") else text
     try:
         return dt.datetime.fromisoformat(candidate)
     except ValueError:
-        return default
+        return None
+
+
+def _pick_upstream_value(
+    params: dict[str, Any],
+    structured_context: dict[str, Any],
+    keys: tuple[str, ...],
+) -> Any:
+    for key in keys:
+        if key in structured_context and structured_context.get(key) is not None and str(structured_context.get(key)).strip():
+            return structured_context.get(key)
+    for key in keys:
+        if key in params and params.get(key) is not None and str(params.get(key)).strip():
+            return params.get(key)
+    return None
 
 
 def _extract_backup_keywords(question: str) -> list[str]:
@@ -165,9 +178,32 @@ def _extract_effective_info(tool_name: str, query_word: str, rows: list[EsResult
 def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict[str, Any]) -> dict[str, Any]:
     tool_name = str(step.get("tool_name") or "log_query")
     params = dict(step.get("params") or {})
-    now = dt.datetime.now(dt.timezone.utc)
-    begin_time = _as_datetime(params.get("begin_time") or structured_context.get("begin_time"), now - dt.timedelta(minutes=_DEFAULT_WINDOW_MINUTES))
-    end_time = _as_datetime(params.get("end_time") or structured_context.get("end_time"), now)
+    begin_raw = _pick_upstream_value(
+        params,
+        structured_context,
+        ("begin_time", "beginTime", "start_time", "startTime"),
+    )
+    end_raw = _pick_upstream_value(
+        params,
+        structured_context,
+        ("end_time", "endTime", "finish_time", "finishTime"),
+    )
+    if begin_raw is None or end_raw is None:
+        return {
+            "tool": tool_name,
+            "ok": False,
+            "error": "missing begin_time/end_time from upstream",
+            "evidence": [],
+        }
+    begin_time = _as_datetime(begin_raw)
+    end_time = _as_datetime(end_raw)
+    if begin_time is None or end_time is None:
+        return {
+            "tool": tool_name,
+            "ok": False,
+            "error": "invalid begin_time/end_time format from upstream",
+            "evidence": [],
+        }
     app_code = str(params.get("app_code") or structured_context.get("app_code") or "").strip()
     logname = str(params.get("logname") or structured_context.get("logname") or "").strip()
     raw_phrase_list = params.get("match_phrase_list")

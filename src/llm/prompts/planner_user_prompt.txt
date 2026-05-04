@@ -26,7 +26,7 @@
 
 要求：
 1. 你需要优先阅读“完整文档内容”，并从中识别可能用于日志查询的关键词（例如错误码、异常类名、关键业务词）。
-2. 对于 log_query / dependency_log_query，把强约束标识（如 traceId/订单号）放入 params.match_phrase_list，把扩召回关键词放入 params.match_list。
-3. 强校验要求：凡是 log_query / dependency_log_query，params 必须包含 match_phrase_list 和 match_list 字段，且两者至少一个非空。
-4. 如果日志检索已经命中异常或出现关键线索，可增加代码步骤（code_pull 或 code_clone）进一步定位；若代码查询条件不足，可不加代码步骤并直接汇总日志证据。
+2. plan_steps 优先输出“指导性子任务”而不是写死工具参数，每个子任务要包含：subtask、hypothesis、success_criteria。
+3. 只有当参数非常明确时，才输出固定 tool_call 步骤；日志工具仍需遵守 match_phrase_list / match_list 规范。
+4. 如果日志检索已经命中异常或出现关键线索，可增加代码相关子任务（fetch_code/code_pull）进一步定位。
 5. 在 solution_steps 与 validation 中优先体现“日志依据”；存在代码证据时再补充“代码依据”。

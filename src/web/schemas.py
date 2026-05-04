@@ -21,6 +21,16 @@ class AnalyzeRequest(BaseModel):
         description="Optional user id from caller.",
         validation_alias=AliasChoices("user_id", "userId"),
     )
+    begin_time: str = Field(
+        default="",
+        description="Optional log begin time from caller.",
+        validation_alias=AliasChoices("begin_time", "beginTime", "start_time", "startTime"),
+    )
+    end_time: str = Field(
+        default="",
+        description="Optional log end time from caller.",
+        validation_alias=AliasChoices("end_time", "endTime", "finish_time", "finishTime"),
+    )
     extra: dict[str, Any] = Field(default_factory=dict, description="Pass-through fields.")
 
 

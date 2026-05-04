@@ -53,6 +53,7 @@ class AgentState(TypedDict, total=False):
     tool_result: Dict[str, Any]
     tool_call_count: int
     max_tool_calls: int
+    in_place_retry_count: int
 
     # ==============================
     # 4. 分析与证据融合

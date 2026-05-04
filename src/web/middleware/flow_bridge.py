@@ -10,11 +10,19 @@ def _to_flow_payload(req: AnalyzeRequest) -> dict[str, object]:
     question = str(req.question or "")
     chat_id = str(req.chat_id or "")
     user_id = str(req.user_id or "")
+    begin_time = str(req.begin_time or "").strip()
+    end_time = str(req.end_time or "").strip()
+    time_payload: dict[str, object] = {}
+    if begin_time:
+        time_payload["begin_time"] = begin_time
+    if end_time:
+        time_payload["end_time"] = end_time
     return {
         "message": question,
         "query": question,
         "chat_id": chat_id,
         "user_id": user_id,
+        **time_payload,
         "extra": extra,
         **extra,
     }
