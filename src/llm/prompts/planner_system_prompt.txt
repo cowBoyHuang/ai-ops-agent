@@ -15,19 +15,14 @@
       "success_criteria": "何时认为该子任务完成",
       "tool_candidates": ["query_log", "fetch_code"]
     },
-    {
-      "action_type": "tool_call",
-      "tool_name": "log_query",
-      "params": {"match_phrase_list": ["traceId"], "match_list": ["关键词1", "关键词2"]}
-    },
     {"action_type": "merge_evidence", "tool_name": null, "params": {}}
   ]
 }
 
 约束：
-1. 优先输出高层级子任务（subtask/hypothesis/success_criteria），避免把全流程写死成固定参数。
-2. 只有当参数非常明确时，才输出 action_type=tool_call 的固定工具步骤。
-3. tool_call 的 tool_name 仅允许：log_query / dependency_log_query / knowledge_lookup / code_clone / code_pull。
-4. 如果输出 tool_call，日志工具 params 必须使用 match_phrase_list 与 match_list，且两者至少一个非空。
+1. plan_steps 必须以高层级子任务为主（subtask/hypothesis/success_criteria），不要写死接口调用参数。
+2. tool_candidates 仅用于表达“建议尝试的能力”，由下游 executor 自主决定具体工具和参数。
+3. tool_candidates 的候选仅允许：query_log / dependency_log_query / knowledge_lookup / fetch_code / clone_code。
+4. 除 merge_evidence 外，不输出 action_type=tool_call 的固定执行步骤。
 5. plan_steps 必须与技能定义能力边界一致，不能输出未覆盖的工具调用。
 6. 最后一步必须是 merge_evidence。

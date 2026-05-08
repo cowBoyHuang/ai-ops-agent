@@ -30,7 +30,8 @@ def _as_int(value: Any, default: int) -> int:
 def _compute_recursion_limit(payload: dict[str, Any]) -> int:
     """根据预算估算合理递归上限，避免默认 25 过低导致误报。"""
     max_tool_calls = max(1, _as_int(payload.get("max_tool_calls"), 8))
-    max_replan = max(0, _as_int(payload.get("max_replan"), 2))
+    # replan 已在运行态禁用，递归预算不再为其预留额外放大空间。
+    max_replan = 0
     max_retries = max(0, _as_int(payload.get("max_retries"), _as_int(payload.get("max_retry"), 0)))
     estimated = 16 + max_tool_calls * 4 + max_replan * 14 + max_retries * 6
     return max(_MIN_RECURSION_LIMIT, min(_MAX_RECURSION_LIMIT, estimated))

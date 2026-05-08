@@ -26,7 +26,7 @@
 
 要求：
 1. 你需要优先阅读“完整文档内容”，并从中识别可能用于日志查询的关键词（例如错误码、异常类名、关键业务词）。
-2. plan_steps 优先输出“指导性子任务”而不是写死工具参数，每个子任务要包含：subtask、hypothesis、success_criteria。
-3. 只有当参数非常明确时，才输出固定 tool_call 步骤；日志工具仍需遵守 match_phrase_list / match_list 规范。
+2. plan_steps 只输出“指导性子任务”，每个子任务必须包含：subtask、hypothesis、success_criteria、tool_candidates。
+3. 不要输出固定 tool_call 步骤与具体参数（如 app_code/logname/match_list）；这些由下游 executor 决定。
 4. 如果日志检索已经命中异常或出现关键线索，可增加代码相关子任务（fetch_code/code_pull）进一步定位。
 5. 在 solution_steps 与 validation 中优先体现“日志依据”；存在代码证据时再补充“代码依据”。

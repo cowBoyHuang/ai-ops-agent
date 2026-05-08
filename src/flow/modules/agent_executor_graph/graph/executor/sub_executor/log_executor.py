@@ -11,7 +11,13 @@ from llm.llm import chat_with_llm
 from log.log import EsResult, query_external_logs
 
 _MAX_LOG_ROWS = 8
-_TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
+_TRACE_ID_PATTERN = re.compile(r"[a-z]+[_-]slugger[_a-z0-9\.\-]+(?=$|[^A-Za-z0-9_\.\-])", re.IGNORECASE)
+_TRACE_KEY_PATTERN = re.compile(r"\btrace[_-]?id\b\s*[:=]?\s*([A-Za-z0-9_.:\-]{4,128})", re.IGNORECASE)
+_ORDER_KEY_PATTERN = re.compile(
+    r"(?:\border[_-]?(?:id|no)\b|订单号|订单id|订单ID|子单号)\s*[:：=]?\s*([A-Za-z0-9_.:\-]{4,128})",
+    re.IGNORECASE,
+)
+_ORDER_TOKEN_PATTERN = re.compile(r"\bxep\d{12,}\b", re.IGNORECASE)
 _BIZ_CODE_PATTERN = re.compile(r"\b\d{2}_[0-9A-Z]{3,}_[0-9A-Z]{3,}_[0-9]{4}\b")
 _DECISIVE_HINTS = (
     "校验不通过",
@@ -91,6 +97,28 @@ def _split_terms_for_query(terms: list[str]) -> tuple[list[str], list[str]]:
         if text not in fuzzy_terms:
             fuzzy_terms.append(text)
     return phrase_terms, fuzzy_terms
+
+
+def _extract_forced_phrase_terms(texts: list[str]) -> list[str]:
+    results: list[str] = []
+    for text in texts:
+        raw = str(text or "").strip()
+        if not raw:
+            continue
+        for match in _TRACE_ID_PATTERN.findall(raw):
+            value = str(match or "").strip()
+            if value and value not in results:
+                results.append(value)
+        for pattern in (_TRACE_KEY_PATTERN, _ORDER_KEY_PATTERN):
+            for match in pattern.findall(raw):
+                value = str(match or "").strip()
+                if value and value not in results:
+                    results.append(value)
+        for match in _ORDER_TOKEN_PATTERN.findall(raw):
+            value = str(match or "").strip()
+            if value and value not in results:
+                results.append(value)
+    return results
 
 
 def _score_row_for_evidence(text: str) -> int:
@@ -210,12 +238,24 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     raw_match_list = params.get("match_list")
     match_phrase_list = _normalize_terms(raw_phrase_list)
     match_list = _normalize_terms(raw_match_list)
-
-    if not match_phrase_list and not match_list:
-        backup_terms = _extract_backup_keywords(str(state.get("question") or ""))
-        if not backup_terms:
-            backup_terms = _normalize_terms(state.get("question"))
-        match_phrase_list, match_list = _split_terms_for_query(backup_terms)
+    forced_terms = _extract_forced_phrase_terms(
+        [
+            str(state.get("question") or ""),
+            str(params.get("query") or ""),
+            str(params.get("keyword") or ""),
+            " ".join(_normalize_terms(params.get("keywords"))),
+            " ".join(match_list),
+            str(params.get("trace_id") or ""),
+            str(params.get("traceId") or ""),
+            str(params.get("order_id") or ""),
+            str(params.get("orderId") or ""),
+            str(params.get("order_no") or ""),
+            str(params.get("orderNo") or ""),
+        ]
+    )
+    for token in forced_terms:
+        if token not in match_phrase_list:
+            match_phrase_list.append(token)
 
     query_word_for_prompt = " ".join([*match_phrase_list, *match_list]).strip()
 

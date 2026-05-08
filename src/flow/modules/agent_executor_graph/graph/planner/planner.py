@@ -66,7 +66,7 @@ _APP_CODE_PATTERN = re.compile(r"\b(f_tts_trade_(?:order|core))\b", re.IGNORECAS
 _XEP_ORDER_PATTERN = re.compile(r"\bxep\s*(\d{6})(\d{6})\d*\b", re.IGNORECASE)
 _OPS_SLUGGER_PATTERN = re.compile(r"\bops[\s_.-]*slugger[\s_.-]*(\d{6})[\s_.-]*(\d{6})\b", re.IGNORECASE)
 _GENERIC_DT_PATTERN = re.compile(r"\b(\d{6})[\s_.-]+(\d{6})\b")
-_TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
+_TRACE_ID_PATTERN = re.compile(r"[a-z]+[_-]slugger[_a-z0-9\.\-]+(?=$|[^A-Za-z0-9_\.\-])", re.IGNORECASE)
 _DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 _SRC_ROOT = Path(__file__).resolve().parents[5]
 _PROJECT_ROOT = _SRC_ROOT.parent
@@ -555,6 +555,69 @@ def _normalize_react_subtask_step(item: dict[str, Any]) -> PlanStep | None:
     }
 
 
+def _tool_call_to_macro_subtask(item: dict[str, Any], tool_name: str) -> PlanStep:
+    params = dict(item.get("params") or {})
+    param_keywords = " ".join(
+        [
+            *[str(x) for x in _normalize_str_list(params.get("match_phrase_list"))],
+            *[str(x) for x in _normalize_str_list(params.get("match_list"))],
+            str(params.get("service_name") or ""),
+            str(params.get("query") or ""),
+        ]
+    ).strip()
+    keyword_suffix = f"（线索：{_clip_text(param_keywords, 80)}）" if param_keywords else ""
+
+    if tool_name == "dependency_log_query":
+        return {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": f"对依赖链路执行日志扩展检索，确认故障归属与传播路径{keyword_suffix}",
+            "hypothesis": "主服务异常由下游依赖返回异常、超时或业务拦截触发。",
+            "success_criteria": "拿到可关联同一链路的依赖侧错误证据（错误码/异常/返回原因）。",
+            "suggested_tools": ["dependency_log_query", "query_log"],
+        }
+    if tool_name == "log_query":
+        return {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": f"在主服务日志中检索失败链路并提取关键异常信号{keyword_suffix}",
+            "hypothesis": "主服务日志中可定位首个失败点并产出可复述证据。",
+            "success_criteria": "提取到 traceId/错误码/异常类名/失败返回中的至少一项。",
+            "suggested_tools": ["query_log"],
+        }
+    if tool_name == "knowledge_lookup":
+        return {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": "检索知识与历史经验，补充当前故障模式的解释与排查规则。",
+            "hypothesis": "历史案例中存在与当前现象相似的故障模式。",
+            "success_criteria": "获得可用于解释或约束下一步检索范围的规则性信息。",
+            "suggested_tools": ["knowledge_lookup"],
+        }
+    if tool_name in {"code_pull", "code_clone"}:
+        return {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": "读取相关代码实现，核对异常触发条件与返回逻辑。",
+            "hypothesis": "代码中存在与日志现象一致的抛错分支或拦截逻辑。",
+            "success_criteria": "形成“日志现象 ↔ 代码路径”的对应关系。",
+            "suggested_tools": ["fetch_code", "clone_code"],
+        }
+    return {
+        "action_type": "react_subtask",
+        "tool_name": None,
+        "params": {},
+        "subtask": "执行下一轮证据收集并缩小根因范围。",
+        "hypothesis": "当前证据仍可通过补充检索进一步收敛。",
+        "success_criteria": "补充至少一条可用于路由下一步的有效证据。",
+        "suggested_tools": [],
+    }
+
+
 def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
     rows = list(raw_steps or []) if isinstance(raw_steps, list) else []
     result: list[PlanStep] = []
@@ -567,20 +630,16 @@ def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
         if action_type == "merge_evidence":
             result.append({"action_type": "merge_evidence", "tool_name": None, "params": {}})
             continue
-        tool_name = _map_tool_name(item.get("tool_name"))
-        if not tool_name:
-            react_step = _normalize_react_subtask_step(item)
-            if react_step:
-                result.append(react_step)
+        # 规划层只输出“做什么”的宏观步骤，不在此层固化调用参数。
+        react_step = _normalize_react_subtask_step(item)
+        if react_step:
+            result.append(react_step)
             continue
-        params = dict(item.get("params") or {})
-        result.append(
-            {
-                "action_type": "tool_call",
-                "tool_name": tool_name,
-                "params": params,
-            }
-        )
+
+        tool_name = _map_tool_name(item.get("tool_name"))
+        if tool_name:
+            result.append(_tool_call_to_macro_subtask(item, tool_name))
+            continue
 
     # 允许“按需不调工具”的计划：LLM 无步骤时，默认保留 merge_evidence 单步收口。
     # 但若 LLM 给了候选步骤却全部无效，仍回退为空，交由上层走 fallback 规则计划。
@@ -729,10 +788,6 @@ def _normalize_log_params(
         trace_hits = _TRACE_ID_PATTERN.findall(user_query)
         if trace_hits:
             match_phrase_list = [str(trace_hits[0]).strip()]
-        else:
-            short_query = str(user_query or "").strip()
-            if short_query:
-                match_list = [short_query[:80]]
     normalized["match_phrase_list"] = match_phrase_list
     normalized["match_list"] = match_list
 
@@ -852,24 +907,80 @@ def _ensure_code_step_for_log_queries(
 def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
     if replan_count > 0:
         return [
-            {"action_type": "tool_call", "tool_name": "log_query", "params": {}},
-            {"action_type": "tool_call", "tool_name": "dependency_log_query", "params": {}},
+            {
+                "action_type": "react_subtask",
+                "tool_name": None,
+                "params": {},
+                "subtask": "复查主服务失败链路，补充首个失败事件证据。",
+                "hypothesis": "重规划后仍可在主服务日志中收敛到更明确的失败点。",
+                "success_criteria": "得到至少一条可复用的失败证据（错误码/异常/失败返回）。",
+                "suggested_tools": ["query_log"],
+            },
+            {
+                "action_type": "react_subtask",
+                "tool_name": None,
+                "params": {},
+                "subtask": "对依赖链路进行交叉验证，确认故障归属。",
+                "hypothesis": "失败来自依赖侧拒绝或调用链异常传播。",
+                "success_criteria": "形成调用方与依赖方一致的证据链。",
+                "suggested_tools": ["dependency_log_query", "query_log"],
+            },
             {"action_type": "merge_evidence", "tool_name": None, "params": {}},
         ]
     if intent_type == "OPS_ANALYSIS":
         return [
-            {"action_type": "tool_call", "tool_name": "log_query", "params": {}},
-            {"action_type": "tool_call", "tool_name": "dependency_log_query", "params": {}},
+            {
+                "action_type": "react_subtask",
+                "tool_name": None,
+                "params": {},
+                "subtask": "先在主服务日志检索失败链路，提取关键线索。",
+                "hypothesis": "主服务日志中存在可定位故障的直接证据。",
+                "success_criteria": "提取到 traceId/异常/错误码/失败返回中的至少一项。",
+                "suggested_tools": ["query_log"],
+            },
+            {
+                "action_type": "react_subtask",
+                "tool_name": None,
+                "params": {},
+                "subtask": "扩展到依赖日志确认根因归属与传播路径。",
+                "hypothesis": "故障可能由依赖异常或业务拦截导致。",
+                "success_criteria": "拿到可关联同一链路的依赖侧证据。",
+                "suggested_tools": ["dependency_log_query", "query_log"],
+            },
             {"action_type": "merge_evidence", "tool_name": None, "params": {}},
         ]
     if intent_type in {"GENERAL_QA", "ORDER_INFO_QUERY"}:
         return [
-            {"action_type": "tool_call", "tool_name": "knowledge_lookup", "params": {}},
+            {
+                "action_type": "react_subtask",
+                "tool_name": None,
+                "params": {},
+                "subtask": "检索知识与规则，回答当前问题并给出可验证依据。",
+                "hypothesis": "知识库中已有可直接回答当前问题的规则或案例。",
+                "success_criteria": "给出清晰回答并附带可复查的依据来源。",
+                "suggested_tools": ["knowledge_lookup"],
+            },
             {"action_type": "merge_evidence", "tool_name": None, "params": {}},
         ]
     return [
-        {"action_type": "tool_call", "tool_name": "knowledge_lookup", "params": {}},
-        {"action_type": "tool_call", "tool_name": "log_query", "params": {}},
+        {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": "先补充知识背景，识别候选排查方向。",
+            "hypothesis": "先验规则可缩小日志检索范围。",
+            "success_criteria": "形成至少一个可执行的排查方向。",
+            "suggested_tools": ["knowledge_lookup"],
+        },
+        {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": "在主服务日志验证候选方向并补充证据。",
+            "hypothesis": "日志中可验证知识侧推断是否成立。",
+            "success_criteria": "得到支持或反驳该方向的日志证据。",
+            "suggested_tools": ["query_log"],
+        },
         {"action_type": "merge_evidence", "tool_name": None, "params": {}},
     ]
 
@@ -891,16 +1002,15 @@ def _plan_with_llm(context: dict[str, Any]) -> tuple[list[PlanStep], dict[str, A
             "parsed_output": {},
         }
     steps = _normalize_plan_steps(parsed.get("plan_steps"))
-    strict_ok, strict_reason = _validate_plan_steps_strict(steps)
-    if not strict_ok:
-        _LOGGER.warning("planner LLM 计划强校验失败: %s", strict_reason)
+    if not steps:
+        _LOGGER.warning("planner LLM 计划为空或不可用")
         return [], {
             "raw_output": raw_output,
             "parse_ok": False,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "parsed_output": parsed,
-            "validation_error": strict_reason,
+            "validation_error": "empty_or_invalid_plan_steps",
         }
     plan_meta = {
         "raw_output": raw_output,
@@ -947,17 +1057,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         plan_steps = _fallback_plan_steps(intent_type=intent_type, replan_count=replan_count)
         _LOGGER.info("planner 使用规则兜底计划: steps=%d intent=%s replan=%d", len(plan_steps), intent_type, replan_count)
-    plan_steps = _enrich_plan_steps_for_log_queries(
-        plan_steps=plan_steps,
-        user_query=str(context_for_llm.get("user_query") or question),
-    )
     structured_context = _ensure_structured_log_window(
         dict(state.get("structured_context") or {}),
         str(context_for_llm.get("user_query") or question),
-    )
-    plan_steps = _ensure_code_step_for_log_queries(
-        plan_steps=plan_steps,
-        structured_context=structured_context,
     )
 
     previous_plan = list(state.get("current_plan") or state.get("plan_steps") or [])

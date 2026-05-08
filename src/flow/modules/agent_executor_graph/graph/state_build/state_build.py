@@ -77,8 +77,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     )
     state["retry_count"] = raw_context.get("retry_count", state.get("retry_count", 0))
     state["max_retries"] = raw_context.get("max_retries", raw_context.get("max_retry", state.get("max_retries", 0)))
-    state["replan_count"] = raw_context.get("replan_count", state.get("replan_count", 0))
-    state["max_replan"] = raw_context.get("max_replan", state.get("max_replan", 2))
+    # 线上策略：禁用重规划，避免 planner<->executor 循环放大导致长尾超时。
+    state["replan_count"] = 0
+    state["max_replan"] = 0
     state["tool_call_count"] = raw_context.get("tool_call_count", state.get("tool_call_count", 0))
     # Plan-ReAct 会在同一步内做有限重试，默认预算需覆盖“多步 + 重规划”场景，避免过早触发预算熔断。
     state["max_tool_calls"] = raw_context.get("max_tool_calls", state.get("max_tool_calls", 24))

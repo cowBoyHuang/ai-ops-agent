@@ -15,7 +15,7 @@ _RETRYABLE_TOKENS = ("timeout", "network", "connection", "temporarily", "503", "
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
 _ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
 _CODE_QUERY_TOOLS = {"code_clone", "code_pull"}
-_TRACE_ID_PATTERN = re.compile(r"\b[a-z]+[_-]slugger[_a-z0-9\.\-]+\b", re.IGNORECASE)
+_TRACE_ID_PATTERN = re.compile(r"[a-z]+[_-]slugger[_a-z0-9\.\-]+(?=$|[^A-Za-z0-9_\.\-])", re.IGNORECASE)
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -198,18 +198,15 @@ def _build_local_adjustment_step(
         if str(step.get("tool_name") or "") == "log_query":
             tool_name = "dependency_log_query"
             if observed_keywords:
-                phrase_terms, fuzzy_terms = _split_terms_for_query(observed_keywords[:5])
+                phrase_terms, _ = _split_terms_for_query(observed_keywords[:5])
                 if not match_phrase_list and phrase_terms:
                     match_phrase_list = phrase_terms
-                if not match_list and fuzzy_terms:
-                    match_list = fuzzy_terms
         else:
             tool_name = str(step.get("tool_name") or "")
 
     if tool_name == "dependency_log_query" and observed_keywords and not match_phrase_list and not match_list:
-        phrase_terms, fuzzy_terms = _split_terms_for_query(observed_keywords[:5])
+        phrase_terms, _ = _split_terms_for_query(observed_keywords[:5])
         match_phrase_list = phrase_terms
-        match_list = fuzzy_terms
 
     params_dict["match_phrase_list"] = match_phrase_list
     params_dict["match_list"] = match_list

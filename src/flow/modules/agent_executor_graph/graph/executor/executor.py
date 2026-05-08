@@ -25,6 +25,13 @@ _LOCAL_TZ = dt.timezone(dt.timedelta(hours=8))
 _XEP_ORDER_PATTERN = re.compile(r"\bxep\s*(\d{6})(\d{6})\d*\b", re.IGNORECASE)
 _OPS_SLUGGER_PATTERN = re.compile(r"\bops[\s_.-]*slugger[\s_.-]*(\d{6})[\s_.-]*(\d{6})\b", re.IGNORECASE)
 _GENERIC_DT_PATTERN = re.compile(r"\b(\d{6})[\s_.-]+(\d{6})\b")
+_TRACE_ID_PATTERN = re.compile(r"[a-z]+[_-]slugger[_a-z0-9\.\-]+(?=$|[^A-Za-z0-9_\.\-])", re.IGNORECASE)
+_TRACE_KEY_PATTERN = re.compile(r"\btrace[_-]?id\b\s*[:=]?\s*([A-Za-z0-9_.:\-]{4,128})", re.IGNORECASE)
+_ORDER_KEY_PATTERN = re.compile(
+    r"(?:\border[_-]?(?:id|no)\b|订单号|订单id|订单ID|子单号)\s*[:：=]?\s*([A-Za-z0-9_.:\-]{4,128})",
+    re.IGNORECASE,
+)
+_ORDER_TOKEN_PATTERN = re.compile(r"\bxep\d{12,}\b", re.IGNORECASE)
 _SERVICE_TO_APP_CODE = {
     "order-service": "f_tts_trade_order",
     "tts-trade-order": "f_tts_trade_order",
@@ -38,6 +45,10 @@ _SERVICE_TO_APP_CODE = {
 _APP_CODE_TO_LOGNAME = {
     "f_tts_trade_order": "ttsorder.log",
     "f_tts_trade_core": "tts.log",
+}
+_DEPENDENCY_APP_CODE_FALLBACK = {
+    "f_tts_trade_order": "f_tts_trade_core",
+    "f_tts_trade_core": "f_tts_trade_order",
 }
 _REACT_TOOL_NAME_MAP = {
     "query_log": "log_query",
@@ -298,6 +309,64 @@ def _normalize_str_list(value: Any) -> list[str]:
     return []
 
 
+def _extract_exact_identifiers(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    hits: list[str] = []
+    for match in _TRACE_ID_PATTERN.findall(raw):
+        value = str(match or "").strip()
+        if value and value not in hits:
+            hits.append(value)
+    for pattern in (_TRACE_KEY_PATTERN, _ORDER_KEY_PATTERN):
+        for match in pattern.findall(raw):
+            value = str(match or "").strip()
+            if value and value not in hits:
+                hits.append(value)
+    for match in _ORDER_TOKEN_PATTERN.findall(raw):
+        value = str(match or "").strip()
+        if value and value not in hits:
+            hits.append(value)
+    return hits
+
+
+def _collect_forced_match_phrase_terms(params: dict[str, Any], state: dict[str, Any], step: dict[str, Any]) -> list[str]:
+    structured_context = dict(state.get("structured_context") or {})
+    candidates = [
+        str(params.get("trace_id") or ""),
+        str(params.get("traceId") or ""),
+        str(params.get("order_id") or ""),
+        str(params.get("orderId") or ""),
+        str(params.get("order_no") or ""),
+        str(params.get("orderNo") or ""),
+        str(params.get("request_id") or ""),
+        str(params.get("requestId") or ""),
+        str(structured_context.get("trace_id") or ""),
+        str(structured_context.get("traceId") or ""),
+        str(structured_context.get("order_id") or ""),
+        str(structured_context.get("orderId") or ""),
+        str(structured_context.get("order_no") or ""),
+        str(structured_context.get("orderNo") or ""),
+        str(structured_context.get("request_id") or ""),
+        str(structured_context.get("requestId") or ""),
+        str(params.get("query") or ""),
+        " ".join(_normalize_str_list(params.get("keywords"))),
+        str(params.get("keyword") or ""),
+        " ".join(_normalize_str_list(params.get("match_list"))),
+        str(step.get("subtask") or ""),
+        str(step.get("hypothesis") or ""),
+        str(step.get("success_criteria") or ""),
+        str(structured_context.get("user_query") or ""),
+        str(state.get("question") or ""),
+    ]
+    forced_terms: list[str] = []
+    for text in candidates:
+        for token in _extract_exact_identifiers(text):
+            if token not in forced_terms:
+                forced_terms.append(token)
+    return forced_terms
+
+
 def _to_time_window(time_range: str) -> tuple[str, str] | None:
     text = str(time_range or "").strip().lower()
     if not text:
@@ -445,6 +514,82 @@ def _ensure_log_query_time_window(params: dict[str, Any], state: dict[str, Any],
     params["end_time"] = end_dt.isoformat()
 
 
+def _pick_recent_log_app_code(state: dict[str, Any]) -> str:
+    history = list(state.get("tool_history") or [])
+    for item in reversed(history):
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool_name") or "").strip()
+        if tool_name not in {"log_query", "dependency_log_query"}:
+            continue
+        params = dict(item.get("tool_params") or {})
+        app_code = str(params.get("app_code") or "").strip().lower()
+        if app_code in _APP_CODE_TO_LOGNAME:
+            return app_code
+    return ""
+
+
+def _infer_app_code_from_text(text: str) -> str:
+    lowered = str(text or "").lower()
+    core_tokens = ("f_tts_trade_core", "trade_core", "trade-core", "tts.log", "core-service", "tts-trade-core")
+    order_tokens = ("f_tts_trade_order", "trade_order", "trade-order", "ttsorder.log", "order-service", "tts-trade-order")
+    if any(token in lowered for token in core_tokens):
+        return "f_tts_trade_core"
+    if any(token in lowered for token in order_tokens):
+        return "f_tts_trade_order"
+    return ""
+
+
+def _infer_log_query_target(
+    *,
+    tool_name: str,
+    params: dict[str, Any],
+    state: dict[str, Any],
+    step: dict[str, Any],
+) -> None:
+    structured_context = dict(state.get("structured_context") or {})
+    explicit_app_code = str(params.get("app_code") or params.get("appCode") or "").strip().lower()
+    app_code = str(
+        explicit_app_code
+        or structured_context.get("app_code")
+        or ""
+    ).strip().lower()
+    logname = str(params.get("logname") or structured_context.get("logname") or "").strip().lower()
+
+    service_name = str(params.get("service_name") or params.get("service") or "").strip().lower()
+    if service_name and not app_code:
+        app_code = str(_SERVICE_TO_APP_CODE.get(service_name) or "").strip().lower()
+
+    if not app_code:
+        merged_text = " ".join(
+            [
+                str(step.get("subtask") or ""),
+                str(step.get("hypothesis") or ""),
+                str(step.get("success_criteria") or ""),
+                str(state.get("question") or ""),
+                " ".join(_normalize_str_list(params.get("match_phrase_list"))),
+                " ".join(_normalize_str_list(params.get("match_list"))),
+                str(params.get("query") or ""),
+            ]
+        )
+        app_code = _infer_app_code_from_text(merged_text)
+
+    recent_app_code = _pick_recent_log_app_code(state) if tool_name == "dependency_log_query" else ""
+    if tool_name == "dependency_log_query" and recent_app_code and not explicit_app_code:
+        if not app_code or app_code == recent_app_code:
+            app_code = str(_DEPENDENCY_APP_CODE_FALLBACK.get(recent_app_code) or app_code)
+
+    if not app_code:
+        app_code = "f_tts_trade_core" if tool_name == "dependency_log_query" else "f_tts_trade_order"
+
+    if not logname:
+        logname = str(_APP_CODE_TO_LOGNAME.get(app_code) or "")
+
+    params["app_code"] = app_code
+    if logname:
+        params["logname"] = logname
+
+
 def _normalize_react_tool_name(raw_name: Any) -> str:
     name = str(raw_name or "").strip()
     if not name:
@@ -465,16 +610,10 @@ def _normalize_react_params(
     if tool_name in {"log_query", "dependency_log_query"}:
         phrase_terms = _normalize_str_list(params.get("match_phrase_list"))
         fuzzy_terms = _normalize_str_list(params.get("match_list"))
-        keyword = str(params.get("keyword") or "").strip()
-        for item in _normalize_str_list(params.get("keywords")):
-            if item not in fuzzy_terms:
-                fuzzy_terms.append(item)
-        if keyword and keyword not in fuzzy_terms:
-            fuzzy_terms.append(keyword)
-        if not phrase_terms and not fuzzy_terms:
-            query = str(params.get("query") or "").strip() or str(state.get("question") or "").strip()
-            if query:
-                fuzzy_terms = [query[:120]]
+        forced_phrase_terms = _collect_forced_match_phrase_terms(params=params, state=state, step=step)
+        for item in forced_phrase_terms:
+            if item not in phrase_terms:
+                phrase_terms.append(item)
         params["match_phrase_list"] = phrase_terms
         params["match_list"] = fuzzy_terms
 
@@ -483,9 +622,7 @@ def _normalize_react_params(
             mapped_code = _SERVICE_TO_APP_CODE.get(service_name, "")
             if mapped_code:
                 params["app_code"] = mapped_code
-        app_code = str(params.get("app_code") or "").strip().lower()
-        if app_code and not str(params.get("logname") or "").strip():
-            params["logname"] = _APP_CODE_TO_LOGNAME.get(app_code, "")
+        _infer_log_query_target(tool_name=tool_name, params=params, state=state, step=step)
 
         _ensure_log_query_time_window(params, state, step)
 

@@ -20,6 +20,18 @@
 
 至少有一个列表非空。
 
+### 强制规则（必须遵守）
+
+当用户问题、上下文或已有参数中识别到以下字段时，必须把“实际识别到的值”写入 `match_phrase_list`：
+
+- `traceId` / `trace_id`
+- `ops_slugger_xxx`（完整串）
+- 订单号（如 `orderId` / `orderNo` / `订单号` / `子单号`）
+
+约束：
+- 这些精确标识禁止只放在 `match_list`，必须进入 `match_phrase_list`。
+- `match_list` 仅用于模糊扩召回词，由执行器结合完整技能与上下文自行决定（例如“生单”“失败”“error”）。
+
 ## 1) query_external_logs
 
 签名:
@@ -128,3 +140,44 @@ adapt_raw_item_to_es_result(raw_item: Any) -> EsResult
 3. 条件建议：
    - `match_phrase_list` 放强约束（如 traceId、固定日志短语）
    - `match_list` 放扩召回关键词（如业务词、错误词）
+
+## 固定格式示例（ops_slugger）
+
+输入样例：
+- `ops_slugger_260506.110918.10.90.75.73.4022708.3131167276_1`
+
+时间解析规则：
+- `260506` => `2026-05-06`
+- `110918` => `11:09:18`
+- 基准时间 `T = 2026-05-06T11:09:18+08:00`
+- 推荐查询窗：`T-1h ~ T+1h`
+  - `begin_time = 2026-05-06T10:09:18+08:00`
+  - `end_time = 2026-05-06T12:09:18+08:00`
+
+推荐查询参数（先查 trade_order）：
+```python
+query_external_logs(
+    app_code="f_tts_trade_order",
+    logname="ttsorder.log",
+    begin_time="2026-05-06T10:09:18+08:00",
+    end_time="2026-05-06T12:09:18+08:00",
+    content={
+        "match_phrase_list": ["ops_slugger_260506.110918.10.90.75.73.4022708.3131167276_1"],
+        "match_list": ["订单创建失败", "生单失败", "Exception", "ERROR"],
+    },
+)
+```
+
+依赖侧查询（trade_core）示例：
+```python
+query_external_logs(
+    app_code="f_tts_trade_core",
+    logname="tts.log",
+    begin_time="2026-05-06T10:09:18+08:00",
+    end_time="2026-05-06T12:09:18+08:00",
+    content={
+        "match_phrase_list": ["ops_slugger_260506.110918.10.90.75.73.4022708.3131167276_1"],
+        "match_list": ["特殊产品拦截", "子单失败", "errorCode", "timeout"],
+    },
+)
+```
