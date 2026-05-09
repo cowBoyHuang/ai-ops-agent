@@ -18,6 +18,7 @@ _ORDER_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ORDER_TOKEN_PATTERN = re.compile(r"\bxep\d{12,}\b", re.IGNORECASE)
+_PLACEHOLDER_TOKEN_PATTERN = re.compile(r"(?:\bxxx\b|placeholder|tbd|todo|待补充|示例)", re.IGNORECASE)
 _BIZ_CODE_PATTERN = re.compile(r"\b\d{2}_[0-9A-Z]{3,}_[0-9A-Z]{3,}_[0-9]{4}\b")
 _DECISIVE_HINTS = (
     "校验不通过",
@@ -83,6 +84,32 @@ def _normalize_terms(value: Any) -> list[str]:
     return []
 
 
+def _is_placeholder_token(value: str) -> bool:
+    return bool(_PLACEHOLDER_TOKEN_PATTERN.search(str(value or "").strip()))
+
+
+def _is_valid_trace_token(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_token(text):
+        return False
+    if not _TRACE_ID_PATTERN.search(text):
+        return False
+    return bool(re.search(r"\d{6}", text))
+
+
+def _sanitize_match_phrase_terms(terms: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    for term in terms:
+        text = str(term or "").strip()
+        if not text or _is_placeholder_token(text):
+            continue
+        extracted = _extract_forced_phrase_terms([text])
+        for token in extracted:
+            if token not in sanitized:
+                sanitized.append(token)
+    return sanitized
+
+
 def _split_terms_for_query(terms: list[str]) -> tuple[list[str], list[str]]:
     phrase_terms: list[str] = []
     fuzzy_terms: list[str] = []
@@ -107,16 +134,16 @@ def _extract_forced_phrase_terms(texts: list[str]) -> list[str]:
             continue
         for match in _TRACE_ID_PATTERN.findall(raw):
             value = str(match or "").strip()
-            if value and value not in results:
+            if _is_valid_trace_token(value) and value not in results:
                 results.append(value)
         for pattern in (_TRACE_KEY_PATTERN, _ORDER_KEY_PATTERN):
             for match in pattern.findall(raw):
                 value = str(match or "").strip()
-                if value and value not in results:
+                if value and not _is_placeholder_token(value) and value not in results:
                     results.append(value)
         for match in _ORDER_TOKEN_PATTERN.findall(raw):
             value = str(match or "").strip()
-            if value and value not in results:
+            if value and not _is_placeholder_token(value) and value not in results:
                 results.append(value)
     return results
 
@@ -236,7 +263,7 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     logname = str(params.get("logname") or structured_context.get("logname") or "").strip()
     raw_phrase_list = params.get("match_phrase_list")
     raw_match_list = params.get("match_list")
-    match_phrase_list = _normalize_terms(raw_phrase_list)
+    match_phrase_list = _sanitize_match_phrase_terms(_normalize_terms(raw_phrase_list))
     match_list = _normalize_terms(raw_match_list)
     forced_terms = _extract_forced_phrase_terms(
         [

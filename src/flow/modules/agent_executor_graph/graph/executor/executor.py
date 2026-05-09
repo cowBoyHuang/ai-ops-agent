@@ -32,6 +32,7 @@ _ORDER_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ORDER_TOKEN_PATTERN = re.compile(r"\bxep\d{12,}\b", re.IGNORECASE)
+_PLACEHOLDER_TOKEN_PATTERN = re.compile(r"(?:\bxxx\b|placeholder|tbd|todo|待补充|示例)", re.IGNORECASE)
 _SERVICE_TO_APP_CODE = {
     "order-service": "f_tts_trade_order",
     "tts-trade-order": "f_tts_trade_order",
@@ -309,6 +310,35 @@ def _normalize_str_list(value: Any) -> list[str]:
     return []
 
 
+def _is_placeholder_token(value: str) -> bool:
+    return bool(_PLACEHOLDER_TOKEN_PATTERN.search(str(value or "").strip()))
+
+
+def _is_valid_trace_token(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_token(text):
+        return False
+    if not _TRACE_ID_PATTERN.search(text):
+        return False
+    # 过滤 ops_slugger_xxx 一类占位串：trace 必须带数字片段（例如日期时间段）。
+    return bool(re.search(r"\d{6}", text))
+
+
+def _sanitize_match_phrase_terms(terms: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    for term in terms:
+        text = str(term or "").strip()
+        if not text or _is_placeholder_token(text):
+            continue
+        extracted = _extract_exact_identifiers(text)
+        if not extracted:
+            continue
+        for token in extracted:
+            if token not in sanitized:
+                sanitized.append(token)
+    return sanitized
+
+
 def _extract_exact_identifiers(text: str) -> list[str]:
     raw = str(text or "").strip()
     if not raw:
@@ -316,16 +346,16 @@ def _extract_exact_identifiers(text: str) -> list[str]:
     hits: list[str] = []
     for match in _TRACE_ID_PATTERN.findall(raw):
         value = str(match or "").strip()
-        if value and value not in hits:
+        if _is_valid_trace_token(value) and value not in hits:
             hits.append(value)
     for pattern in (_TRACE_KEY_PATTERN, _ORDER_KEY_PATTERN):
         for match in pattern.findall(raw):
             value = str(match or "").strip()
-            if value and value not in hits:
+            if value and not _is_placeholder_token(value) and value not in hits:
                 hits.append(value)
     for match in _ORDER_TOKEN_PATTERN.findall(raw):
         value = str(match or "").strip()
-        if value and value not in hits:
+        if value and not _is_placeholder_token(value) and value not in hits:
             hits.append(value)
     return hits
 
@@ -339,16 +369,12 @@ def _collect_forced_match_phrase_terms(params: dict[str, Any], state: dict[str, 
         str(params.get("orderId") or ""),
         str(params.get("order_no") or ""),
         str(params.get("orderNo") or ""),
-        str(params.get("request_id") or ""),
-        str(params.get("requestId") or ""),
         str(structured_context.get("trace_id") or ""),
         str(structured_context.get("traceId") or ""),
         str(structured_context.get("order_id") or ""),
         str(structured_context.get("orderId") or ""),
         str(structured_context.get("order_no") or ""),
         str(structured_context.get("orderNo") or ""),
-        str(structured_context.get("request_id") or ""),
-        str(structured_context.get("requestId") or ""),
         str(params.get("query") or ""),
         " ".join(_normalize_str_list(params.get("keywords"))),
         str(params.get("keyword") or ""),
@@ -608,7 +634,7 @@ def _normalize_react_params(
 ) -> dict[str, Any]:
     params = dict(raw_params or {})
     if tool_name in {"log_query", "dependency_log_query"}:
-        phrase_terms = _normalize_str_list(params.get("match_phrase_list"))
+        phrase_terms = _sanitize_match_phrase_terms(_normalize_str_list(params.get("match_phrase_list")))
         fuzzy_terms = _normalize_str_list(params.get("match_list"))
         forced_phrase_terms = _collect_forced_match_phrase_terms(params=params, state=state, step=step)
         for item in forced_phrase_terms:

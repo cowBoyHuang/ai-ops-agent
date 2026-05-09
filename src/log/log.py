@@ -583,5 +583,15 @@ def search_logs(
         content=content,
         type=type,
     )
+    _LOGGER.info(
+        "log.search_logs.request payload=%s",
+        json.dumps(
+            request_body,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
     raw = pull_log_by_condition(request_body, config=config)
     return adapt_raw_response_to_es_results(raw)

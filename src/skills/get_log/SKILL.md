@@ -25,12 +25,13 @@
 当用户问题、上下文或已有参数中识别到以下字段时，必须把“实际识别到的值”写入 `match_phrase_list`：
 
 - `traceId` / `trace_id`
-- `ops_slugger_xxx`（完整串）
+- 完整 `ops_slugger` trace（例如 `ops_slugger_260506.110918.10.90.75.73.4022708.3131167276_1`）
 - 订单号（如 `orderId` / `orderNo` / `订单号` / `子单号`）
 
 约束：
 - 这些精确标识禁止只放在 `match_list`，必须进入 `match_phrase_list`。
 - `match_list` 仅用于模糊扩召回词，由执行器结合完整技能与上下文自行决定（例如“生单”“失败”“error”）。
+- `match_phrase_list` 只允许真实、可落库检索的标识值；禁止写入占位符/不确定值（如 `ops_slugger_xxx`、`xxx`、`placeholder`、`tbd`、`todo`）。
 
 ## 1) query_external_logs
 
@@ -54,7 +55,7 @@ query_external_logs(
 推荐 `content` 结构:
 ```python
 {
-  "match_phrase_list": ["生单请求参数为", "ops_slugger_xxx"],
+  "match_phrase_list": ["ops_slugger_260506.110918.10.90.75.73.4022708.3131167276_1"],
   "match_list": ["生单返回结果为", "traceId"]
 }
 ```

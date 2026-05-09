@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-import re
 from typing import Any
-import unicodedata
 from uuid import uuid4
 
 from cache.message_cache_context import MessageCacheContext
@@ -40,16 +38,12 @@ def _pick_message_input(context: dict[str, Any]) -> Any:
 
 
 # 方法注释（业务）:
-# - 业务：对输入文本做统一标准化清洗。
+# - 业务：按原样保留用户问题文本（仅做字符串化兜底）。
 # - 入参：`text`(Any)=待处理文本。
-# - 出参：`str`，标准化后的文本。
-# - 逻辑：全角转半角、去换行制表符、去标点、合并空白、去首尾空白并转小写。
+# - 出参：`str`，原始文本（不做标点/大小写/空白归一化）。
+# - 逻辑：仅在 None 时返回空串，其余保持原样。
 def _normalize_message(text: Any) -> str:
-    normalized = unicodedata.normalize("NFKC", str(text or ""))
-    normalized = normalized.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    normalized = "".join(" " if unicodedata.category(ch).startswith("P") else ch for ch in normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return normalized.lower()
+    return "" if text is None else str(text)
 
 
 # 方法注释（业务）:
@@ -74,7 +68,7 @@ def _restore_message_context(cache_value: Any) -> MessageCacheContext:
 # - 逻辑：
 #   1) 统一 `chat_id/user_id`；
 #   2) 生成 `requestId`；
-#   3) 标准化 `message`；
+#   3) 保留原始 `message`；
 #   4) 读取缓存并恢复为 `MessageCacheContext` 放入 `message_context`；
 #   5) 补齐流程默认控制字段（初始状态为 `init`）。
 def run(payload: dict[str, Any]) -> dict[str, Any]:
