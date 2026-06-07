@@ -14,7 +14,7 @@ def _fallback_reply(intent_type: str, question: str) -> str:
     if intent_type == "ORDER_INFO_QUERY":
         return f"已收到你的订单信息查询请求：{question}。请提供订单号或更具体的查询项。"
     if intent_type == "SYSTEM_LOGIC_CONSULT":
-        return f"已收到你的系统逻辑咨询：{question}。建议补充具体场景或规则点，便于准确回答。"
+        return f"已收到你的业务咨询：{question}。建议补充具体场景或规则点，便于准确回答。"
     return f"已收到你的问题：{question}。"
 
 

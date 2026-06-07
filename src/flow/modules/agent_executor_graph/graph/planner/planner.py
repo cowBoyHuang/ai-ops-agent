@@ -23,7 +23,8 @@ from flow.modules.agent_executor_graph.plan_step import PlanStep
 from llm.llm import chat_with_llm, load_prompt, render_prompt
 
 _LOGGER = logging.getLogger(__name__)
-_MAX_RAG_DOCS_FOR_PROMPT = 5
+_MAX_RAG_DOCS_FOR_PROMPT = 2
+_MAX_RAG_SUB_DOCS_FOR_PROMPT = 4
 _MAX_RAG_TEXT_LEN = 300
 _MAX_QUERY_LEN = 500
 _MAX_PLAN_STEPS = 6
@@ -31,9 +32,27 @@ _MAX_HISTORY_ROWS = 10
 _MAX_HISTORY_TEXT_LEN = 1200
 _MAX_MESSAGE_CONTEXT_ROUNDS = 8
 _MAX_MESSAGE_CONTEXT_TEXT_LEN = 1600
-_MAX_FULL_DOCS_FOR_PROMPT = 5
+_MAX_FULL_DOCS_FOR_PROMPT = 2
 _MAX_FULL_DOC_TEXT_LEN = 1500
-_ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull"}
+_BUSINESS_CONSULT_INTENT = "SYSTEM_LOGIC_CONSULT"
+_BUSINESS_CONTEXT_FILTER_TOKENS = (
+    "问题根因",
+    "代码分析",
+    "日志结论",
+    "堆栈",
+    "traceid",
+    "异常",
+    "排查",
+    "根因",
+)
+_ALLOWED_TOOL_NAMES = {
+    "log_query",
+    "dependency_log_query",
+    "knowledge_lookup",
+    "code_clone",
+    "code_pull",
+    "rag_parent_chunk_query",
+}
 _TOOL_HINT_NAME_MAP = {
     "query_log": "query_log",
     "log_query": "query_log",
@@ -44,6 +63,9 @@ _TOOL_HINT_NAME_MAP = {
     "code_pull": "fetch_code",
     "code_clone": "clone_code",
     "clone_code": "clone_code",
+    "query_rag_parent_chunk": "rag_parent_chunk_query",
+    "rag_parent_chunk_query": "rag_parent_chunk_query",
+    "rag_parent_doc_query": "rag_parent_chunk_query",
 }
 _LOG_QUERY_TOOLS = {"log_query", "dependency_log_query"}
 _CODE_QUERY_TOOLS = {"code_clone", "code_pull"}
@@ -354,11 +376,19 @@ def _prepare_history_dialogues(state: dict[str, Any]) -> str:
     return _clip_text(merged, _MAX_HISTORY_TEXT_LEN) or "无历史对话信息"
 
 
-def _prepare_message_context(state: dict[str, Any]) -> str:
+def _looks_like_troubleshooting_text(text: Any) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(token in lowered for token in _BUSINESS_CONTEXT_FILTER_TOKENS)
+
+
+def _prepare_message_context(state: dict[str, Any], *, intent_type: str = "") -> str:
     raw_context = dict(state.get("context") or {})
     raw_message_context = raw_context.get("message_context")
     if raw_message_context is None:
         raw_message_context = state.get("message_context")
+    is_business_consult = str(intent_type or "").strip() == _BUSINESS_CONSULT_INTENT
 
     summary = ""
     rounds: list[Any] = []
@@ -370,7 +400,7 @@ def _prepare_message_context(state: dict[str, Any]) -> str:
         rounds = list(getattr(raw_message_context, "rounds", []) or [])
 
     lines: list[str] = []
-    if summary:
+    if summary and not (is_business_consult and _looks_like_troubleshooting_text(summary)):
         lines.append(f"summary: {summary}")
 
     for idx, row in enumerate(rounds[-_MAX_MESSAGE_CONTEXT_ROUNDS:], start=1):
@@ -382,7 +412,7 @@ def _prepare_message_context(state: dict[str, Any]) -> str:
             ai_text = str(getattr(row, "aiResponse", "") or "").strip()
         if user_text:
             lines.append(f"round{idx}.user: {user_text}")
-        if ai_text:
+        if ai_text and not (is_business_consult and _looks_like_troubleshooting_text(ai_text)):
             lines.append(f"round{idx}.assistant: {ai_text}")
 
     merged = "\n".join(lines).strip()
@@ -422,7 +452,24 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
     # 仅保留核心 RAG 文档链路，不再处理 legacy 的 error_info/bm25 诊断摘要。
     log_diagnosis_summary = "无额外日志诊断信息"
 
+    rag_sub_chunk_docs = list(structured_context.get("rag_sub_chunk_docs") or state.get("rag_sub_chunk_docs") or [])
     rag_docs = list(structured_context.get("rag_docs") or state.get("rag_docs") or [])
+    sub_chunk_rows: list[str] = []
+    for idx, item in enumerate(rag_sub_chunk_docs[:_MAX_RAG_SUB_DOCS_FOR_PROMPT], start=1):
+        if not isinstance(item, dict):
+            continue
+        payload = dict(item.get("payload") or {})
+        path = str(payload.get("path") or item.get("path") or "").strip()
+        file_name = str(payload.get("file_name") or Path(path).name or "unknown")
+        text = _clip_text(item.get("text"), _MAX_RAG_TEXT_LEN)
+        if not text:
+            continue
+        score = _to_float(item.get("score"), 0.0)
+        sub_chunk_rows.append(
+            f"[子chunk{idx}] 来源={file_name} path={path or 'N/A'} score={score:.4f} 内容={text}"
+        )
+    rag_sub_chunks_summary = "\n".join(sub_chunk_rows).strip() or "无子 chunk 摘要"
+
     rag_rows: list[str] = []
     for idx, item in enumerate(rag_docs[:_MAX_RAG_DOCS_FOR_PROMPT], start=1):
         if not isinstance(item, dict):
@@ -440,7 +487,7 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
     parent_docs = list(structured_context.get("rag_parent_docs") or state.get("rag_parent_docs") or [])
     parent_docs = _merge_parent_docs_from_chunk_paths(rag_docs=rag_docs, parent_docs=parent_docs)
     history_dialogues = _prepare_history_dialogues(state)
-    message_context = _prepare_message_context(state)
+    message_context = _prepare_message_context(state, intent_type=str(state.get("intent_type") or ""))
     full_docs_content = _prepare_full_docs_content(parent_docs)
     ref_rows: list[str] = []
     for idx, item in enumerate(parent_docs, start=1):
@@ -458,6 +505,7 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
     return {
         "user_query": user_query,
         "log_diagnosis_summary": log_diagnosis_summary,
+        "rag_sub_chunks_summary": rag_sub_chunks_summary,
         "rag_solutions_summary": rag_solutions_summary,
         "full_docs_references": full_docs_references,
         "history_dialogues": history_dialogues,
@@ -469,14 +517,22 @@ def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]
     }
 
 
-def _build_planner_user_prompt(context: dict[str, Any]) -> str:
+def _resolve_planner_prompt_files(intent_type: str) -> tuple[str, str]:
+    normalized = str(intent_type or "").strip()
+    if normalized == "SYSTEM_LOGIC_CONSULT":
+        return "planner_business_consult_system_prompt.txt", "planner_business_consult_user_prompt.txt"
+    return "planner_system_prompt.txt", "planner_user_prompt.txt"
+
+
+def _build_planner_user_prompt(context: dict[str, Any], *, prompt_file: str) -> str:
     return render_prompt(
-        "planner_user_prompt.txt",
+        prompt_file,
         user_query=str(context.get("user_query") or ""),
         history_dialogues=str(context.get("history_dialogues") or ""),
         message_context=str(context.get("message_context") or ""),
         skills_context=str(context.get("skills_context") or ""),
         log_diagnosis_summary=str(context.get("log_diagnosis_summary") or ""),
+        rag_sub_chunks_summary=str(context.get("rag_sub_chunks_summary") or ""),
         rag_solutions_summary=str(context.get("rag_solutions_summary") or ""),
         full_docs_references=str(context.get("full_docs_references") or ""),
         full_docs_content=str(context.get("full_docs_content") or ""),
@@ -488,6 +544,10 @@ def _map_tool_name(raw_name: Any) -> str:
     if name in _ALLOWED_TOOL_NAMES:
         return name
     lower = name.lower()
+    if "rag_sub" in lower or "child_chunk" in lower:
+        return "rag_parent_chunk_query"
+    if "rag_parent" in lower or "parent_chunk" in lower or "parent_doc" in lower:
+        return "rag_parent_chunk_query"
     if "code_pull" in lower or ("pull" in lower and "git" in lower):
         return "code_pull"
     if "code_clone" in lower or "clone" in lower:
@@ -606,6 +666,16 @@ def _tool_call_to_macro_subtask(item: dict[str, Any], tool_name: str) -> PlanSte
             "hypothesis": "代码中存在与日志现象一致的抛错分支或拦截逻辑。",
             "success_criteria": "形成“日志现象 ↔ 代码路径”的对应关系。",
             "suggested_tools": ["fetch_code", "clone_code"],
+        }
+    if tool_name == "rag_parent_chunk_query":
+        return {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": "根据已命中的子 chunk 回查父文档 TopK，读取完整上下文后形成业务结论。",
+            "hypothesis": "完整父文档包含子 chunk 的上下文约束，能避免断章取义。",
+            "success_criteria": "形成“业务问题-规则依据-结论”的完整链路，并引用父文档路径。",
+            "suggested_tools": ["rag_parent_chunk_query"],
         }
     return {
         "action_type": "react_subtask",
@@ -904,6 +974,53 @@ def _ensure_code_step_for_log_queries(
     return rows
 
 
+def _build_business_consult_base_steps() -> list[PlanStep]:
+    return [
+        {
+            "action_type": "react_subtask",
+            "tool_name": None,
+            "params": {},
+            "subtask": "直接查询 RAG 父文档 TopK（内部自动完成子 chunk 排序）并形成业务结论。",
+            "hypothesis": "父文档完整上下文可覆盖业务规则、模块职责与流程边界。",
+            "success_criteria": "输出“结论 + 文档依据 + 适用边界”的可复查回答。",
+            "suggested_tools": ["rag_parent_chunk_query"],
+        },
+        {"action_type": "merge_evidence", "tool_name": None, "params": {}},
+    ]
+
+
+def _step_suggests_tool(step: dict[str, Any], tool_name: str) -> bool:
+    mapped_tool_name = _map_tool_name(step.get("tool_name"))
+    if mapped_tool_name == tool_name:
+        return True
+    hints = _normalize_tool_hints(step.get("suggested_tools") or step.get("tool_candidates"))
+    return tool_name in hints
+
+
+def _enforce_business_rag_steps(plan_steps: list[PlanStep]) -> list[PlanStep]:
+    default_steps = _build_business_consult_base_steps()
+    if not plan_steps:
+        return default_steps
+
+    rows = [dict(item or {}) for item in list(plan_steps or []) if isinstance(item, dict)]
+    non_merge = [row for row in rows if str(row.get("action_type") or "") != "merge_evidence"]
+    if not non_merge:
+        return default_steps
+
+    parent_index = next((idx for idx, row in enumerate(non_merge) if _step_suggests_tool(row, "rag_parent_chunk_query")), -1)
+    parent_step = dict(non_merge[parent_index]) if parent_index >= 0 else dict(default_steps[0])
+    retained_steps = [
+        dict(row)
+        for idx, row in enumerate(non_merge)
+        if idx != parent_index
+    ]
+    normalized = [parent_step, *retained_steps]
+    if len(normalized) >= _MAX_PLAN_STEPS:
+        normalized = normalized[: max(1, _MAX_PLAN_STEPS - 1)]
+    normalized.append({"action_type": "merge_evidence", "tool_name": None, "params": {}})
+    return normalized
+
+
 def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
     if replan_count > 0:
         return [
@@ -949,6 +1066,8 @@ def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
             },
             {"action_type": "merge_evidence", "tool_name": None, "params": {}},
         ]
+    if intent_type == _BUSINESS_CONSULT_INTENT:
+        return _build_business_consult_base_steps()
     if intent_type in {"GENERAL_QA", "ORDER_INFO_QUERY"}:
         return [
             {
@@ -985,18 +1104,28 @@ def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
     ]
 
 
-def _plan_with_llm(context: dict[str, Any]) -> tuple[list[PlanStep], dict[str, Any]]:
-    system_prompt = load_prompt("planner_system_prompt.txt", default="")
-    user_prompt = _build_planner_user_prompt(context)
+def _plan_with_llm(context: dict[str, Any], *, intent_type: str) -> tuple[list[PlanStep], dict[str, Any]]:
+    system_prompt_file, user_prompt_file = _resolve_planner_prompt_files(intent_type)
+    system_prompt = load_prompt(system_prompt_file, default="")
+    user_prompt = _build_planner_user_prompt(context, prompt_file=user_prompt_file)
     if not user_prompt:
-        _LOGGER.warning("planner prompt 缺失: planner_user_prompt.txt")
-        return [], {"raw_output": "", "parse_ok": False, "system_prompt": system_prompt, "user_prompt": user_prompt}
+        _LOGGER.warning("planner prompt 缺失: %s", user_prompt_file)
+        return [], {
+            "raw_output": "",
+            "parse_ok": False,
+            "system_prompt_file": system_prompt_file,
+            "user_prompt_file": user_prompt_file,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+        }
     raw_output = chat_with_llm(question=user_prompt, system_prompt=system_prompt)
     parsed = _parse_json_object(raw_output)
     if not parsed:
         return [], {
             "raw_output": raw_output,
             "parse_ok": False,
+            "system_prompt_file": system_prompt_file,
+            "user_prompt_file": user_prompt_file,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "parsed_output": {},
@@ -1007,6 +1136,8 @@ def _plan_with_llm(context: dict[str, Any]) -> tuple[list[PlanStep], dict[str, A
         return [], {
             "raw_output": raw_output,
             "parse_ok": False,
+            "system_prompt_file": system_prompt_file,
+            "user_prompt_file": user_prompt_file,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "parsed_output": parsed,
@@ -1015,6 +1146,8 @@ def _plan_with_llm(context: dict[str, Any]) -> tuple[list[PlanStep], dict[str, A
     plan_meta = {
         "raw_output": raw_output,
         "parse_ok": True,
+        "system_prompt_file": system_prompt_file,
+        "user_prompt_file": user_prompt_file,
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
         "parsed_output": parsed,
@@ -1049,7 +1182,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     # 强制步骤：每次规划前先读取 src/skills 下全部 skill 文件。
     skills = _load_all_skills()
     context_for_llm = _prepare_context_for_llm(state, skills)
-    llm_plan_steps, llm_plan_meta = _plan_with_llm(context_for_llm)
+    llm_plan_steps, llm_plan_meta = _plan_with_llm(context_for_llm, intent_type=intent_type)
 
     if llm_plan_steps:
         plan_steps = llm_plan_steps
@@ -1057,6 +1190,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         plan_steps = _fallback_plan_steps(intent_type=intent_type, replan_count=replan_count)
         _LOGGER.info("planner 使用规则兜底计划: steps=%d intent=%s replan=%d", len(plan_steps), intent_type, replan_count)
+    if intent_type == _BUSINESS_CONSULT_INTENT:
+        plan_steps = _enforce_business_rag_steps(plan_steps)
+        _LOGGER.info("planner 业务咨询计划已注入 RAG 子/父 chunk 前置步骤: steps=%d", len(plan_steps))
     structured_context = _ensure_structured_log_window(
         dict(state.get("structured_context") or {}),
         str(context_for_llm.get("user_query") or question),
@@ -1067,6 +1203,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         state["current_step_index"] = 0
 
     llm_request = {
+        "system_prompt_file": str(llm_plan_meta.get("system_prompt_file") or ""),
+        "user_prompt_file": str(llm_plan_meta.get("user_prompt_file") or ""),
         "system_prompt": str(llm_plan_meta.get("system_prompt") or ""),
         "user_prompt": str(llm_plan_meta.get("user_prompt") or ""),
         "request_context": context_for_llm,
@@ -1089,6 +1227,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "planner_context_for_llm": {
             "skills_context": str(context_for_llm.get("skills_context") or ""),
             "log_diagnosis_summary": str(context_for_llm.get("log_diagnosis_summary") or ""),
+            "rag_sub_chunks_summary": str(context_for_llm.get("rag_sub_chunks_summary") or ""),
             "rag_solutions_summary": str(context_for_llm.get("rag_solutions_summary") or ""),
             "full_docs_references": str(context_for_llm.get("full_docs_references") or ""),
         },

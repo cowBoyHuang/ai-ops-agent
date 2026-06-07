@@ -5,9 +5,12 @@ from fastapi import APIRouter
 from web.middleware.flow_bridge import handle_analyze
 from web.schemas import AnalyzeRequest, AnalyzeResponse
 
-router = APIRouter()
+API_V1_PREFIX = "/api/v1"
+ANALYZE_PATH = f"{API_V1_PREFIX}/analyze"
+
+router = APIRouter(prefix=API_V1_PREFIX, tags=["analyze"])
 
 
-@router.post("/api/v1/analyze", response_model=AnalyzeResponse)
+@router.post("/analyze", response_model=AnalyzeResponse, summary="Analyze issue evidence")
 def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     return handle_analyze(req)

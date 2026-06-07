@@ -13,14 +13,36 @@ from flow.modules.agent_executor_graph.graph.executor.sub_executor import (
     run_code_sub_executor,
     run_log_sub_executor,
 )
+from flow.modules.agent_executor_graph.graph.rag_retrieve.rag_retrieve import (
+    query_parent_docs_from_rag,
+    resolve_intent_label_for_rag,
+)
 from llm.llm import chat_with_llm, load_prompt, render_prompt
 
 _LOGGER = logging.getLogger(__name__)
-_ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull", "none"}
+_ALLOWED_TOOL_NAMES = {
+    "log_query",
+    "dependency_log_query",
+    "knowledge_lookup",
+    "code_clone",
+    "code_pull",
+    "rag_parent_chunk_query",
+    "none",
+}
 _KEYWORD_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{2,64}")
+_STACK_LOCATION_HINT_PATTERN = re.compile(r"\b[A-Z][A-Za-z0-9_]+\.(?:java|kt|py):\d+\b")
+_CLASS_FILE_HINT_PATTERN = re.compile(r"\b[A-Z][A-Za-z0-9_]+\.(?:java|kt|py)\b")
 _MAX_LLM_HISTORY_ROWS = 4
 _MAX_SUMMARY_LEN = 300
+_MAX_PROMPT_ERROR_LEN = 200
+_MAX_PROMPT_EVIDENCE_ROWS = 4
+_MAX_PROMPT_EVIDENCE_CHARS = 800
+_MAX_PROMPT_KEYWORDS = 8
+_MAX_PROMPT_FACT_ITEMS = 8
 _MAX_REACT_RETRY_PER_STEP = 3
+_MAX_EXECUTOR_LOG_FACT_ITEMS = 8
+_MAX_EXECUTOR_LOG_VALUE_CHARS = 240
+_BUSINESS_CONSULT_INTENT = "SYSTEM_LOGIC_CONSULT"
 _LOCAL_TZ = dt.timezone(dt.timedelta(hours=8))
 _XEP_ORDER_PATTERN = re.compile(r"\bxep\s*(\d{6})(\d{6})\d*\b", re.IGNORECASE)
 _OPS_SLUGGER_PATTERN = re.compile(r"\bops[\s_.-]*slugger[\s_.-]*(\d{6})[\s_.-]*(\d{6})\b", re.IGNORECASE)
@@ -33,6 +55,7 @@ _ORDER_KEY_PATTERN = re.compile(
 )
 _ORDER_TOKEN_PATTERN = re.compile(r"\bxep\d{12,}\b", re.IGNORECASE)
 _PLACEHOLDER_TOKEN_PATTERN = re.compile(r"(?:\bxxx\b|placeholder|tbd|todo|待补充|示例)", re.IGNORECASE)
+_EXECUTION_HISTORY_KEY_PATTERN = re.compile(r"^step_(\d+)(?:_try_(\d+))?$")
 _SERVICE_TO_APP_CODE = {
     "order-service": "f_tts_trade_order",
     "tts-trade-order": "f_tts_trade_order",
@@ -51,6 +74,9 @@ _DEPENDENCY_APP_CODE_FALLBACK = {
     "f_tts_trade_order": "f_tts_trade_core",
     "f_tts_trade_core": "f_tts_trade_order",
 }
+_LOG_QUERY_TOOLS = {"log_query", "dependency_log_query"}
+_CODE_QUERY_TOOLS = {"code_clone", "code_pull"}
+_RAG_QUERY_TOOLS = {"rag_parent_chunk_query"}
 _REACT_TOOL_NAME_MAP = {
     "query_log": "log_query",
     "log_query": "log_query",
@@ -62,6 +88,9 @@ _REACT_TOOL_NAME_MAP = {
     "code_pull": "code_pull",
     "clone_code": "code_clone",
     "code_clone": "code_clone",
+    "rag_parent_chunk_query": "rag_parent_chunk_query",
+    "query_rag_parent_chunk": "rag_parent_chunk_query",
+    "rag_parent_doc_query": "rag_parent_chunk_query",
     "none": "none",
     "final_answer": "none",
 }
@@ -121,6 +150,19 @@ _REACT_TOOL_SCHEMAS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "rag_parent_chunk_query",
+        "description": "按用户问题直接查询父文档 TopK（内部自动完成子 chunk 排序），并读取完整父文档。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "可选检索词；未传时复用当前问题"},
+                "sub_chunk_top_k": {"type": "integer", "description": "先查询子 chunk 的条数，默认 6"},
+                "parent_top_k": {"type": "integer", "description": "父 chunk/父文档返回条数，默认 4"},
+            },
+            "required": [],
+        },
+    },
 ]
 _DEFAULT_REACT_SYSTEM_PROMPT = (
     "你是排障系统的执行者（ReAct Agent）。"
@@ -143,6 +185,149 @@ def _clip_text(text: Any, max_len: int = _MAX_SUMMARY_LEN) -> str:
     if len(raw) <= max_len:
         return raw
     return f"{raw[:max_len]}..."
+
+
+def _clip_text_middle(text: Any, max_len: int) -> str:
+    raw = str(text or "").strip()
+    if len(raw) <= max_len:
+        return raw
+    if max_len <= 10:
+        return raw[:max_len]
+    marker = " ... "
+    head = max(1, (max_len - len(marker)) // 2)
+    tail = max(1, max_len - len(marker) - head)
+    return f"{raw[:head]}{marker}{raw[-tail:]}"
+
+
+def _compact_prompt_value(value: Any, *, max_len: int = _MAX_PROMPT_EVIDENCE_CHARS) -> Any:
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        for idx, key in enumerate(sorted(value.keys(), key=str)):
+            if idx >= _MAX_PROMPT_FACT_ITEMS:
+                compact["..."] = f"truncated {max(0, len(value) - _MAX_PROMPT_FACT_ITEMS)} items"
+                break
+            compact[str(key)] = _compact_prompt_value(value.get(key), max_len=max_len)
+        return compact
+    if isinstance(value, list):
+        compact_list = [
+            _compact_prompt_value(item, max_len=max_len)
+            for item in list(value)[:_MAX_PROMPT_FACT_ITEMS]
+        ]
+        if len(value) > _MAX_PROMPT_FACT_ITEMS:
+            compact_list.append(f"... truncated {len(value) - _MAX_PROMPT_FACT_ITEMS} items")
+        return compact_list
+    if isinstance(value, tuple):
+        return _compact_prompt_value(list(value), max_len=max_len)
+    return _clip_text_middle(value, max_len=max_len)
+
+
+def _compact_executor_log_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        for idx, key in enumerate(sorted(value.keys(), key=str)):
+            if idx >= _MAX_EXECUTOR_LOG_FACT_ITEMS:
+                compact["..."] = f"truncated {max(0, len(value) - _MAX_EXECUTOR_LOG_FACT_ITEMS)} items"
+                break
+            compact[str(key)] = _compact_executor_log_value(value.get(key))
+        return compact
+    if isinstance(value, list):
+        compact_list = [_compact_executor_log_value(item) for item in list(value)[:_MAX_EXECUTOR_LOG_FACT_ITEMS]]
+        if len(value) > _MAX_EXECUTOR_LOG_FACT_ITEMS:
+            compact_list.append(f"... truncated {len(value) - _MAX_EXECUTOR_LOG_FACT_ITEMS} items")
+        return compact_list
+    if isinstance(value, tuple):
+        return _compact_executor_log_value(list(value))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return _clip_text_middle(value, _MAX_EXECUTOR_LOG_VALUE_CHARS)
+    return _clip_text_middle(repr(value), _MAX_EXECUTOR_LOG_VALUE_CHARS)
+
+
+def _compact_raw_result_for_executor_log(raw_result: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "tool": str(raw_result.get("tool") or ""),
+        "ok": bool(raw_result.get("ok")),
+        "error": _clip_text_middle(raw_result.get("error"), _MAX_PROMPT_ERROR_LEN),
+    }
+    for key in (
+        "log_hit_count",
+        "code_snippet_count",
+        "sub_chunk_count",
+        "parent_chunk_count",
+        "parent_doc_count",
+        "degraded",
+        "budget_exhausted",
+        "action_type",
+    ):
+        if key in raw_result:
+            compact[key] = raw_result.get(key)
+    effective_info = dict(raw_result.get("effective_info") or {})
+    if effective_info:
+        compact["effective_info"] = {
+            "summary": _clip_text_middle(effective_info.get("summary"), _MAX_EXECUTOR_LOG_VALUE_CHARS),
+            "keywords": [
+                _clip_text_middle(item, 80)
+                for item in list(effective_info.get("keywords") or [])[:_MAX_EXECUTOR_LOG_FACT_ITEMS]
+                if str(item or "").strip()
+            ],
+        }
+    return compact
+
+
+def _compact_raw_result_for_prompt(raw_result: dict[str, Any]) -> dict[str, Any]:
+    evidence = [
+        _clip_text_middle(item, _MAX_PROMPT_EVIDENCE_CHARS)
+        for item in list(raw_result.get("evidence") or [])[:_MAX_PROMPT_EVIDENCE_ROWS]
+        if str(item or "").strip()
+    ]
+    effective_info = dict(raw_result.get("effective_info") or {})
+    compact_effective_info: dict[str, Any] = {}
+    if effective_info:
+        summary = _clip_text_middle(effective_info.get("summary"), _MAX_PROMPT_EVIDENCE_CHARS)
+        keywords = [
+            _clip_text_middle(item, 80)
+            for item in list(effective_info.get("keywords") or [])[:_MAX_PROMPT_KEYWORDS]
+            if str(item or "").strip()
+        ]
+        facts = _compact_prompt_value(dict(effective_info.get("facts") or {}), max_len=160)
+        if summary:
+            compact_effective_info["summary"] = summary
+        if keywords:
+            compact_effective_info["keywords"] = keywords
+        if facts:
+            compact_effective_info["facts"] = facts
+
+    compact = {
+        "tool": str(raw_result.get("tool") or ""),
+        "ok": bool(raw_result.get("ok")),
+        "error": _clip_text_middle(raw_result.get("error"), _MAX_PROMPT_ERROR_LEN),
+        "evidence": evidence,
+    }
+    if compact_effective_info:
+        compact["effective_info"] = compact_effective_info
+    for key in ("log_hit_count", "code_snippet_count", "degraded", "budget_exhausted", "action_type"):
+        if key in raw_result:
+            compact[key] = raw_result.get(key)
+    return compact
+
+
+def _build_react_previous_observation(current_step_result: dict[str, Any]) -> dict[str, Any]:
+    if not current_step_result:
+        return {}
+    processed = dict(current_step_result.get("processed") or {})
+    react_decision = dict(current_step_result.get("react_decision") or {})
+    executed_step = dict(current_step_result.get("executed_step") or {})
+    return {
+        "step_index": current_step_result.get("step_index"),
+        "executed_tool": str(executed_step.get("tool_name") or ""),
+        "advance_plan_step": bool(react_decision.get("advance_plan_step", True)),
+        "summary": _clip_text_middle(processed.get("summary"), 240),
+        "keywords": [
+            _clip_text_middle(item, 80)
+            for item in list(processed.get("extracted_keywords") or [])[:_MAX_PROMPT_KEYWORDS]
+            if str(item or "").strip()
+        ],
+        "raw_result": _compact_raw_result_for_prompt(dict(current_step_result.get("raw_result") or {})),
+    }
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
@@ -178,6 +363,99 @@ def _tool_failed(tool: str, error: str, extra: dict[str, Any] | None = None) -> 
     if extra:
         payload.update(extra)
     return payload
+
+
+def _pick_positive_int(value: Any, default: int, *, min_value: int = 1, max_value: int = 30) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed < min_value:
+        parsed = min_value
+    if parsed > max_value:
+        parsed = max_value
+    return parsed
+
+
+def _summarize_sub_chunks_for_evidence(rows: list[dict[str, Any]], *, max_rows: int = 5) -> list[str]:
+    evidence: list[str] = []
+    for idx, item in enumerate(list(rows or [])[:max_rows], start=1):
+        payload = dict(item.get("payload") or {})
+        path = str(payload.get("path") or item.get("path") or "").strip() or "N/A"
+        score = float(item.get("score") or 0.0)
+        text = _clip_text(item.get("text"), 180)
+        evidence.append(f"[sub_chunk#{idx}] score={score:.4f} path={path} text={text}")
+    return evidence
+
+
+def _summarize_parent_docs_for_evidence(rows: list[dict[str, Any]], *, max_rows: int = 3) -> list[str]:
+    evidence: list[str] = []
+    for idx, item in enumerate(list(rows or [])[:max_rows], start=1):
+        path = str(item.get("path") or "").strip() or "N/A"
+        parent_id = str(item.get("parent_id") or "").strip() or "N/A"
+        score = float(item.get("score") or 0.0)
+        content = _clip_text(item.get("content"), 220)
+        evidence.append(f"[parent_doc#{idx}] parent_id={parent_id} score={score:.4f} path={path} content={content}")
+    return evidence
+
+
+def _build_rag_topk_docs_from_parent_docs(
+    *,
+    parent_docs: list[dict[str, Any]],
+    parent_top_k: int,
+) -> list[dict[str, Any]]:
+    """执行器侧 RAG 结果适配方法：返回 TopK 父文档列表。"""
+    rows: list[dict[str, Any]] = []
+    for item in list(parent_docs or [])[: max(1, parent_top_k)]:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "parent_id": str(item.get("parent_id") or "").strip(),
+                "path": str(item.get("path") or "").strip(),
+                "content": str(item.get("content") or "").strip(),
+                "score": float(item.get("score") or 0.0),
+                "chunk_id": str(item.get("chunk_id") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _run_rag_parent_chunk_tool(tool_params: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    question = str(tool_params.get("query") or state.get("question") or "").strip()
+    if not question:
+        return _tool_failed("rag_parent_chunk_query", "empty_query")
+    intent_zh = resolve_intent_label_for_rag(state)
+    sub_top_k = _pick_positive_int(tool_params.get("sub_chunk_top_k"), 6, max_value=30)
+    parent_top_k = _pick_positive_int(tool_params.get("parent_top_k"), 4, max_value=12)
+    sub_chunks, parent_chunks, parent_docs = query_parent_docs_from_rag(
+        question=question,
+        intent_zh=intent_zh,
+        sub_chunk_top_k=sub_top_k,
+        parent_top_k=parent_top_k,
+    )
+    topk_docs = _build_rag_topk_docs_from_parent_docs(
+        parent_docs=parent_docs,
+        parent_top_k=parent_top_k,
+    )
+    evidence = []
+    evidence.extend(_summarize_sub_chunks_for_evidence(sub_chunks, max_rows=2))
+    evidence.extend(_summarize_parent_docs_for_evidence(topk_docs, max_rows=min(3, parent_top_k)))
+    return _tool_success(
+        "rag_parent_chunk_query",
+        evidence,
+        extra={
+            "query": question,
+            "intent": intent_zh,
+            "sub_chunk_docs": sub_chunks,
+            "parent_chunk_docs": parent_chunks,
+            "parent_docs": topk_docs,
+            "topk_docs": topk_docs,
+            "sub_chunk_count": len(sub_chunks),
+            "parent_chunk_count": len(parent_chunks),
+            "parent_doc_count": len(topk_docs),
+        },
+    )
 
 
 def _execute_tool_call(
@@ -216,7 +494,16 @@ def _execute_tool_call(
         )
 
     if normalized_tool == "knowledge_lookup":
-        return _tool_success("knowledge_lookup", [f"知识库证据：{question[:64]}"])
+        intent_type = str(state.get("intent_type") or "").strip()
+        # 业务咨询场景统一收敛到父文档 RAG，避免占位知识工具导致证据不足。
+        if intent_type == _BUSINESS_CONSULT_INTENT:
+            rag_params = dict(tool_params or {})
+            rag_params.setdefault("query", str(tool_params.get("query") or question or "").strip())
+            rag_params.setdefault("sub_chunk_top_k", 6)
+            rag_params.setdefault("parent_top_k", 4)
+            return _run_rag_parent_chunk_tool(rag_params, state)
+        lookup_query = str(tool_params.get("query") or question or "").strip()
+        return _tool_success("knowledge_lookup", [f"知识库证据：{lookup_query[:64]}"])
 
     if normalized_tool in {"code_clone", "code_pull"}:
         return run_code_sub_executor(
@@ -225,12 +512,38 @@ def _execute_tool_call(
             structured_context=structured_context,
         )
 
+    if normalized_tool == "rag_parent_chunk_query":
+        return _run_rag_parent_chunk_tool(tool_params, state)
+
     return _tool_success("none", [])
+
+
+def _execution_history_sort_key(value: Any) -> tuple[int, int]:
+    text = str(value or "").strip()
+    matched = _EXECUTION_HISTORY_KEY_PATTERN.fullmatch(text)
+    if matched:
+        return (_as_int(matched.group(1), 0), _as_int(matched.group(2), 0))
+    return (_as_int(text, 0), 0)
+
+
+def _next_execution_step_key(execution_history: dict[str, Any], current_step_index: int) -> str:
+    prefix = f"step_{current_step_index}"
+    next_attempt = 0
+    for key in execution_history.keys():
+        matched = _EXECUTION_HISTORY_KEY_PATTERN.fullmatch(str(key or "").strip())
+        if not matched:
+            continue
+        if _as_int(matched.group(1), -1) != current_step_index:
+            continue
+        next_attempt = max(next_attempt, _as_int(matched.group(2), 0) + 1)
+    if next_attempt == 0 and prefix not in execution_history:
+        return prefix
+    return f"{prefix}_try_{next_attempt}"
 
 
 def _build_step_history_preview(execution_history: dict[str, Any]) -> str:
     rows: list[str] = []
-    keys = sorted(execution_history.keys(), key=lambda item: _as_int(str(item).split("_")[-1], 0))
+    keys = sorted(execution_history.keys(), key=_execution_history_sort_key)
     for key in keys[-_MAX_LLM_HISTORY_ROWS:]:
         item = dict(execution_history.get(key) or {})
         step = dict(item.get("step") or {})
@@ -249,6 +562,157 @@ def _build_step_history_preview(execution_history: dict[str, Any]) -> str:
             )
         )
     return "\n".join(rows).strip() or "无历史步骤"
+
+
+def _history_has_tool_evidence(execution_history: dict[str, Any], tool_names: set[str]) -> bool:
+    for key in sorted(execution_history.keys(), key=_execution_history_sort_key):
+        item = dict(execution_history.get(key) or {})
+        raw_result = dict(item.get("raw_result") or {})
+        tool_name = str(raw_result.get("tool") or dict(item.get("executed_step") or {}).get("tool_name") or "").strip()
+        if tool_name not in tool_names:
+            continue
+        evidence_rows = [str(row).strip() for row in list(raw_result.get("evidence") or []) if str(row).strip()]
+        if evidence_rows:
+            return True
+    return False
+
+
+def _history_has_code_hints(execution_history: dict[str, Any]) -> bool:
+    for key in sorted(execution_history.keys(), key=_execution_history_sort_key):
+        item = dict(execution_history.get(key) or {})
+        raw_result = dict(item.get("raw_result") or {})
+        evidence_rows = [str(row).strip() for row in list(raw_result.get("evidence") or []) if str(row).strip()]
+        for text in evidence_rows:
+            if _STACK_LOCATION_HINT_PATTERN.search(text) or _CLASS_FILE_HINT_PATTERN.search(text):
+                return True
+    return False
+
+
+def _step_has_code_intent(step: dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            str(step.get("subtask") or ""),
+            str(step.get("hypothesis") or ""),
+            str(step.get("success_criteria") or ""),
+        ]
+    ).lower()
+    return any(token in text for token in ("代码", "code", "文件", "file", "类", "方法", "行号", "实现"))
+
+
+def _step_has_dependency_log_intent(step: dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            str(step.get("subtask") or ""),
+            str(step.get("hypothesis") or ""),
+            str(step.get("success_criteria") or ""),
+        ]
+    ).lower()
+    return any(
+        token in text
+        for token in (
+            "dependency",
+            "trade_core",
+            "trade-core",
+            "core服务",
+            "依赖",
+            "下游",
+            "机票子单",
+            "flight/nflight",
+            "nflight",
+            "n_flight",
+            "单程生单结果",
+            "往返生单结果",
+        )
+    )
+
+
+def _history_has_flight_failure_signal(execution_history: dict[str, Any]) -> bool:
+    signal_tokens = (
+        "n_flight",
+        "nflight",
+        "flightordercreateresult",
+        "ordercreateresultmap",
+        "机票生单失败",
+        "子单生单",
+        "单程生单结果",
+        "往返生单结果",
+    )
+    for key in sorted(execution_history.keys(), key=_execution_history_sort_key):
+        item = dict(execution_history.get(key) or {})
+        raw_result = dict(item.get("raw_result") or {})
+        evidence_rows = [str(row).strip().lower() for row in list(raw_result.get("evidence") or []) if str(row).strip()]
+        if any(any(token in text for token in signal_tokens) for text in evidence_rows):
+            return True
+    return False
+
+
+def _pick_forced_followup_tool(
+    *,
+    step: dict[str, Any],
+    execution_history: dict[str, Any],
+) -> str:
+    suggested_tools = [
+        _normalize_react_tool_name(item)
+        for item in list(step.get("suggested_tools") or [])
+    ]
+    normalized_suggested_tools = [item for item in suggested_tools if item]
+    has_dependency_candidate = "dependency_log_query" in normalized_suggested_tools or _step_has_dependency_log_intent(step)
+    if has_dependency_candidate and not _history_has_tool_evidence(execution_history, {"dependency_log_query"}):
+        if _history_has_flight_failure_signal(execution_history):
+            return "dependency_log_query"
+    if not normalized_suggested_tools:
+        return ""
+
+    for tool_name in normalized_suggested_tools:
+        if tool_name == "rag_parent_chunk_query" and not _history_has_tool_evidence(execution_history, {tool_name}):
+            return tool_name
+        if tool_name == "dependency_log_query" and not _history_has_tool_evidence(execution_history, {"dependency_log_query"}):
+            return tool_name
+        if tool_name == "log_query" and not _history_has_tool_evidence(execution_history, _LOG_QUERY_TOOLS):
+            return tool_name
+        if tool_name in _CODE_QUERY_TOOLS and not _history_has_tool_evidence(execution_history, _CODE_QUERY_TOOLS):
+            if _step_has_code_intent(step) or _history_has_code_hints(execution_history):
+                return "code_pull"
+    return ""
+
+
+def _should_override_with_forced_tool(
+    *,
+    selected_tool_name: str,
+    forced_tool_name: str,
+) -> bool:
+    selected = str(selected_tool_name or "").strip()
+    forced = str(forced_tool_name or "").strip()
+    if not forced or selected == forced:
+        return False
+    if selected in {"none", "knowledge_lookup"}:
+        return True
+    if forced in _CODE_QUERY_TOOLS and selected not in _CODE_QUERY_TOOLS:
+        return True
+    if forced == "rag_parent_chunk_query" and selected != "rag_parent_chunk_query":
+        return True
+    return False
+
+
+def _should_force_advance_after_success(
+    *,
+    executed_step: dict[str, Any],
+    raw_result: dict[str, Any],
+    advance_plan_step: bool,
+) -> bool:
+    if advance_plan_step or not bool(raw_result.get("ok")):
+        return advance_plan_step
+    tool_name = str(executed_step.get("tool_name") or raw_result.get("tool") or "").strip()
+    evidence_rows = [str(row).strip() for row in list(raw_result.get("evidence") or []) if str(row).strip()]
+    has_substantive_evidence = bool(evidence_rows)
+    has_rag_hits = any(
+        _as_int(raw_result.get(key), 0) > 0 for key in ("sub_chunk_count", "parent_chunk_count", "parent_doc_count")
+    )
+    if tool_name in {"dependency_log_query", *list(_CODE_QUERY_TOOLS)} and has_substantive_evidence:
+        return True
+    if tool_name in _RAG_QUERY_TOOLS and (has_substantive_evidence or has_rag_hits):
+        return True
+    return advance_plan_step
 
 
 def _fallback_keywords(step: dict[str, Any], raw_result: dict[str, Any]) -> list[str]:
@@ -271,7 +735,7 @@ def _process_step_result_with_llm(
     user_prompt = render_prompt(
         "plan_execute_step_user_prompt.txt",
         step_json=json.dumps(step, ensure_ascii=False),
-        result_json=json.dumps(raw_result, ensure_ascii=False),
+        result_json=json.dumps(_compact_raw_result_for_prompt(raw_result), ensure_ascii=False),
         history_preview=_build_step_history_preview(execution_history),
     )
     fallback = {
@@ -552,6 +1016,22 @@ def _pick_recent_log_app_code(state: dict[str, Any]) -> str:
         app_code = str(params.get("app_code") or "").strip().lower()
         if app_code in _APP_CODE_TO_LOGNAME:
             return app_code
+    execution_history = dict(state.get("execution_history") or {})
+    for key in sorted(execution_history.keys(), key=_execution_history_sort_key, reverse=True):
+        item = dict(execution_history.get(key) or {})
+        raw_result = dict(item.get("raw_result") or {})
+        step = dict(item.get("executed_step") or item.get("step") or {})
+        tool_name = str(raw_result.get("tool") or step.get("tool_name") or "").strip()
+        if tool_name not in {"log_query", "dependency_log_query"}:
+            continue
+        params = dict(step.get("params") or {})
+        app_code = str(params.get("app_code") or "").strip().lower()
+        if app_code in _APP_CODE_TO_LOGNAME:
+            return app_code
+        if tool_name == "dependency_log_query":
+            return "f_tts_trade_core"
+        if tool_name == "log_query":
+            return "f_tts_trade_order"
     return ""
 
 
@@ -564,6 +1044,54 @@ def _infer_app_code_from_text(text: str) -> str:
     if any(token in lowered for token in order_tokens):
         return "f_tts_trade_order"
     return ""
+
+
+def _normalize_code_repo_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    return str(_SERVICE_TO_APP_CODE.get(lowered) or raw).strip()
+
+
+def _infer_code_repo_name(params: dict[str, Any], state: dict[str, Any], step: dict[str, Any]) -> str:
+    explicit_repo = _normalize_code_repo_name(params.get("repo_name") or params.get("repo"))
+    if explicit_repo:
+        return explicit_repo
+
+    service_name = _normalize_code_repo_name(params.get("service_name") or params.get("service"))
+    if service_name:
+        return service_name
+
+    explicit_app_code = _normalize_code_repo_name(params.get("app_code") or params.get("appCode"))
+    if explicit_app_code:
+        return explicit_app_code
+
+    recent_log_app_code = _normalize_code_repo_name(_pick_recent_log_app_code(state))
+    execution_history = dict(state.get("execution_history") or {})
+    if recent_log_app_code and _history_has_tool_evidence(execution_history, {"dependency_log_query"}):
+        return recent_log_app_code
+
+    structured_context = dict(state.get("structured_context") or {})
+    context_app_code = _normalize_code_repo_name(structured_context.get("app_code"))
+    if context_app_code:
+        return context_app_code
+
+    merged_text = " ".join(
+        [
+            str(step.get("subtask") or ""),
+            str(step.get("hypothesis") or ""),
+            str(step.get("success_criteria") or ""),
+            str(state.get("question") or ""),
+            str(params.get("file_path") or ""),
+            str(params.get("search_hint") or ""),
+        ]
+    )
+    inferred_from_text = _infer_app_code_from_text(merged_text)
+    if inferred_from_text:
+        return inferred_from_text
+
+    return recent_log_app_code
 
 
 def _infer_log_query_target(
@@ -657,10 +1185,32 @@ def _normalize_react_params(
         line_number = params.get("line_number")
         if file_path and line_number and not str(params.get("search_hint") or "").strip():
             params["search_hint"] = f"{file_path}:{line_number}"
-        if not str(params.get("repo_name") or "").strip():
-            repo_name = str(params.get("repo") or params.get("service_name") or "").strip()
-            if repo_name:
-                params["repo_name"] = repo_name
+        execution_history = dict(state.get("execution_history") or {})
+        recent_log_app_code = _normalize_code_repo_name(_pick_recent_log_app_code(state))
+        current_repo_hint = _normalize_code_repo_name(
+            params.get("repo_name")
+            or params.get("repo")
+            or params.get("service_name")
+            or params.get("service")
+            or params.get("app_code")
+            or params.get("appCode")
+        )
+        if (
+            recent_log_app_code
+            and _history_has_tool_evidence(execution_history, {"dependency_log_query"})
+            and current_repo_hint == "f_tts_trade_order"
+        ):
+            params["repo_name"] = recent_log_app_code
+            params["app_code"] = recent_log_app_code
+        repo_name = _infer_code_repo_name(params=params, state=state, step=step)
+        if repo_name:
+            params["repo_name"] = repo_name
+            params.setdefault("app_code", repo_name)
+    if tool_name == "rag_parent_chunk_query":
+        params["sub_chunk_top_k"] = _pick_positive_int(params.get("sub_chunk_top_k"), 6, max_value=30)
+        params["parent_top_k"] = _pick_positive_int(params.get("parent_top_k"), 4, max_value=12)
+        if not str(params.get("query") or "").strip():
+            params["query"] = str(state.get("question") or "")
     return params
 
 
@@ -698,6 +1248,11 @@ def _infer_default_tool_for_subtask(step: dict[str, Any], state: dict[str, Any])
         "往返生单结果",
     )
     code_hints = ("代码", "code", "file", "文件", "行号", "方法", "类")
+    rag_parent_hints = ("rag", "chunk", "文档片段", "子chunk", "子 chunk", "父chunk", "父 chunk", "完整文档", "父文档", "上下文", "业务规则")
+    intent_type = str(state.get("intent_type") or "").strip()
+    if intent_type == "SYSTEM_LOGIC_CONSULT":
+        if any(token in text for token in rag_parent_hints):
+            return "rag_parent_chunk_query"
     if any(token in text for token in log_hints):
         return "log_query"
     if any(token in text for token in code_hints):
@@ -751,7 +1306,7 @@ def _decide_react_action(
         step,
     )
     system_prompt = load_prompt("executor_react_system_prompt.txt", default=_DEFAULT_REACT_SYSTEM_PROMPT)
-    previous_observation = dict(state.get("current_step_result") or {})
+    previous_observation = _build_react_previous_observation(dict(state.get("current_step_result") or {}))
     user_prompt = render_prompt(
         "executor_react_user_prompt.txt",
         question=str(state.get("question") or ""),
@@ -795,6 +1350,23 @@ def _decide_react_action(
     if not internal_tool_name and not final_answer:
         fallback["raw_output"] = llm_output
         return fallback
+    forced_tool_name = _pick_forced_followup_tool(step=step, execution_history=execution_history)
+    if _should_override_with_forced_tool(
+        selected_tool_name=internal_tool_name,
+        forced_tool_name=forced_tool_name,
+    ):
+        normalized_params = _normalize_react_params(forced_tool_name, params, state, step)
+        forced_action_name = tool_name or forced_tool_name
+        return {
+            "thought": str(parsed.get("thought") or parsed.get("reasoning") or "").strip() or "当前子任务仍需补充关键证据，按计划继续执行工具。",
+            "action": {"tool_name": forced_action_name, "params": params},
+            "internal_tool_name": forced_tool_name,
+            "action_params": normalized_params,
+            "final_answer": "",
+            "advance_plan_step": True,
+            "parse_ok": True,
+            "raw_output": llm_output,
+        }
     if internal_tool_name == "none" and not final_answer:
         fallback["raw_output"] = llm_output
         return fallback
@@ -841,6 +1413,13 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     step = dict(raw_step) if isinstance(raw_step, dict) else {}
     step.setdefault("action_type", "tool_call")
     action_type = str(step.get("action_type") or "tool_call")
+    _LOGGER.info(
+        "executor 开始执行步骤: step=%d action_type=%s subtask=%s suggested_tools=%s",
+        current_step_index,
+        action_type,
+        _clip_text_middle(step.get("subtask"), 120),
+        json.dumps(_compact_executor_log_value(step.get("suggested_tools") or []), ensure_ascii=False),
+    )
 
     if action_type == "merge_evidence":
         raw_result = _tool_success("none", [], extra={"action_type": "merge_evidence"})
@@ -866,10 +1445,23 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         react_decision = _decide_react_action(step=step, state=state, execution_history=execution_history)
         tool_name = str(react_decision.get("internal_tool_name") or "none")
         tool_params = dict(react_decision.get("action_params") or {})
+        if tool_name == "knowledge_lookup" and str(state.get("intent_type") or "").strip() == _BUSINESS_CONSULT_INTENT:
+            tool_name = "rag_parent_chunk_query"
+            tool_params = _normalize_react_params(tool_name, dict(tool_params or {}), state, step)
+            react_decision["internal_tool_name"] = tool_name
+            react_decision["action_params"] = dict(tool_params or {})
         tool_params.setdefault("query", state.get("question") or "")
         tool_params.setdefault("order_id", structured_context.get("order_id") or "")
         tool_params.setdefault("request_id", structured_context.get("request_id") or "")
         executed_step = {"action_type": "tool_call", "tool_name": tool_name, "params": tool_params}
+        _LOGGER.info(
+            "executor ReAct 决策: step=%d action=%s internal_tool=%s advance=%s params=%s",
+            current_step_index,
+            _clip_text_middle(dict(react_decision.get("action") or {}).get("tool_name"), 60),
+            tool_name,
+            bool(react_decision.get("advance_plan_step", True)),
+            json.dumps(_compact_executor_log_value(tool_params), ensure_ascii=False),
+        )
 
         final_answer = str(react_decision.get("final_answer") or "").strip()
         if tool_name == "none":
@@ -905,7 +1497,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         )
         state["tool_history"] = history
 
-    step_key = f"step_{current_step_index}"
+    step_key = _next_execution_step_key(execution_history, current_step_index)
     execution_history[step_key] = {
         "index": current_step_index,
         "step": step,
@@ -923,6 +1515,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     extracted_keywords.update(clues)
 
     advance_plan_step = bool(react_decision.get("advance_plan_step", True))
+    advance_plan_step = _should_force_advance_after_success(
+        executed_step=executed_step,
+        raw_result=raw_result,
+        advance_plan_step=advance_plan_step,
+    )
     in_place_retry_count = _as_int(state.get("in_place_retry_count"), 0)
     if advance_plan_step:
         in_place_retry_count = 0
@@ -974,5 +1571,31 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         str(executed_step.get("tool_name") or "none"),
         bool(raw_result.get("ok")),
         bool(react_decision.get("advance_plan_step", True)),
+    )
+    _LOGGER.info(
+        "executor 单步详情: step=%d executed_step=%s decision=%s result=%s",
+        current_step_index,
+        json.dumps(
+            _compact_executor_log_value(
+                {
+                    "action_type": executed_step.get("action_type"),
+                    "tool_name": executed_step.get("tool_name"),
+                    "params": executed_step.get("params"),
+                }
+            ),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            _compact_executor_log_value(
+                {
+                    "thought": react_decision.get("thought"),
+                    "action": react_decision.get("action"),
+                    "advance_plan_step": react_decision.get("advance_plan_step"),
+                    "final_answer": react_decision.get("final_answer"),
+                }
+            ),
+            ensure_ascii=False,
+        ),
+        json.dumps(_compact_raw_result_for_executor_log(raw_result), ensure_ascii=False),
     )
     return dict(state)

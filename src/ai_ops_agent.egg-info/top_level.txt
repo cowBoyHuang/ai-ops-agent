@@ -1,11 +1,14 @@
 cache
+code_repo
 db
 embedding
 flow
 llm
 log
+log_repo
 qdrant
 skills
 src
 tests
+tool
 web

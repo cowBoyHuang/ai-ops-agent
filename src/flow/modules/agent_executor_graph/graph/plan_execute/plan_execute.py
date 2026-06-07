@@ -24,6 +24,7 @@ _MAX_STEP_RETRY = 1
 _MAX_LLM_HISTORY_ROWS = 4
 _MAX_SUMMARY_LEN = 300
 _KEYWORD_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{2,64}")
+_EXECUTION_HISTORY_KEY_PATTERN = re.compile(r"^step_(\d+)(?:_try_(\d+))?$")
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -106,7 +107,7 @@ def _extract_git_url(tool_params: dict[str, Any], structured_context: dict[str, 
 
 def _build_step_history_preview(execution_history: dict[str, Any]) -> str:
     rows: list[str] = []
-    keys = sorted(execution_history.keys(), key=lambda item: _as_int(str(item).split("_")[-1], 0))
+    keys = sorted(execution_history.keys(), key=_execution_history_sort_key)
     for key in keys[-_MAX_LLM_HISTORY_ROWS:]:
         item = dict(execution_history.get(key) or {})
         step = dict(item.get("step") or {})
@@ -123,6 +124,29 @@ def _build_step_history_preview(execution_history: dict[str, Any]) -> str:
             )
         )
     return "\n".join(rows).strip() or "无历史步骤"
+
+
+def _execution_history_sort_key(value: Any) -> tuple[int, int]:
+    text = str(value or "").strip()
+    matched = _EXECUTION_HISTORY_KEY_PATTERN.fullmatch(text)
+    if matched:
+        return (_as_int(matched.group(1), 0), _as_int(matched.group(2), 0))
+    return (_as_int(text, 0), 0)
+
+
+def _next_execution_step_key(execution_history: dict[str, Any], current_step_index: int) -> str:
+    prefix = f"step_{current_step_index}"
+    next_attempt = 0
+    for key in execution_history.keys():
+        matched = _EXECUTION_HISTORY_KEY_PATTERN.fullmatch(str(key or "").strip())
+        if not matched:
+            continue
+        if _as_int(matched.group(1), -1) != current_step_index:
+            continue
+        next_attempt = max(next_attempt, _as_int(matched.group(2), 0) + 1)
+    if next_attempt == 0 and prefix not in execution_history:
+        return prefix
+    return f"{prefix}_try_{next_attempt}"
 
 
 def _fallback_keywords(step: dict[str, Any], raw_result: dict[str, Any]) -> list[str]:
@@ -318,7 +342,7 @@ def _merge_all_evidence(state: dict[str, Any], execution_history: dict[str, Any]
             }
         )
 
-    keys = sorted(execution_history.keys(), key=lambda item: _as_int(str(item).split("_")[-1], 0))
+    keys = sorted(execution_history.keys(), key=_execution_history_sort_key)
     for key in keys:
         item = dict(execution_history.get(key) or {})
         step = dict(item.get("step") or {})
@@ -379,11 +403,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         raw_step = plan_steps[current_step_index]
         step = dict(raw_step) if isinstance(raw_step, dict) else {}
         step.setdefault("action_type", "tool_call")
-        step_key = f"step_{current_step_index}"
         step_attempt = 0
         step_completed = True
 
         while step_attempt <= _MAX_STEP_RETRY:
+            step_key = _next_execution_step_key(execution_history, current_step_index)
             raw_result = _execute_single_step(step=step, state=state, structured_context=structured_context)
             processed = _process_step_result_with_llm(step=step, raw_result=raw_result, execution_history=execution_history)
 

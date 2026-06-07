@@ -1,0 +1,32 @@
+请基于以下上下文制定业务咨询分析计划：
+
+【用户问题】
+{user_query}
+
+【历史对话信息】
+{history_dialogues}
+
+【消息缓存上下文（message_context）】
+{message_context}
+
+【技能定义（必须遵循）】
+{skills_context}
+
+【RAG 子 chunk 摘要】
+{rag_sub_chunks_summary}
+
+【RAG 父 chunk 摘要】
+{rag_solutions_summary}
+
+【完整参考文档】
+{full_docs_references}
+
+【完整文档内容】
+{full_docs_content}
+
+要求：
+1. 这是业务咨询，不是线上故障排障；优先基于文档解释业务规则与业务流程。
+2. plan_steps 仅安排父文档回查子任务（rag_parent_chunk_query），子 chunk 排序由该方法内部完成。
+3. 每个子任务都要包含：subtask、hypothesis、success_criteria、tool_candidates。
+4. 不要输出具体接口参数；执行参数由下游执行器按上下文自动补全。
+5. solution_steps 与 validation 中必须体现“结论对应父文档依据”。

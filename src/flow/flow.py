@@ -16,6 +16,7 @@ from flow.modules.memory.memory import run as memory_run
 from flow.modules.response_emit.response_emit import run as response_emit_run
 
 _MOD_LOG = logging.getLogger("aiops.flow.module")
+_RUN_WHEN_FINISHED = {"memory"}
 
 
 def _validate_module_result(module_name: str, before: dict[str, Any], after: Any) -> dict[str, Any]:
@@ -36,8 +37,9 @@ def _module_node(module_name: str, fn: Callable[[dict[str, Any]], dict[str, Any]
 
     def _wrapped(payload: dict[str, Any]) -> dict[str, Any]:
         incoming = dict(payload)
-        # 全局停止规则：status=finished 时不再处理后续节点。
-        if str(incoming.get("status") or "").lower() == "finished":
+        # 全局停止规则：status=finished 时默认不再处理后续节点。
+        # memory 需要在 finished 场景也执行，用于会话落库与缓存更新。
+        if str(incoming.get("status") or "").lower() == "finished" and module_name not in _RUN_WHEN_FINISHED:
             _MOD_LOG.info("module.skip name=%s reason=status_finished", module_name)
             return incoming
 

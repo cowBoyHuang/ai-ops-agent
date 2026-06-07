@@ -59,6 +59,18 @@ def _to_confidence(value: Any) -> float:
         return 0.0
 
 
+def _has_analysis_content(section: dict[str, Any]) -> bool:
+    if bool(section.get("available")):
+        return True
+    if str(section.get("root_cause") or "").strip():
+        return True
+    if str(section.get("reply") or "").strip():
+        return True
+    if list(section.get("locations") or []):
+        return True
+    return False
+
+
 def _extract_decisive_log_reason(merged_evidence: dict[str, Any]) -> str:
     """从日志证据中提取“可直接给结论”的失败原因。"""
     logs = list(merged_evidence.get("logs") or [])
@@ -104,6 +116,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     root_cause = str(state.get("root_cause") or analysis.get("root_cause") or "").strip()
     solution = str(state.get("solution") or analysis.get("reply") or "").strip()
     confidence = _to_confidence(state.get("confidence") or analysis.get("confidence"))
+    log_analysis = dict(state.get("log_analysis") or analysis.get("log_analysis") or {})
+    code_analysis = dict(state.get("code_analysis") or analysis.get("code_analysis") or {})
     tool_ok = bool(tool_result.get("ok", True))
     tool_error = str(tool_result.get("error") or "")
 
@@ -114,30 +128,47 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     has_more_plan_steps = current_step_index < len(plan_steps)
     logs = list(merged_evidence.get("logs") or [])
     knowledge = list(merged_evidence.get("knowledge") or [])
-    has_evidence = bool(logs or knowledge)
+    code = list(merged_evidence.get("code") or [])
+    has_evidence = bool(logs or knowledge or code)
     decisive_reason = _extract_decisive_log_reason(merged_evidence)
     if decisive_reason:
         root_cause = root_cause or decisive_reason
         solution = solution or f"日志已明确给出失败原因：{decisive_reason}。请按该原因调整请求参数或业务规则后重试。"
         confidence = max(confidence, 0.9)
+        if not _has_analysis_content(log_analysis):
+            log_analysis = {
+                "available": True,
+                "root_cause": decisive_reason,
+                "reply": f"日志已明确给出失败原因：{decisive_reason}。",
+                "confidence": 0.9,
+            }
         state["root_cause"] = root_cause
         state["solution"] = solution
         state["confidence"] = confidence
+        state["log_analysis"] = log_analysis
         state["analysis"] = {
             **analysis,
             "root_cause": root_cause,
             "reply": solution,
             "confidence": "high",
             "decision_source": "decisive_log_evidence",
+            "log_analysis": log_analysis,
+            "code_analysis": code_analysis,
         }
 
+    has_log_analysis = _has_analysis_content(log_analysis)
+    has_code_analysis = _has_analysis_content(code_analysis)
+    has_any_analysis = has_log_analysis or has_code_analysis or bool(root_cause)
+
     # 判定顺序遵循“先硬限制，再可重试，再成功，再重规划”。
-    if decisive_reason:
-        status = "SUCCESS"
-    elif tool_call_count >= max_tool_calls:
-        status = "FAIL"
+    if tool_call_count >= max_tool_calls:
+        status = "SUCCESS" if has_any_analysis else "FAIL"
     elif not tool_ok and _has_retryable_error(tool_error):
         status = "NEED_RETRY"
+    elif has_more_plan_steps and not (has_log_analysis and has_code_analysis):
+        status = "NEED_RETRY"
+    elif has_any_analysis:
+        status = "SUCCESS"
     elif confidence > 0.7 and bool(root_cause):
         status = "SUCCESS"
     elif not has_evidence:

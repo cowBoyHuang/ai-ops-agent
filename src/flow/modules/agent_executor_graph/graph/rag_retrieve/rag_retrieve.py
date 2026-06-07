@@ -2,8 +2,8 @@
 
 业务职责：
 - 根据原始问题执行向量检索（Qdrant）。
-- 基于首轮 RAG 结果提取错误信息，构建二阶段增强查询并再次检索。
-- 输出 rag_docs/rag_parent_docs/rag_scores，供 planner 与分析节点使用。
+- 提供两个能力方法：子 chunk TopK 查询、父 chunk TopK + 父文档全文回查。
+- 输出 rag_sub_chunk_docs/rag_docs/rag_parent_docs/rag_scores，供 planner 与执行节点使用。
 """
 
 from __future__ import annotations
@@ -11,24 +11,24 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-import re
 import time
 from typing import Any
+import xml.etree.ElementTree as ET
+import zipfile
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from qdrant import QdrantStore
 
 _LOGGER = logging.getLogger(__name__)
-_MAX_DIAGNOSE_DOCS = 5
 _MAX_RAG_DOCS = 30
 _MAX_RAG_PARENT_DOCS = 12
 _DEFAULT_PARENT_DOC_TOP_N = 6
+_DEFAULT_SUB_CHUNK_TOP_K = 12
 _MAX_LOG_QUESTION_LEN = 120
-_ERROR_CODE_PATTERN = re.compile(r"(?:error[_\s-]?code|错误码)\s*[:=]\s*([A-Za-z0-9_-]{2,64})", re.IGNORECASE)
-_EXCEPTION_PATTERN = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:Exception|Error))\b")
+_DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 _INTENT_TO_CN = {
-    "SYSTEM_LOGIC_CONSULT": "系统逻辑咨询",
+    "SYSTEM_LOGIC_CONSULT": "业务咨询",
     "OPS_ANALYSIS": "线上问题咨询",
     "ORDER_INFO_QUERY": "订单信息查询",
     "UNKNOWN_INTENT": "未知意图",
@@ -36,16 +36,24 @@ _INTENT_TO_CN = {
 }
 
 
-def _parent_doc_top_n() -> int:
-    """读取父文档回查 TopN，环境变量无效时回退默认值。"""
-    raw = str(os.getenv("RAG_RETRIEVE_PARENT_DOC_TOP_N", _DEFAULT_PARENT_DOC_TOP_N)).strip()
+def _positive_int_env(env_key: str, default: int) -> int:
+    raw = str(os.getenv(env_key, default)).strip()
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return _DEFAULT_PARENT_DOC_TOP_N
+        return default
     if value <= 0:
-        return _DEFAULT_PARENT_DOC_TOP_N
+        return default
     return value
+
+
+def _sub_chunk_top_k() -> int:
+    return min(_positive_int_env("RAG_RETRIEVE_SUB_CHUNK_TOP_K", _DEFAULT_SUB_CHUNK_TOP_K), _MAX_RAG_DOCS)
+
+
+def _parent_doc_top_n() -> int:
+    """读取父文档回查 TopN，环境变量无效时回退默认值。"""
+    return min(_positive_int_env("RAG_RETRIEVE_PARENT_DOC_TOP_N", _DEFAULT_PARENT_DOC_TOP_N), _MAX_RAG_PARENT_DOCS)
 
 
 # 方法注释（业务）:
@@ -67,6 +75,8 @@ def _read_local_doc(path: str) -> str:
     text_path = Path(str(path or "").strip())
     if not text_path.is_file():
         return ""
+    if text_path.suffix.lower() == ".docx":
+        return _read_docx_text_safely(text_path)
     try:
         raw = text_path.read_bytes()
     except Exception:  # pragma: no cover - 文件系统异常统一降级
@@ -80,6 +90,23 @@ def _read_local_doc(path: str) -> str:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="ignore").strip()
+
+
+def _read_docx_text_safely(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            if "word/document.xml" not in zf.namelist():
+                return ""
+            root = ET.fromstring(zf.read("word/document.xml"))
+    except Exception:
+        return ""
+
+    rows: list[str] = []
+    for para in root.findall(".//w:p", _DOCX_NS):
+        text = "".join(node.text or "" for node in para.findall(".//w:t", _DOCX_NS)).strip()
+        if text:
+            rows.append(" ".join(text.split()))
+    return "\n".join(rows).strip()
 
 
 # 方法注释（业务）:
@@ -106,7 +133,7 @@ def _pick_question(state: dict[str, Any]) -> str:
 # - 入参：`state`(dict[str, Any])=当前 AgentState 字典，可能包含 intent_type/intent_recognition。
 # - 出参：`str`=中文意图标签（用于拼接 RAG 查询词）。
 # - 方法逻辑：优先使用 `intent_recognition.best_intent`，否则由 `intent_type` 映射为中文标签并兜底“未知意图”。
-def _pick_intent_zh(state: dict[str, Any]) -> str:
+def resolve_intent_label_for_rag(state: dict[str, Any]) -> str:
     recognition = dict(state.get("intent_recognition") or {})
     best_intent = str(recognition.get("best_intent") or "").strip()
     if best_intent:
@@ -119,7 +146,7 @@ def _pick_intent_zh(state: dict[str, Any]) -> str:
 # - 入参：`query`(str)=RAG 检索查询词；`intent_zh`(str)=中文意图标签。
 # - 出参：`list[dict[str, Any]]`=RAG chunk 候选列表（含 payload.parent_id）。
 # - 方法逻辑：将“查询词+意图”拼接后调用 Qdrant，抽取文本与 payload 元信息，统一输出结构。
-def _search_qdrant_rag(query: str, intent_zh: str) -> list[dict[str, Any]]:
+def _search_qdrant_rag(query: str, intent_zh: str, *, limit: int = _MAX_RAG_DOCS) -> list[dict[str, Any]]:
     if not query:
         _LOGGER.info("rag_retrieve 跳过 Qdrant: query 为空")
         return []
@@ -131,13 +158,13 @@ def _search_qdrant_rag(query: str, intent_zh: str) -> list[dict[str, Any]]:
         _clip_for_log(query_text),
     )
     try:
-        rows = QdrantStore().search(query=query_text, limit=_MAX_RAG_DOCS)
+        rows = QdrantStore().search(query=query_text, limit=max(1, min(limit, _MAX_RAG_DOCS)))
     except Exception as err:  # pragma: no cover - 外部依赖异常统一降级
         _LOGGER.warning("rag_retrieve Qdrant 查询失败: %s", err)
         return []
 
     docs: list[dict[str, Any]] = []
-    for idx, row in enumerate(list(rows or [])[:_MAX_RAG_DOCS], start=1):
+    for idx, row in enumerate(list(rows or [])[: max(1, min(limit, _MAX_RAG_DOCS))], start=1):
         payload = dict(row.get("payload") or {}) if isinstance(row, dict) else {}
         # 兼容不同 payload 字段命名，优先 text，其次 content。
         text = str(
@@ -168,55 +195,10 @@ def _search_qdrant_rag(query: str, intent_zh: str) -> list[dict[str, Any]]:
 
 
 # 方法注释（业务）:
-# - 入参：`docs`(list[dict[str, Any]])=首轮 RAG chunk 命中结果。
-# - 出参：`dict[str, Any]`=错误信息摘要（error_code/exception/keywords）。
-# - 方法逻辑：从高分 RAG 文档中提取错误码与异常类名，并生成增强检索关键词。
-def _extract_error_info(docs: list[dict[str, Any]]) -> dict[str, Any]:
-    texts = [str(item.get("text") or "") for item in docs[:_MAX_DIAGNOSE_DOCS]]
-    merged = "\n".join(texts)
-
-    error_code = ""
-    match_code = _ERROR_CODE_PATTERN.search(merged)
-    if match_code:
-        error_code = str(match_code.group(1) or "").strip()
-
-    exception = ""
-    match_exception = _EXCEPTION_PATTERN.search(merged)
-    if match_exception:
-        exception = str(match_exception.group(1) or "").strip()
-
-    keywords = " ".join(part for part in [error_code, exception] if part).strip()
-    result = {
-        "error_code": error_code,
-        "exception": exception,
-        "keywords": keywords,
-    }
-    _LOGGER.info(
-        "rag_retrieve 文档诊断提取完成: error_code=%s exception=%s",
-        error_code,
-        exception,
-    )
-    return result
-
-
-# 方法注释（业务）:
-# - 入参：`question`(str)=原始问题；`error_info`(dict[str, Any])=错误信息摘要。
-# - 出参：`str`=用于第二阶段文档检索的查询词。
-# - 方法逻辑：若日志已提取到错误码/异常，则将关键词拼接到问题后进行增强检索；否则回退原问题。
-def _build_stage2_rag_query(question: str, error_info: dict[str, Any]) -> str:
-    keywords = str(error_info.get("keywords") or "").strip()
-    if keywords:
-        _LOGGER.info("rag_retrieve 二阶段检索词增强: keywords=%s", keywords)
-        return f"{question} {keywords}".strip()
-    _LOGGER.info("rag_retrieve 二阶段检索词未增强: 使用原问题")
-    return str(question or "").strip()
-
-
-# 方法注释（业务）:
 # - 入参：`rag_chunk_docs`(list[dict[str, Any]])=RAG chunk 命中列表（含 payload.parent_id）。
 # - 出参：`list[dict[str, Any]]`=按父文档去重后的文档列表（每个 parent 仅保留最高分 chunk）。
 # - 方法逻辑：以 payload.parent_id 为主键聚合并保留最高分子块，最终按分数降序输出。
-def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]], *, top_k: int = _MAX_RAG_PARENT_DOCS) -> list[dict[str, Any]]:
     _LOGGER.info("rag_retrieve 开始按 parent_id 去重: 输入 chunk=%d", len(rag_chunk_docs))
     parent_best: dict[str, dict[str, Any]] = {}
     for row in rag_chunk_docs:
@@ -245,7 +227,7 @@ def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]]) -> list[dict[s
 
     docs = list(parent_best.values())
     docs.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    result = docs[:_MAX_RAG_PARENT_DOCS]
+    result = docs[: max(1, min(top_k, _MAX_RAG_PARENT_DOCS))]
     _LOGGER.info("rag_retrieve parent 去重完成: 输出 parent=%d", len(result))
     return result
 
@@ -254,12 +236,12 @@ def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]]) -> list[dict[s
 # - 入参：`rag_docs`(list[dict[str, Any]])=按 parent_id 去重后的 RAG 文档。
 # - 出参：`list[dict[str, Any]]`=父文档完整内容列表（parent_id/path/content）。
 # - 方法逻辑：使用 chunk payload 中的 path 直接读取父文档全文并挂上检索分数透传下游。
-def _load_parent_documents(rag_docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _load_parent_documents(rag_docs: list[dict[str, Any]], *, top_n: int | None = None) -> list[dict[str, Any]]:
     if not rag_docs:
         _LOGGER.info("rag_retrieve 跳过父文档回查: rag_docs 为空")
         return []
 
-    top_n = _parent_doc_top_n()
+    top_n = max(1, min(int(top_n or _parent_doc_top_n()), _MAX_RAG_PARENT_DOCS))
     _LOGGER.info("rag_retrieve 开始加载父文档: 候选=%d top_n=%d", len(rag_docs), top_n)
     rows: list[dict[str, Any]] = []
     for item in rag_docs[:top_n]:
@@ -285,10 +267,41 @@ def _load_parent_documents(rag_docs: list[dict[str, Any]]) -> list[dict[str, Any
     return rows
 
 
+def _query_sub_chunks_from_rag(*, question: str, intent_zh: str, top_k: int | None = None) -> list[dict[str, Any]]:
+    """查询子 chunk TopK（内部方法）。"""
+    chunk_top_k = max(1, min(int(top_k or _sub_chunk_top_k()), _MAX_RAG_DOCS))
+    return _search_qdrant_rag(query=question, intent_zh=intent_zh, limit=chunk_top_k)
+
+
+def _query_parent_chunks_from_sub_chunks(
+    *,
+    sub_chunk_docs: list[dict[str, Any]],
+    top_k: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """根据子 chunk 排序结果回查父 chunk TopK，并读取父文档完整内容（内部方法）。"""
+    parent_top_k = max(1, min(int(top_k or _parent_doc_top_n()), _MAX_RAG_PARENT_DOCS))
+    parent_chunk_docs = _dedup_rag_by_parent_id(sub_chunk_docs, top_k=parent_top_k)
+    parent_full_docs = _load_parent_documents(parent_chunk_docs, top_n=parent_top_k)
+    return parent_chunk_docs, parent_full_docs
+
+
+def query_parent_docs_from_rag(
+    *,
+    question: str,
+    intent_zh: str,
+    sub_chunk_top_k: int | None = None,
+    parent_top_k: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """对外方法：按问题直接查询父文档链路（内部自动完成子 chunk 检索与排序）。"""
+    sub_chunks = _query_sub_chunks_from_rag(question=question, intent_zh=intent_zh, top_k=sub_chunk_top_k)
+    parent_chunks, parent_docs = _query_parent_chunks_from_sub_chunks(sub_chunk_docs=sub_chunks, top_k=parent_top_k)
+    return sub_chunks, parent_chunks, parent_docs
+
+
 # 方法注释（业务）:
 # - 入参：`payload`(dict[str, Any])=AgentState，至少包含 question/intent 等上下文字段。
-# - 出参：`dict[str, Any]`=写回 `rag_docs/rag_parent_docs/rag_scores/route` 后的状态。
-# - 方法逻辑：执行单阶段 RAG 检索并按 parent_id 去重，然后回查父文档全文透传下游。
+# - 出参：`dict[str, Any]`=写回 `rag_sub_chunk_docs/rag_docs/rag_parent_docs/rag_scores/route` 后的状态。
+# - 方法逻辑：先查询子 chunk TopK，再查询父 chunk TopK 并回查父文档全文。
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     """执行检索步骤。
 
@@ -301,7 +314,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
     run_started = time.perf_counter()
     question = _pick_question(state)
-    intent_zh = _pick_intent_zh(state)
+    intent_zh = resolve_intent_label_for_rag(state)
     _LOGGER.info(
         "rag_retrieve 开始执行: chat_id=%s intent=%s question=%s",
         str(state.get("chat_id") or ""),
@@ -309,22 +322,28 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         _clip_for_log(question),
     )
 
-    # 单阶段：仅做文档检索，不做错误码/异常提取与二阶段增强查询。
+    sub_chunk_top_k = _sub_chunk_top_k()
+    parent_chunk_top_k = _parent_doc_top_n()
+    # 双阶段：先查子 chunk TopK，再按子 chunk 排序结果回查父文档 TopK 与完整文档。
     rag_started = time.perf_counter()
-    rag_chunk_docs = _search_qdrant_rag(question, intent_zh)
-    rag_docs = _dedup_rag_by_parent_id(rag_chunk_docs)
-    parent_docs = _load_parent_documents(rag_docs)
+    rag_sub_chunk_docs, rag_docs, parent_docs = query_parent_docs_from_rag(
+        question=question,
+        intent_zh=intent_zh,
+        sub_chunk_top_k=sub_chunk_top_k,
+        parent_top_k=parent_chunk_top_k,
+    )
     rag_cost_ms = (time.perf_counter() - rag_started) * 1000
     _LOGGER.info(
-        "rag_retrieve Qdrant 阶段完成: chunk_docs=%d parent_docs=%d full_docs=%d cost_ms=%.2f intent=%s",
-        len(rag_chunk_docs),
+        "rag_retrieve Qdrant 阶段完成: sub_chunk_docs=%d parent_chunk_docs=%d full_docs=%d cost_ms=%.2f intent=%s",
+        len(rag_sub_chunk_docs),
         len(rag_docs),
         len(parent_docs),
         rag_cost_ms,
         intent_zh,
     )
 
-    # 输出以“完整文档召回”为主，不注入额外诊断提取信息。
+    # 输出给下游：子 chunk、父 chunk（最佳子块代表）与父文档全文。
+    state["rag_sub_chunk_docs"] = rag_sub_chunk_docs
     state["rag_docs"] = rag_docs
     state["rag_parent_docs"] = parent_docs
     state["rag_scores"] = [float(item.get("score") or 0.0) for item in rag_docs]

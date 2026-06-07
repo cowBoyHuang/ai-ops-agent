@@ -4,6 +4,8 @@ This directory stores LLM prompt templates.
 
 - `analysis_system_prompt.txt`: system prompt for root cause analysis.
 - `analysis_user_prompt.txt`: user prompt template for root cause analysis.
+- `analysis_business_consult_system_prompt.txt`: system prompt for business consult analysis.
+- `analysis_business_consult_user_prompt.txt`: user prompt template for business consult analysis.
 - `summary_system_prompt.txt`: system prompt for memory summary.
 - `summary_user_prompt.txt`: user prompt template for memory summary.
 - `sensitive_operation_system_prompt.txt`: system prompt for sensitive operation check.

@@ -45,16 +45,26 @@ def _finish_node(payload: AgentState) -> AgentState:
     analysis = dict(state.get("analysis") or {})
     root_cause = str(state.get("root_cause") or analysis.get("root_cause") or "").strip()
     solution = str(state.get("solution") or analysis.get("reply") or "").strip()
+    intent_type = str(state.get("intent_type") or "").strip()
+    is_business_consult = intent_type == "SYSTEM_LOGIC_CONSULT"
 
-    # 对外文案优先包含“根因 + 建议”，便于排障同学直接使用。
-    if root_cause and solution:
-        final_answer = f"问题根因：{root_cause}。建议：{solution}"
-    elif solution:
-        final_answer = solution
-    elif root_cause:
-        final_answer = f"问题根因：{root_cause}"
+    if is_business_consult:
+        if solution:
+            final_answer = solution
+        elif root_cause:
+            final_answer = f"业务结论：{root_cause}"
+        else:
+            final_answer = "业务分析完成"
     else:
-        final_answer = "分析完成"
+        # 对外文案优先包含“根因 + 建议”，便于排障同学直接使用。
+        if root_cause and solution:
+            final_answer = f"问题根因：{root_cause}。建议：{solution}"
+        elif solution:
+            final_answer = solution
+        elif root_cause:
+            final_answer = f"问题根因：{root_cause}"
+        else:
+            final_answer = "分析完成"
 
     state["final_answer"] = final_answer
     state["status"] = "finished"

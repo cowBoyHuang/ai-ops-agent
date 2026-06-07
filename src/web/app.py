@@ -9,19 +9,23 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 from runtime_logging import bind_request_id, build_request_file_handler, logs_dir, reset_request_id
-from web.routes.analyze import router as analyze_router
+from web.routes.analyze import ANALYZE_PATH, router as analyze_router
 
 _REQUEST_LOGGER = logging.getLogger("aiops.request")
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="AIOps Agent")
+    app = FastAPI(
+        title="AIOps Agent",
+        version="1.0.0",
+        description="AIOps analysis service powered by FastAPI.",
+    )
 
     @app.middleware("http")
     async def request_logging_middleware(request: Request, call_next):
         path = request.url.path
         method = request.method.upper()
-        if path == "/api/v1/analyze" and method == "POST":
+        if path == ANALYZE_PATH and method == "POST":
             request_id = uuid.uuid4().hex
             token = bind_request_id(request_id)
             root_logger = logging.getLogger()
@@ -170,7 +174,7 @@ def create_app() -> FastAPI:
         };
         resultBox.textContent = "请求中...";
         try {
-          const resp = await fetch("/api/v1/analyze", {
+          const resp = await fetch("__ANALYZE_PATH__", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
@@ -184,7 +188,7 @@ def create_app() -> FastAPI:
     </script>
   </body>
 </html>
-""".replace("__LOGS_DIR__", str(logs_dir()))
+""".replace("__LOGS_DIR__", str(logs_dir())).replace("__ANALYZE_PATH__", ANALYZE_PATH)
 
     @app.get("/health")
     def health() -> dict[str, str]:

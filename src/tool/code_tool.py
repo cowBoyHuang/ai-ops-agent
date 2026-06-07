@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,37 @@ def _run_git_command(args: list[str], cwd: Path | None = None) -> dict[str, Any]
     }
 
 
+def _is_usable_local_repo(target_dir: Path) -> bool:
+    git_dir = target_dir / ".git"
+    if not git_dir.is_dir():
+        return False
+    work_tree_result = _run_git_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=target_dir)
+    if not bool(work_tree_result.get("ok")):
+        return False
+    head_result = _run_git_command(["git", "rev-parse", "--verify", "HEAD"], cwd=target_dir)
+    return bool(head_result.get("ok"))
+
+
+def _remove_invalid_repo_dir(target_dir: Path) -> dict[str, Any]:
+    try:
+        shutil.rmtree(target_dir)
+    except Exception as err:  # pragma: no cover - filesystem/runtime error
+        return {
+            "ok": False,
+            "return_code": -1,
+            "stdout": "",
+            "stderr": str(err),
+            "message": f"failed to remove invalid repository: {err}",
+        }
+    return {
+        "ok": True,
+        "return_code": 0,
+        "stdout": "",
+        "stderr": "",
+        "message": "invalid repository removed",
+    }
+
+
 def clone_repo(git_url: str, repo_root: str | Path = _DEFAULT_CODE_REPO_DIR) -> dict[str, Any]:
     """Clone a repository into src/code_repo by git url."""
     url = str(git_url or "").strip()
@@ -70,13 +102,33 @@ def clone_repo(git_url: str, repo_root: str | Path = _DEFAULT_CODE_REPO_DIR) -> 
     root.mkdir(parents=True, exist_ok=True)
 
     if (target_dir / ".git").is_dir():
+        if not _is_usable_local_repo(target_dir):
+            remove_result = _remove_invalid_repo_dir(target_dir)
+            if not bool(remove_result.get("ok")):
+                return {
+                    **remove_result,
+                    "action": "clone",
+                    "status": "failed",
+                    "git_url": url,
+                    "target_dir": str(target_dir),
+                }
+        else:
+            return {
+                "ok": True,
+                "action": "clone",
+                "status": "already_exists",
+                "git_url": url,
+                "target_dir": str(target_dir),
+                "message": "repository already exists",
+            }
+    elif target_dir.exists():
         return {
-            "ok": True,
+            "ok": False,
             "action": "clone",
-            "status": "already_exists",
+            "status": "failed",
             "git_url": url,
             "target_dir": str(target_dir),
-            "message": "repository already exists",
+            "message": "target directory exists but is not a git repository",
         }
 
     run_result = _run_git_command(["git", "clone", url, str(target_dir)], cwd=None)
@@ -111,6 +163,15 @@ def pull_repo(git_url: str, repo_root: str | Path = _DEFAULT_CODE_REPO_DIR) -> d
             "target_dir": str(target_dir),
             "message": "repository not found, clone first",
         }
+    if not _is_usable_local_repo(target_dir):
+        return {
+            "ok": False,
+            "action": "pull",
+            "status": "failed",
+            "git_url": url,
+            "target_dir": str(target_dir),
+            "message": "repository invalid, reclone required",
+        }
 
     run_result = _run_git_command(["git", "pull", "--ff-only"], cwd=target_dir)
     return {
@@ -139,6 +200,15 @@ def pull_repo_local(repo_name: str, repo_root: str | Path = _DEFAULT_CODE_REPO_D
             "repo_name": name,
             "target_dir": str(target_dir),
             "message": "repository not found in local code_repo",
+        }
+    if not _is_usable_local_repo(target_dir):
+        return {
+            "ok": False,
+            "action": "pull_local",
+            "status": "failed",
+            "repo_name": name,
+            "target_dir": str(target_dir),
+            "message": "repository invalid, reclone required",
         }
 
     run_result = _run_git_command(["git", "pull", "--ff-only"], cwd=target_dir)

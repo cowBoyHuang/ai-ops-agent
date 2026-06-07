@@ -62,7 +62,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     analysis = dict(state.get("analysis") or {})
     analysis_reply = str(analysis.get("reply") or "").strip()
     merged_evidence = dict(state.get("merged_evidence") or {})
-    has_any_evidence = bool(list(merged_evidence.get("logs") or []) or list(merged_evidence.get("knowledge") or []))
+    has_any_evidence = bool(
+        list(merged_evidence.get("logs") or [])
+        or list(merged_evidence.get("knowledge") or [])
+        or list(merged_evidence.get("code") or [])
+    )
 
     # 成功直接收口到 finish。
     if analysis_status == "SUCCESS":

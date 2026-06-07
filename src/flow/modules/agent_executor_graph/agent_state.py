@@ -67,9 +67,12 @@ class AgentState(TypedDict, total=False):
     extracted_keywords: List[str]
     analysis: Any
     analysis_status: str
+    log_analysis: Dict[str, Any]
+    code_analysis: Dict[str, Any]
     root_cause: str
     confidence: float
     solution: str
+    rag_sub_chunk_docs: List[Dict[str, Any]]
     rag_docs: List[Dict[str, Any]]
     rag_parent_docs: List[Dict[str, Any]]
     rag_scores: List[float]

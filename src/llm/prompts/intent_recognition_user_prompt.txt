@@ -24,7 +24,7 @@
 
 【意图定义】
 
-意图1: 系统逻辑咨询
+意图1: 业务咨询
 - 定义: 咨询系统功能、代码逻辑、业务规则等
 - 关键词: 支持、逻辑、规则、功能、如何、是否、代码、实现
 - 问题类型: 咨询类（是否、如何、为什么）
@@ -41,13 +41,16 @@
 
 【输出要求】
 - 严格输出 JSON
+- 不需要解释文本，仅需要输出结构化数据
+- 禁止输出推理过程、Markdown、代码块标签、<think>或</think>
 - 分数保留到 3 位小数
 - confidence 使用 best_intent 的 final_score
+- reasoning 最多 30 个字
 
 输出格式:
 {{
   "scores": {{
-    "系统逻辑咨询": {{
+    "业务咨询": {{
       "semantic_match": 0.0,
       "keyword_match": 0.0,
       "context_relevance": 0.0,
@@ -69,7 +72,7 @@
       "final_score": 0.0
     }}
   }},
-  "best_intent": "系统逻辑咨询|线上问题咨询|订单信息查询",
+  "best_intent": "业务咨询|线上问题咨询|订单信息查询",
   "confidence": 0.0,
   "reasoning": "简要说明选择原因"
 }}

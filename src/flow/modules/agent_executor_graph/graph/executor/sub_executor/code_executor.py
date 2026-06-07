@@ -13,13 +13,27 @@ from tool.code_tool import clone_repo, pull_repo, pull_repo_local
 _MAX_FILES = 6
 _MAX_FILE_CHARS = 2000
 _MAX_CLASS_HINTS = 20
-_SUPPORTED_GLOBS = ("*.py", "*.java", "*.kt", "*.xml", "*.yml", "*.yaml", "*.properties")
+_MAX_CODE_TARGETS = 12
+_LINE_WINDOW_RADIUS = 18
 _APP_CODE_GIT_URL_MAP = {
     "f_tts_trade_order": "http://gitlab.corp.qunar.com/flightdev-tts/tts_trade_order.git",
+    "f_tts_trade_core": "http://gitlab.corp.qunar.com/flightdev-tts/tts-trade-core",
 }
 _CLASS_FILE_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_]+)\.java\b")
 _STACK_CLASS_METHOD_PATTERN = re.compile(r"\b(?:[a-z][a-z0-9_]*\.)+([A-Z][A-Za-z0-9_]+)\.([a-z][A-Za-z0-9_]*)\(")
 _SIMPLE_CLASS_LINE_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_]+):\d+\b")
+_STACK_FILE_LINE_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_]+\.(?:java|kt|py)):(\d+)\b")
+_FAILURE_PRIORITY_TOKENS = (
+    "success\":false",
+    "resultok\":false",
+    "errorcode",
+    "errormsg",
+    "refsuberrmsg",
+    "校验不通过",
+    "失败",
+    "block_reason",
+    "failres",
+)
 
 
 def _is_placeholder_git_url(value: Any) -> bool:
@@ -67,13 +81,67 @@ def _is_repo_not_found(result: dict[str, Any]) -> bool:
             str(result.get("status") or ""),
         ]
     ).lower()
-    return "repository not found" in text or "clone first" in text
+    return (
+        "repository not found" in text
+        or "clone first" in text
+        or "repository invalid" in text
+        or "reclone required" in text
+    )
 
 
-def _extract_code_hints(state: dict[str, Any]) -> tuple[list[str], list[str]]:
+def _refresh_repo_before_read(
+    *,
+    tool_name: str,
+    effective_git_url: str,
+    repo_name: str,
+    mapped_git_url: str,
+) -> dict[str, Any]:
+    """Pull or clone before reading any local repository content."""
+    if tool_name == "code_clone":
+        if not effective_git_url:
+            return {"ok": False, "message": "missing git_url for clone"}
+        return clone_repo(git_url=effective_git_url)
+
+    if effective_git_url:
+        refresh_result = pull_repo(git_url=effective_git_url)
+        if not bool(refresh_result.get("ok")) and _is_repo_not_found(refresh_result):
+            clone_result = clone_repo(git_url=effective_git_url)
+            if bool(clone_result.get("ok")):
+                return clone_result
+        return refresh_result
+
+    if repo_name:
+        refresh_result = pull_repo_local(repo_name=repo_name)
+        if not bool(refresh_result.get("ok")) and _is_repo_not_found(refresh_result) and mapped_git_url:
+            clone_result = clone_repo(git_url=mapped_git_url)
+            if bool(clone_result.get("ok")):
+                return clone_result
+        return refresh_result
+
+    return {"ok": False, "message": "missing git_url/repo_name"}
+
+
+def _class_name_from_file_name(file_name: str) -> str:
+    return Path(str(file_name or "").strip()).stem
+
+
+def _score_code_hint_row(text: str) -> int:
+    lowered = str(text or "").strip().lower()
+    score = 0
+    for token in _FAILURE_PRIORITY_TOKENS:
+        if token in lowered:
+            score += 3
+    if ".java:" in lowered or ".kt:" in lowered or ".py:" in lowered:
+        score += 1
+    return score
+
+
+def _extract_code_hints(state: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     execution_history = dict(state.get("execution_history") or {})
+    code_targets: list[dict[str, Any]] = []
     class_names: list[str] = []
     terms: list[str] = []
+    seen_target: set[tuple[str, int]] = set()
     seen_class: set[str] = set()
     seen_terms: set[str] = set()
 
@@ -85,6 +153,33 @@ def _extract_code_hints(state: dict[str, Any]) -> tuple[list[str], list[str]]:
             text = str(row or "")
             if not text:
                 continue
+            row_score = _score_code_hint_row(text)
+            for file_name, line_text in _STACK_FILE_LINE_PATTERN.findall(text):
+                line_no = int(str(line_text).strip() or "0")
+                target_key = (str(file_name).strip(), line_no)
+                if target_key not in seen_target:
+                    seen_target.add(target_key)
+                    code_targets.append(
+                        {
+                            "file_name": str(file_name).strip(),
+                            "class_name": _class_name_from_file_name(file_name),
+                            "line_no": line_no,
+                            "score": row_score,
+                        }
+                    )
+            for class_name, line_text in re.findall(r"\b([A-Z][A-Za-z0-9_]+):(\d+)\b", text):
+                line_no = int(str(line_text).strip() or "0")
+                target_key = (f"{str(class_name).strip()}.java", line_no)
+                if target_key not in seen_target:
+                    seen_target.add(target_key)
+                    code_targets.append(
+                        {
+                            "file_name": f"{str(class_name).strip()}.java",
+                            "class_name": str(class_name).strip(),
+                            "line_no": line_no,
+                            "score": row_score,
+                        }
+                    )
             for matched in _CLASS_FILE_PATTERN.findall(text):
                 name = str(matched).strip()
                 if name and name not in seen_class:
@@ -105,12 +200,22 @@ def _extract_code_hints(state: dict[str, Any]) -> tuple[list[str], list[str]]:
                     seen_class.add(name)
                     class_names.append(name)
 
-    return class_names[:_MAX_CLASS_HINTS], terms[:_MAX_CLASS_HINTS]
+    ranked_targets = sorted(
+        code_targets,
+        key=lambda item: (-int(item.get("score") or 0), str(item.get("class_name") or ""), int(item.get("line_no") or 0)),
+    )
+    return ranked_targets[:_MAX_CODE_TARGETS], class_names[:_MAX_CLASS_HINTS], terms[:_MAX_CLASS_HINTS]
 
 
-def _slice_relevant_content(content: str, terms: list[str]) -> str:
+def _slice_relevant_content(content: str, terms: list[str], *, line_no: int | None = None) -> str:
     if not content:
         return ""
+    if line_no and line_no > 0:
+        rows = content.splitlines()
+        if rows and line_no <= len(rows):
+            start = max(1, line_no - _LINE_WINDOW_RADIUS)
+            end = min(len(rows), line_no + _LINE_WINDOW_RADIUS)
+            return "\n".join(f"{idx}: {rows[idx - 1]}" for idx in range(start, end + 1))
     haystack = content.lower()
     for term in terms:
         text = str(term or "").strip()
@@ -125,55 +230,94 @@ def _slice_relevant_content(content: str, terms: list[str]) -> str:
     return content[:_MAX_FILE_CHARS]
 
 
-def _collect_code_snippets(target_dir: str, *, class_hints: list[str], terms: list[str]) -> list[dict[str, str]]:
+def _find_candidate_paths(root: Path, *, file_name: str = "", class_name: str = "") -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def _append(path: Path) -> None:
+        if path in seen or not path.is_file():
+            return
+        seen.add(path)
+        candidates.append(path)
+
+    file_name = str(file_name or "").strip()
+    class_name = str(class_name or "").strip()
+    if file_name:
+        for path in root.rglob(file_name):
+            _append(path)
+    if not candidates and class_name:
+        for ext in (".java", ".kt", ".py"):
+            for path in root.rglob(f"{class_name}{ext}"):
+                _append(path)
+    return candidates
+
+
+def _collect_code_snippets(
+    target_dir: str,
+    *,
+    class_hints: list[str],
+    terms: list[str],
+    code_targets: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     root = Path(str(target_dir or "")).expanduser()
     if not root.is_dir():
         return []
-    rows: list[dict[str, str]] = []
-    seen_paths: set[Path] = set()
-    candidate_paths: list[Path] = []
+    normalized_targets = [dict(item or {}) for item in list(code_targets or [])]
+    if not normalized_targets and not class_hints:
+        return []
 
-    def _append_candidate(path: Path) -> None:
-        if path in seen_paths:
+    rows: list[dict[str, Any]] = []
+    candidate_specs: list[dict[str, Any]] = []
+    spec_index_by_path: dict[Path, int] = {}
+
+    def _append_candidate(path: Path, *, line_no: int | None = None) -> None:
+        normalized_line = int(line_no or 0) or None
+        existing_index = spec_index_by_path.get(path)
+        if existing_index is not None:
+            if normalized_line and not candidate_specs[existing_index].get("line_no"):
+                candidate_specs[existing_index]["line_no"] = normalized_line
             return
-        seen_paths.add(path)
-        candidate_paths.append(path)
+        spec_index_by_path[path] = len(candidate_specs)
+        candidate_specs.append({"path": path, "line_no": normalized_line})
 
-    for class_name in class_hints:
-        cn = str(class_name or "").strip()
-        if not cn:
-            continue
-        for ext in (".java", ".kt", ".py"):
-            pattern = f"*{cn}{ext}"
-            for path in root.rglob(pattern):
-                if path.is_file():
-                    _append_candidate(path)
-                if len(candidate_paths) >= _MAX_FILES:
-                    break
-            if len(candidate_paths) >= _MAX_FILES:
+    for target in normalized_targets:
+        file_name = str(target.get("file_name") or "").strip()
+        class_name = str(target.get("class_name") or "").strip()
+        line_no = int(target.get("line_no") or 0) or None
+        for path in _find_candidate_paths(root, file_name=file_name, class_name=class_name):
+            _append_candidate(path, line_no=line_no)
+            if len(candidate_specs) >= _MAX_FILES:
                 break
-        if len(candidate_paths) >= _MAX_FILES:
+        if len(candidate_specs) >= _MAX_FILES:
             break
 
-    if len(candidate_paths) < _MAX_FILES:
-        for glob_pattern in _SUPPORTED_GLOBS:
-            for path in root.rglob(glob_pattern):
-                if path.is_file():
-                    _append_candidate(path)
-                if len(candidate_paths) >= _MAX_FILES:
+    if len(candidate_specs) < _MAX_FILES:
+        for class_name in class_hints:
+            cn = str(class_name or "").strip()
+            if not cn:
+                continue
+            for path in _find_candidate_paths(root, class_name=cn):
+                _append_candidate(path)
+                if len(candidate_specs) >= _MAX_FILES:
                     break
-            if len(candidate_paths) >= _MAX_FILES:
+            if len(candidate_specs) >= _MAX_FILES:
                 break
 
-    for path in candidate_paths[:_MAX_FILES]:
+    for spec in candidate_specs[:_MAX_FILES]:
+        path = Path(spec["path"])
+        line_no = spec.get("line_no")
         try:
             content = path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
+        snippet = _slice_relevant_content(content, terms, line_no=line_no)[:_MAX_FILE_CHARS]
+        if not snippet:
+            continue
         rows.append(
             {
                 "path": str(path),
-                "content": _slice_relevant_content(content, terms)[:_MAX_FILE_CHARS],
+                "content": snippet,
+                "anchor_line": line_no,
             }
         )
     return rows
@@ -215,7 +359,6 @@ def _summarize_code(
 
 
 def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict[str, Any]) -> dict[str, Any]:
-    _ = state
     tool_name = str(step.get("tool_name") or "code_pull")
     params = dict(step.get("params") or {})
     git_url = _extract_git_url(params, structured_context)
@@ -223,25 +366,12 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     mapped_git_url = _mapped_git_url(repo_name)
     effective_git_url = git_url or mapped_git_url
 
-    if tool_name == "code_clone":
-        if not effective_git_url:
-            return {"tool": tool_name, "ok": False, "error": "missing git_url for clone", "evidence": []}
-        tool_result = clone_repo(git_url=effective_git_url)
-    else:
-        if effective_git_url:
-            tool_result = pull_repo(git_url=effective_git_url)
-            if not bool(tool_result.get("ok")) and _is_repo_not_found(tool_result):
-                clone_result = clone_repo(git_url=effective_git_url)
-                if bool(clone_result.get("ok")):
-                    tool_result = clone_result
-        elif repo_name:
-            tool_result = pull_repo_local(repo_name=repo_name)
-            if not bool(tool_result.get("ok")) and _is_repo_not_found(tool_result) and mapped_git_url:
-                clone_result = clone_repo(git_url=mapped_git_url)
-                if bool(clone_result.get("ok")):
-                    tool_result = clone_result
-        else:
-            return {"tool": tool_name, "ok": False, "error": "missing git_url/repo_name", "evidence": []}
+    tool_result = _refresh_repo_before_read(
+        tool_name=tool_name,
+        effective_git_url=effective_git_url,
+        repo_name=repo_name,
+        mapped_git_url=mapped_git_url,
+    )
 
     if not bool(tool_result.get("ok")):
         return {
@@ -253,9 +383,14 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
         }
 
     target_dir = str(tool_result.get("target_dir") or "")
-    class_hints, hint_terms = _extract_code_hints(state)
+    code_targets, class_hints, hint_terms = _extract_code_hints(state)
     terms = [*class_hints, *hint_terms]
-    snippets = _collect_code_snippets(target_dir, class_hints=class_hints, terms=terms)
+    snippets = _collect_code_snippets(
+        target_dir,
+        class_hints=class_hints,
+        terms=terms,
+        code_targets=code_targets,
+    )
     extracted = _summarize_code(
         tool_name,
         effective_git_url or repo_name,
@@ -264,9 +399,22 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
         terms=terms,
     )
 
-    evidence = [f"{tool_name} success: {target_dir}", f"[summary] {str(extracted.get('summary') or '')}"]
+    evidence = [
+        (
+            "repo_refresh:"
+            f" action={tool_result.get('action') or tool_name}"
+            f" status={tool_result.get('status') or 'unknown'}"
+            f" target_dir={target_dir}"
+        ),
+        f"{tool_name} success: {target_dir}",
+        f"[summary] {str(extracted.get('summary') or '')}",
+    ]
     for item in snippets[:3]:
-        evidence.append(f"code_file: {item.get('path')}")
+        anchor_line = int(item.get("anchor_line") or 0)
+        if anchor_line > 0:
+            evidence.append(f"code_file: {item.get('path')}:{anchor_line}")
+        else:
+            evidence.append(f"code_file: {item.get('path')}")
     return {
         "tool": tool_name,
         "ok": True,

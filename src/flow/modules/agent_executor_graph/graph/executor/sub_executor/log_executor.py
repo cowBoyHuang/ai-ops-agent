@@ -11,6 +11,7 @@ from llm.llm import chat_with_llm
 from log.log import EsResult, query_external_logs
 
 _MAX_LOG_ROWS = 8
+_MAX_LOG_EVIDENCE_CHARS = 1200
 _TRACE_ID_PATTERN = re.compile(r"[a-z]+[_-]slugger[_a-z0-9\.\-]+(?=$|[^A-Za-z0-9_\.\-])", re.IGNORECASE)
 _TRACE_KEY_PATTERN = re.compile(r"\btrace[_-]?id\b\s*[:=]?\s*([A-Za-z0-9_.:\-]{4,128})", re.IGNORECASE)
 _ORDER_KEY_PATTERN = re.compile(
@@ -167,6 +168,18 @@ def _score_row_for_evidence(text: str) -> int:
     return score
 
 
+def _clip_log_text(text: Any, max_len: int = _MAX_LOG_EVIDENCE_CHARS) -> str:
+    raw = str(text or "").strip()
+    if len(raw) <= max_len:
+        return raw
+    marker = "\n...\n"
+    head = max_len // 2
+    tail = max_len - head - len(marker)
+    if tail <= 0:
+        return raw[:max_len]
+    return f"{raw[:head]}{marker}{raw[-tail:]}"
+
+
 def _select_rows_for_evidence(rows: list[EsResult]) -> list[EsResult]:
     if len(rows) <= _MAX_LOG_ROWS:
         return rows
@@ -196,7 +209,7 @@ def _select_rows_for_evidence(rows: list[EsResult]) -> list[EsResult]:
 
 
 def _extract_effective_info(tool_name: str, query_word: str, rows: list[EsResult]) -> dict[str, Any]:
-    log_rows = [str(item.content or "") for item in rows]
+    log_rows = [_clip_log_text(item.content or "") for item in rows]
     if not log_rows:
         return {
             "summary": "未检索到日志命中",
@@ -328,7 +341,7 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
 
     evidence_rows = _select_rows_for_evidence(rows)
     extracted = _extract_effective_info(tool_name, query_word_for_prompt, evidence_rows)
-    evidence = [str(item.content or "") for item in evidence_rows]
+    evidence = [_clip_log_text(item.content or "") for item in evidence_rows]
     if extracted.get("summary"):
         evidence.insert(0, f"[summary] {str(extracted['summary'])}")
     return {

@@ -16,12 +16,12 @@ from llm.llm import recognize_intent
 
 _LOGGER = logging.getLogger(__name__)
 _INTENT_MAP = {
-    "系统逻辑咨询": "SYSTEM_LOGIC_CONSULT",
+    "业务咨询": "SYSTEM_LOGIC_CONSULT",
     "线上问题咨询": "OPS_ANALYSIS",
     "订单信息查询": "ORDER_INFO_QUERY",
     "未知意图": "UNKNOWN_INTENT",
 }
-_SCORE_INTENT_LABELS = ("系统逻辑咨询", "线上问题咨询", "订单信息查询")
+_SCORE_INTENT_LABELS = ("业务咨询", "线上问题咨询", "订单信息查询")
 _UNKNOWN_SCORE_THRESHOLD = 0.5
 
 
@@ -214,7 +214,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "intent_recognition": state["intent_recognition"],
     }
 
-    # 调用处说明：线上分析/系统咨询意图进入 rag_retrieve 节点执行检索。
+    # 调用处说明：线上分析/业务咨询意图进入 rag_retrieve 节点执行检索。
     if intent_type in {"OPS_ANALYSIS", "SYSTEM_LOGIC_CONSULT"}:
         state["route"] = "rag_retrieve"
     elif intent_type == "UNKNOWN_INTENT":

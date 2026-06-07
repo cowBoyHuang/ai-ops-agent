@@ -12,6 +12,7 @@ Requires-Dist: langchain-openai>=0.3.0
 Requires-Dist: langgraph>=0.2.0
 Requires-Dist: llama-index>=0.11.0
 Requires-Dist: llama-index-embeddings-openai>=0.2.0
+Requires-Dist: ollama>=0.4.0
 Requires-Dist: pydantic>=2.11.0
 Requires-Dist: pydantic-settings>=2.8.0
 Requires-Dist: redis>=5.0.0
