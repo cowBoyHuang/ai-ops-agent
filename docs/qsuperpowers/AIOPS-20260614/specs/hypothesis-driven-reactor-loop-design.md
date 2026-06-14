@@ -9,10 +9,10 @@
 - step 失败或 plan 不可执行时，`observer` 负责决定是否 replan。
 - replan 上限由环境变量控制，默认 `0`。
 - 最终回答必须合并：`用户原始问题 + 全部工具调用关键结果 + 结论`。
+- 外部日志查询结果在本地日志中仅打印长度统计，不打印完整 `content` 全文。
 
 不在本次范围：
 
-- 底层日志查询实现（`src/log/log.py`）改造。
 - 新增外部存储或消息队列。
 - RAG 数据源重构。
 
@@ -176,6 +176,7 @@ Reactor 每次完成当前 goal 输出：
 - `src/flow/modules/agent_executor_graph/graph/planner/planner.py`
 - `src/flow/modules/agent_executor_graph/graph/state_build/state_build.py`
 - `src/flow/modules/agent_executor_graph/agent_state.py`
+- `src/log/log.py`
 
 ### 7.2 可能删改
 
@@ -196,6 +197,22 @@ Reactor 每次完成当前 goal 输出：
 
 目标：单条 request.log 可还原 goal 执行链、失败路径和 replan 决策依据。
 
+### 8.1 外部日志打印收敛策略
+
+针对 `query_external_logs` 增加日志收敛规范：
+
+1. 禁止打印每条命中的完整 `content`。
+2. 打印聚合指标：`hit_count`、`content_total_chars`、`max_item_chars`、`avg_item_chars`。
+3. 如需排障定位，仅打印有限样本的摘要信息（例如前 3 条的 `idx + score + content_length`），不输出正文。
+
+示例：
+
+```text
+log.query_external_logs.summary app_code=f_tts_trade_order hit_count=1000 content_total_chars=2843912 max_item_chars=47670 avg_item_chars=2843
+log.query_external_logs.sample idx=1 score=273.0442 content_length=4210
+log.query_external_logs.sample idx=2 score=272.9588 content_length=3897
+```
+
 ## 9. 测试方案
 
 ### 9.1 单测
@@ -207,6 +224,9 @@ Reactor 每次完成当前 goal 输出：
 - Observer：
   - `next_goal/replan/finish` 路由
   - `max_replan=0` 时不进入 replan
+- Log：
+  - `query_external_logs` 不输出正文 `content`
+  - 输出长度统计字段与 sample 长度字段
 
 ### 9.2 集成测试
 
@@ -233,3 +253,4 @@ Reactor 每次完成当前 goal 输出：
 3. replan 仅由 observer 触发。
 4. `AIOPS_MAX_REPLAN=0` 时，需 replan 的场景也能稳定 finish。
 5. 最终输出包含“用户问题 + 执行证据 + 结论/限制”。
+6. `request.log` 中不再出现外部日志全文，仅保留长度统计与样本长度信息。
