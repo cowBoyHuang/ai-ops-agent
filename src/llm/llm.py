@@ -11,18 +11,16 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from llm.small_ll import check_sensitive_operation_with_small_llm
-
 try:
     from langchain_openai import ChatOpenAI
 except Exception:  # noqa: BLE001
     ChatOpenAI = None  # type: ignore[assignment]
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
-_DEFAULT_MODEL = "azure/gpt-5.3-codex-2026-02-24"
+_DEFAULT_MODEL = "azure/gpt-5.5-2026-04-24"
 _DEFAULT_BASE_URL = "http://llm.api.corp.qunar.com/v1"
 _MAX_SUMMARY_LEN = 500
-_INTENT_LABELS = ("业务咨询", "线上问题咨询", "订单信息查询")
+_INTENT_LABELS = ("业务咨询", "线上问题排查")
 
 _LLM_CLIENT: Any | None = None
 _LLM_INIT_DONE = False
@@ -54,6 +52,14 @@ def _scene_key(scene: str) -> str:
     if scene == "sensitive_check":
         return "SENSITIVE"
     return "GENERAL"
+
+
+def _supports_custom_temperature(model: str) -> bool:
+    """部分模型（如 gpt-5.5）仅支持默认温度，显式传 temperature 会触发 400。"""
+    lowered = str(model or "").strip().lower()
+    if "gpt-5.5" in lowered:
+        return False
+    return True
 
 
 def _resolve_runtime_model(scene: str) -> str:
@@ -224,11 +230,8 @@ def _fallback_intent_recognition(question: str) -> dict[str, Any]:
         best_intent = "业务咨询"
         confidence = 0.5
     elif any(token in lowered for token in ("失败", "错误", "异常", "故障", "排查", "timeout", "error", "一直")):
-        best_intent = "线上问题咨询"
+        best_intent = "线上问题排查"
         confidence = 0.82
-    elif any(token in lowered for token in ("订单", "订单号", "航班", "乘机人", "状态", "信息", "详情", "查询")):
-        best_intent = "订单信息查询"
-        confidence = 0.8
     else:
         best_intent = "业务咨询"
         confidence = 0.72
@@ -270,12 +273,14 @@ def _build_llm_client(model: str, base_url: str) -> Any | None:
         return _LLM_CLIENT_CACHE[cache_key]
 
     try:
-        client = ChatOpenAI(
-            model=model,
-            base_url=base_url,
-            api_key=SecretStr(api_key),
-            temperature=0,
-        )
+        client_kwargs: dict[str, Any] = {
+            "model": model,
+            "base_url": base_url,
+            "api_key": SecretStr(api_key),
+        }
+        if _supports_custom_temperature(model):
+            client_kwargs["temperature"] = 0
+        client = ChatOpenAI(**client_kwargs)
     except Exception:  # noqa: BLE001
         return None
 
@@ -419,7 +424,31 @@ def chat_with_llm(question: str, system_prompt: str = "") -> str:
 
 
 def check_sensitive_operation_with_llm(question: str) -> dict[str, Any]:
-    return check_sensitive_operation_with_small_llm(question)
+    question_text = str(question or "").strip()
+    if not question_text:
+        return {"passed": False, "reason": "empty question"}
+
+    system_prompt = load_prompt("sensitive_operation_system_prompt.txt", default="")
+    user_prompt = render_prompt("sensitive_operation_user_prompt.txt", question=question_text)
+    if not user_prompt:
+        return {"passed": False, "reason": "sensitive prompt missing"}
+
+    text = _invoke_llm(system_prompt, user_prompt, scene="sensitive_check")
+    if not text:
+        return {"passed": True, "reason": "llm check unavailable (degraded allow)"}
+
+    parsed = _parse_json_object(text)
+    if not isinstance(parsed, dict):
+        return {"passed": False, "reason": "llm response parse failed"}
+
+    allow_value = parsed.get("allow")
+    if isinstance(allow_value, bool):
+        allow = allow_value
+    else:
+        allow_text = str(allow_value or "").strip().lower()
+        allow = allow_text in {"true", "1", "yes", "allow", "safe"}
+    reason = str(parsed.get("reason") or "").strip() or "llm sensitive check blocked"
+    return {"passed": allow, "reason": reason}
 
 
 def _recognize_intent_with_llm(question: str, intent_history_prompt: str | None = None) -> dict[str, Any]:

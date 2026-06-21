@@ -38,3 +38,14 @@ class AnalyzeResponse(BaseModel):
     chatId: str
     status: str
     message: str
+
+
+class ClearStorageResponse(BaseModel):
+    status: str
+    db_enabled: bool
+    db_deleted: dict[str, int]
+    redis_enabled: bool
+    redis_deleted: int
+    repeat_chat_fallback_cleared: int
+    message_cache_fallback_cleared: int
+    trace_rows_cleared: int

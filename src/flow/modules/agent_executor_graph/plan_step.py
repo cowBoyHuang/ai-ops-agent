@@ -9,7 +9,11 @@ class PlanStep(TypedDict, total=False):
     action_type: Literal["tool_call", "merge_evidence", "react_subtask"]
     tool_name: Optional[str]          # 仅当 action_type=="tool_call" 时有效
     params: Dict[str, Any]            # 仅当 action_type=="tool_call" 时有效
-    subtask: str
+    plan_goal: str
     hypothesis: str
+    objective: str
+    task_name: str
+    task_objective: str
+    subtask: str
     success_criteria: str
     suggested_tools: List[str]

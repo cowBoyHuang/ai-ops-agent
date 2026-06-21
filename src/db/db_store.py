@@ -106,6 +106,18 @@ class ChatDBStore:
                 )
         return True
 
+    def clear_data_only(self) -> dict[str, int]:
+        """Delete row data from managed tables without changing table structure."""
+        if not self._enabled:
+            return {"total_message": 0, "summary_message": 0}
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM total_message")
+                total_deleted = int(cur.rowcount or 0)
+                cur.execute("DELETE FROM summary_message")
+                summary_deleted = int(cur.rowcount or 0)
+        return {"total_message": total_deleted, "summary_message": summary_deleted}
+
     # ===== total_message CRUD =====
     def create_total_message(self, *, chat_id: str, role: str, content: str) -> int:
         if not self._enabled:

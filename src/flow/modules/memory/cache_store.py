@@ -84,3 +84,8 @@ class MemoryCacheStore:
             tools_context={},
             user_question_embedding=[],
         )
+
+    def clear_repeat_chat_fallback(self) -> int:
+        size = len(self._repeat_chat_fallback)
+        self._repeat_chat_fallback.clear()
+        return size

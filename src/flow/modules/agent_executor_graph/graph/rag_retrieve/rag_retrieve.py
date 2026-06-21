@@ -29,10 +29,17 @@ _DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 _INTENT_TO_CN = {
     "SYSTEM_LOGIC_CONSULT": "业务咨询",
-    "OPS_ANALYSIS": "线上问题咨询",
-    "ORDER_INFO_QUERY": "订单信息查询",
-    "UNKNOWN_INTENT": "未知意图",
-    "UNKNOWN": "未知意图",
+    "OPS_ANALYSIS": "线上问题排查",
+    # 兼容历史值：统一归并到业务咨询。
+    "ORDER_INFO_QUERY": "业务咨询",
+    "UNKNOWN_INTENT": "业务咨询",
+    "UNKNOWN": "业务咨询",
+}
+
+_INTENT_CN_NORMALIZE = {
+    "线上问题咨询": "线上问题排查",
+    "订单信息查询": "业务咨询",
+    "未知意图": "业务咨询",
 }
 
 
@@ -137,9 +144,9 @@ def resolve_intent_label_for_rag(state: dict[str, Any]) -> str:
     recognition = dict(state.get("intent_recognition") or {})
     best_intent = str(recognition.get("best_intent") or "").strip()
     if best_intent:
-        return best_intent
+        return _INTENT_CN_NORMALIZE.get(best_intent, best_intent)
     intent_type = str(state.get("intent_type") or "UNKNOWN").strip() or "UNKNOWN"
-    return _INTENT_TO_CN.get(intent_type, "未知意图")
+    return _INTENT_TO_CN.get(intent_type, "业务咨询")
 
 
 # 方法注释（业务）:
@@ -157,8 +164,41 @@ def _search_qdrant_rag(query: str, intent_zh: str, *, limit: int = _MAX_RAG_DOCS
         intent_zh,
         _clip_for_log(query_text),
     )
+    store = QdrantStore()
+    capped_limit = max(1, min(limit, _MAX_RAG_DOCS))
     try:
-        rows = QdrantStore().search(query=query_text, limit=max(1, min(limit, _MAX_RAG_DOCS)))
+        domain_rows = store.search(
+            query=query_text,
+            limit=capped_limit,
+            collection_name=store.config.domain_collection_name,
+        )
+        case_rows = store.search(
+            query=query_text,
+            limit=capped_limit,
+            collection_name=store.config.case_collection_name,
+        )
+        rows: list[dict[str, Any]] = []
+        for row in list(domain_rows or []):
+            payload = dict(row.get("payload") or {})
+            payload.setdefault("knowledge_type", "domain")
+            rows.append({**row, "payload": payload})
+        for row in list(case_rows or []):
+            payload = dict(row.get("payload") or {})
+            payload.setdefault("knowledge_type", "case")
+            rows.append({**row, "payload": payload})
+        # 兼容老数据：分库都没命中时，回退 legacy collection。
+        if not rows:
+            legacy_rows = store.search(
+                query=query_text,
+                limit=capped_limit,
+                collection_name=store.config.collection_name,
+            )
+            for row in list(legacy_rows or []):
+                payload = dict(row.get("payload") or {})
+                payload.setdefault("knowledge_type", "legacy")
+                rows.append({**row, "payload": payload})
+        rows.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        rows = rows[:capped_limit]
     except Exception as err:  # pragma: no cover - 外部依赖异常统一降级
         _LOGGER.warning("rag_retrieve Qdrant 查询失败: %s", err)
         return []
@@ -223,6 +263,7 @@ def _dedup_rag_by_parent_id(rag_chunk_docs: list[dict[str, Any]], *, top_k: int 
             "path": str(payload.get("path") or ""),
             "chunk_id": str(row.get("id") or ""),
             "chunk_score": score,
+            "knowledge_type": str(payload.get("knowledge_type") or ""),
         }
 
     docs = list(parent_best.values())
@@ -261,6 +302,7 @@ def _load_parent_documents(rag_docs: list[dict[str, Any]], *, top_n: int | None 
                 "content": full_content,
                 "score": float(item.get("score") or 0.0),
                 "chunk_id": str(item.get("chunk_id") or ""),
+                "knowledge_type": str(item.get("knowledge_type") or ""),
             }
         )
     _LOGGER.info("rag_retrieve 父文档加载完成: full_docs=%d", len(rows))

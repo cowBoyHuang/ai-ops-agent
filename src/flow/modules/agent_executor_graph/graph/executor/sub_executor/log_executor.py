@@ -4,21 +4,26 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import re
 from typing import Any
 
 from llm.llm import chat_with_llm
-from log.log import EsResult, query_external_logs
+from log.log import EsResult, execute_log_query_method, resolve_log_method_scope
 
 _MAX_LOG_ROWS = 8
-_MAX_LOG_EVIDENCE_CHARS = 1200
-_TRACE_ID_PATTERN = re.compile(r"[a-z]+[_-]slugger[_a-z0-9\.\-]+(?=$|[^A-Za-z0-9_\.\-])", re.IGNORECASE)
+_MAX_LOG_EVIDENCE_CHARS = 10000
+_LOGGER = logging.getLogger(__name__)
+_TRACE_ID_PATTERN = re.compile(r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_supply_open_api_[a-z0-9_.\-]+)", re.IGNORECASE)
+_RELATIVE_NOW_PATTERN = re.compile(r"^now(?:\s*([+-])\s*(\d+)\s*([smhd]))?$", re.IGNORECASE)
 _TRACE_KEY_PATTERN = re.compile(r"\btrace[_-]?id\b\s*[:=]?\s*([A-Za-z0-9_.:\-]{4,128})", re.IGNORECASE)
 _ORDER_KEY_PATTERN = re.compile(
     r"(?:\border[_-]?(?:id|no)\b|订单号|订单id|订单ID|子单号)\s*[:：=]?\s*([A-Za-z0-9_.:\-]{4,128})",
     re.IGNORECASE,
 )
 _ORDER_TOKEN_PATTERN = re.compile(r"\bxep\d{12,}\b", re.IGNORECASE)
+_ORDER_GENERIC_PATTERN = re.compile(r"\b(?:xep|sid|hpv)[A-Za-z0-9]{6,}\b", re.IGNORECASE)
+_ASCII_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:\-]{6,128}$")
 _PLACEHOLDER_TOKEN_PATTERN = re.compile(r"(?:\bxxx\b|placeholder|tbd|todo|待补充|示例)", re.IGNORECASE)
 _BIZ_CODE_PATTERN = re.compile(r"\b\d{2}_[0-9A-Z]{3,}_[0-9A-Z]{3,}_[0-9]{4}\b")
 _DECISIVE_HINTS = (
@@ -44,6 +49,26 @@ def _as_datetime(value: Any) -> dt.datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
+    relative_match = _RELATIVE_NOW_PATTERN.fullmatch(text)
+    if relative_match:
+        sign = str(relative_match.group(1) or "-").strip()
+        amount_text = str(relative_match.group(2) or "0").strip()
+        unit = str(relative_match.group(3) or "s").strip().lower()
+        try:
+            amount = int(amount_text or "0")
+        except ValueError:
+            amount = 0
+        base = dt.datetime.now().astimezone()
+        if amount <= 0:
+            return base
+        delta_by_unit = {
+            "s": dt.timedelta(seconds=amount),
+            "m": dt.timedelta(minutes=amount),
+            "h": dt.timedelta(hours=amount),
+            "d": dt.timedelta(days=amount),
+        }
+        delta = delta_by_unit.get(unit, dt.timedelta(seconds=amount))
+        return base - delta if sign != "+" else base + delta
     candidate = text.replace("Z", "+00:00") if text.endswith("Z") else text
     try:
         return dt.datetime.fromisoformat(candidate)
@@ -104,8 +129,14 @@ def _sanitize_match_phrase_terms(terms: list[str]) -> list[str]:
         text = str(term or "").strip()
         if not text or _is_placeholder_token(text):
             continue
+        if not _is_trace_or_order_identifier(text):
+            continue
+        if text not in sanitized:
+            sanitized.append(text)
         extracted = _extract_forced_phrase_terms([text])
         for token in extracted:
+            if not _is_trace_or_order_identifier(token):
+                continue
             if token not in sanitized:
                 sanitized.append(token)
     return sanitized
@@ -140,7 +171,12 @@ def _extract_forced_phrase_terms(texts: list[str]) -> list[str]:
         for pattern in (_TRACE_KEY_PATTERN, _ORDER_KEY_PATTERN):
             for match in pattern.findall(raw):
                 value = str(match or "").strip()
-                if value and not _is_placeholder_token(value) and value not in results:
+                if (
+                    value
+                    and not _is_placeholder_token(value)
+                    and _is_trace_or_order_identifier(value)
+                    and value not in results
+                ):
                     results.append(value)
         for match in _ORDER_TOKEN_PATTERN.findall(raw):
             value = str(match or "").strip()
@@ -178,6 +214,51 @@ def _clip_log_text(text: Any, max_len: int = _MAX_LOG_EVIDENCE_CHARS) -> str:
     if tail <= 0:
         return raw[:max_len]
     return f"{raw[:head]}{marker}{raw[-tail:]}"
+
+
+def _clip_for_log(text: Any, max_len: int = 180) -> str:
+    raw = str(text or "").strip()
+    if len(raw) <= max_len:
+        return raw
+    return f"{raw[:max_len]}..."
+
+
+def _pick_trace_id_for_dispatch(params: dict[str, Any], phrase_terms: list[str]) -> str:
+    explicit = str(params.get("trace_id") or params.get("traceId") or "").strip()
+    if explicit:
+        return explicit
+    for token in phrase_terms:
+        text = str(token or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if "slugger" in lowered or "flight_supply_open_api" in lowered:
+            return text
+    for token in phrase_terms:
+        text = str(token or "").strip()
+        if len(text) >= 12 and any(ch.isdigit() for ch in text):
+            return text
+    return ""
+
+
+def _is_trace_or_order_identifier(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_token(text):
+        return False
+    if _TRACE_ID_PATTERN.search(text):
+        return True
+    if _ORDER_TOKEN_PATTERN.search(text):
+        return True
+    if _ORDER_GENERIC_PATTERN.search(text):
+        return True
+    if not _ASCII_ID_PATTERN.fullmatch(text):
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("xep", "sid", "hpv", "trace", "order")):
+        return True
+    if any(ch in text for ch in ("_", "-", ".")) and any(ch.isdigit() for ch in text):
+        return True
+    return False
 
 
 def _select_rows_for_evidence(rows: list[EsResult]) -> list[EsResult]:
@@ -246,6 +327,8 @@ def _extract_effective_info(tool_name: str, query_word: str, rows: list[EsResult
 def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict[str, Any]) -> dict[str, Any]:
     tool_name = str(step.get("tool_name") or "log_query")
     params = dict(step.get("params") or {})
+    query_method = str(params.get("log_method") or tool_name or "log_query").strip()
+    normalized_method = query_method.lower()
     begin_raw = _pick_upstream_value(
         params,
         structured_context,
@@ -256,7 +339,16 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
         structured_context,
         ("end_time", "endTime", "finish_time", "finishTime"),
     )
+    _LOGGER.info(
+        "log_executor start tool=%s begin_time=%s end_time=%s app_code=%s logname=%s",
+        tool_name,
+        _clip_for_log(begin_raw),
+        _clip_for_log(end_raw),
+        _clip_for_log(params.get("app_code") or structured_context.get("app_code") or ""),
+        _clip_for_log(params.get("logname") or structured_context.get("logname") or ""),
+    )
     if begin_raw is None or end_raw is None:
+        _LOGGER.warning("log_executor missing time window: tool=%s", tool_name)
         return {
             "tool": tool_name,
             "ok": False,
@@ -266,14 +358,20 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     begin_time = _as_datetime(begin_raw)
     end_time = _as_datetime(end_raw)
     if begin_time is None or end_time is None:
+        _LOGGER.warning("log_executor invalid time format: tool=%s begin=%s end=%s", tool_name, begin_raw, end_raw)
         return {
             "tool": tool_name,
             "ok": False,
             "error": "invalid begin_time/end_time format from upstream",
             "evidence": [],
         }
-    app_code = str(params.get("app_code") or structured_context.get("app_code") or "").strip()
-    logname = str(params.get("logname") or structured_context.get("logname") or "").strip()
+    requested_app_code = str(params.get("app_code") or structured_context.get("app_code") or "").strip()
+    requested_logname = str(params.get("logname") or structured_context.get("logname") or "").strip()
+    app_code, logname, fixed_scope = resolve_log_method_scope(
+        method=query_method,
+        app_code=requested_app_code,
+        logname=requested_logname,
+    )
     raw_phrase_list = params.get("match_phrase_list")
     raw_match_list = params.get("match_list")
     match_phrase_list = _sanitize_match_phrase_terms(_normalize_terms(raw_phrase_list))
@@ -291,15 +389,76 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
             str(params.get("orderId") or ""),
             str(params.get("order_no") or ""),
             str(params.get("orderNo") or ""),
+            str(structured_context.get("trace_id") or ""),
+            str(structured_context.get("traceId") or ""),
+            str(structured_context.get("order_id") or ""),
+            str(structured_context.get("orderId") or ""),
+            str(structured_context.get("order_no") or ""),
+            str(structured_context.get("orderNo") or ""),
+            str(state.get("trace_id") or ""),
+            str(state.get("traceId") or ""),
+            str(state.get("order_id") or ""),
+            str(state.get("orderId") or ""),
+            str(state.get("order_no") or ""),
+            str(state.get("orderNo") or ""),
         ]
     )
     for token in forced_terms:
         if token not in match_phrase_list:
             match_phrase_list.append(token)
+    explicit_id_candidates = [
+        params.get("trace_id"),
+        params.get("traceId"),
+        params.get("order_id"),
+        params.get("orderId"),
+        params.get("order_no"),
+        params.get("orderNo"),
+        structured_context.get("trace_id"),
+        structured_context.get("traceId"),
+        structured_context.get("order_id"),
+        structured_context.get("orderId"),
+        structured_context.get("order_no"),
+        structured_context.get("orderNo"),
+        state.get("trace_id"),
+        state.get("traceId"),
+        state.get("order_id"),
+        state.get("orderId"),
+        state.get("order_no"),
+        state.get("orderNo"),
+    ]
+    for token in explicit_id_candidates:
+        text = str(token or "").strip()
+        if not _is_trace_or_order_identifier(text):
+            continue
+        if text not in match_phrase_list:
+            match_phrase_list.append(text)
+
+    # 兜底 queryLog 强约束：
+    # - match_phrase_list 必须至少包含一个 traceId/orderNo 类标识；
+    # - match_list 必须为空（禁止模糊扩召回）。
+    if normalized_method in {"querylog", "query_log", "log_query", ""}:
+        strict_phrase_list: list[str] = []
+        for token in [*match_phrase_list, *forced_terms]:
+            text = str(token or "").strip()
+            if not text or not _is_trace_or_order_identifier(text):
+                continue
+            if text not in strict_phrase_list:
+                strict_phrase_list.append(text)
+        match_phrase_list = strict_phrase_list
+        match_list = []
+        if not match_phrase_list:
+            _LOGGER.warning("log_executor queryLog requires trace_id/order_no in match_phrase_list")
+            return {
+                "tool": tool_name,
+                "ok": False,
+                "error": "queryLog requires trace_id/order_no in match_phrase_list",
+                "evidence": [],
+            }
 
     query_word_for_prompt = " ".join([*match_phrase_list, *match_list]).strip()
 
     if not query_word_for_prompt:
+        _LOGGER.warning("log_executor missing query terms: tool=%s", tool_name)
         return {
             "tool": tool_name,
             "ok": False,
@@ -307,12 +466,17 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
             "evidence": [],
         }
 
-    # 参数不足时保留可执行能力：退化为本地日志摘要，避免执行链路被硬中断。
+    # 仅通用 queryLog 要求上游透传 app/log，业务技能方法使用固定作用域。
     if not app_code or not logname:
         extracted = _extract_effective_info(
             tool_name,
             query_word_for_prompt,
             [EsResult(score=0.0, content=f"fallback-log: {query_word_for_prompt}")],
+        )
+        _LOGGER.info(
+            "log_executor degraded fallback tool=%s query=%s reason=missing app_code/logname",
+            tool_name,
+            _clip_for_log(query_word_for_prompt, 240),
         )
         return {
             "tool": tool_name,
@@ -328,15 +492,33 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
         "match_phrase_list": [str(item).strip() for item in match_phrase_list if str(item).strip()],
         "match_list": [str(item).strip() for item in match_list if str(item).strip()],
     }
+    dispatch_trace_id = _pick_trace_id_for_dispatch(params, query_payload.get("match_phrase_list") or [])
+    _LOGGER.info(
+        "log_executor query method=%s tool=%s requested_app_code=%s requested_logname=%s effective_app_code=%s effective_logname=%s fixed_scope=%s trace_id=%s match_phrase_list=%s match_list=%s",
+        query_method,
+        tool_name,
+        _clip_for_log(requested_app_code, 80),
+        _clip_for_log(requested_logname, 80),
+        _clip_for_log(app_code, 80),
+        _clip_for_log(logname, 80),
+        fixed_scope,
+        _clip_for_log(dispatch_trace_id, 100),
+        [_clip_for_log(item, 80) for item in query_payload.get("match_phrase_list") or []],
+        [_clip_for_log(item, 80) for item in query_payload.get("match_list") or []],
+    )
     try:
-        rows = query_external_logs(
+        rows = execute_log_query_method(
+            method=query_method,
             app_code=app_code,
             logname=logname,
             begin_time=begin_time,
             end_time=end_time,
-            content=query_payload,
+            match_phrase_list=query_payload.get("match_phrase_list"),
+            match_list=query_payload.get("match_list"),
+            trace_id=dispatch_trace_id,
         )
     except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("log_executor query failed tool=%s method=%s error=%s", tool_name, query_method, exc)
         return {"tool": tool_name, "ok": False, "error": str(exc), "evidence": []}
 
     evidence_rows = _select_rows_for_evidence(rows)
@@ -344,6 +526,14 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     evidence = [_clip_log_text(item.content or "") for item in evidence_rows]
     if extracted.get("summary"):
         evidence.insert(0, f"[summary] {str(extracted['summary'])}")
+    _LOGGER.info(
+        "log_executor done tool=%s method=%s log_hit_count=%d selected_rows=%d summary=%s",
+        tool_name,
+        query_method,
+        len(rows),
+        len(evidence_rows),
+        _clip_for_log(extracted.get("summary"), 220),
+    )
     return {
         "tool": tool_name,
         "ok": True,

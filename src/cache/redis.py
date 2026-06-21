@@ -172,3 +172,23 @@ class RedisAtomicClient:
         if raw is None:
             return None
         return MessageCacheContext.from_json(raw)
+
+    def delete_keys_by_patterns(self, patterns: list[str]) -> int:
+        if self._client is None:
+            return 0
+        deleted = 0
+        try:
+            for pattern in [str(item or "").strip() for item in list(patterns or []) if str(item or "").strip()]:
+                cursor = 0
+                while True:
+                    cursor, keys = self._client.scan(cursor=cursor, match=pattern, count=500)
+                    if keys:
+                        deleted += int(self._client.delete(*keys) or 0)
+                    if cursor == 0:
+                        break
+        except Exception:
+            return deleted
+        return deleted
+
+    def clear_chat_cache_data(self) -> int:
+        return self.delete_keys_by_patterns([f"{_REPEAT_CHAT_PREFIX}*", f"{_MESSAGE_CONTEXT_PREFIX}*"])

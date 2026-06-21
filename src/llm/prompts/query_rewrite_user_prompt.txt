@@ -1,0 +1,11 @@
+请对下面原始用户问题做 query rewrite，并按 JSON 输出。
+
+【原始用户问题】
+{question}
+
+【最近历史对话】
+{history_context}
+
+要求：
+1. 当前问题若缺少 traceId/orderNo，必须优先从“最近历史对话”提取并填入 trace_id/order_id。
+2. 不要返回解释，只返回 JSON。

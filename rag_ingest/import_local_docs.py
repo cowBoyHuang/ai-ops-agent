@@ -34,6 +34,8 @@ except Exception:  # pragma: no cover - 可选运行时依赖
 _DEFAULT_SUFFIXES = [".md", ".txt", ".text", ".doc", ".docx", ".log", ".rst"]
 _DEFAULT_CHUNK_SIZE = 900
 _DEFAULT_CHUNK_OVERLAP = 120
+_DEFAULT_BUSINESS_SOURCE_DIR = _ROOT_DIR / "rag_ingest" / "business_docs"
+_DEFAULT_CASE_SOURCE_DIR = _ROOT_DIR / "rag_ingest" / "case_docs"
 _DEFAULT_MULTIMODAL_MODEL = "azure/gpt-4.1"
 _DEFAULT_LLM_BASE_URL = "http://llm.api.corp.qunar.com/v1"
 _DOCX_NS = {
@@ -83,6 +85,8 @@ def _normalize_source_paths(raw: str) -> list[str]:
 # - 出参：`list[Path]`=待导入文件路径列表。
 # - 方法逻辑：递归扫描目录，按后缀过滤并按路径排序，保证导入顺序稳定。
 def _collect_source_files(source_dir: Path, suffixes: list[str]) -> list[Path]:
+    if not source_dir.exists() or not source_dir.is_dir():
+        return []
     allowed = {item.lower() for item in suffixes}
     rows: list[Path] = []
     for path in source_dir.rglob("*"):
@@ -99,33 +103,110 @@ def _collect_source_files(source_dir: Path, suffixes: list[str]) -> list[Path]:
 # - 入参：`source_paths`(list[str]|None)=显式输入路径（文件或目录）；`source_dir`(str|Path|None)=目录入口；`suffixes`=允许后缀。
 # - 出参：`tuple[list[Path], str]`=(解析后的文件列表, 来源模式)。
 # - 方法逻辑：优先使用 `source_paths`，支持绝对路径文件/目录；否则回退目录扫描。
+def _is_under_directory(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except Exception:
+        return False
+
+
+def _infer_knowledge_type(
+    doc_path: Path,
+    *,
+    business_root: Path | None = None,
+    case_root: Path | None = None,
+) -> str:
+    path = doc_path.resolve()
+    if case_root is not None and _is_under_directory(path, case_root):
+        return "case"
+    if business_root is not None and _is_under_directory(path, business_root):
+        return "domain"
+    text = str(path).lower()
+    case_tokens = ("case", "案例", "复盘", "故障", "排障")
+    return "case" if any(token in text for token in case_tokens) else "domain"
+
+
 def _resolve_source_files(
     *,
     source_paths: list[str] | None,
     source_dir: str | Path | None,
+    business_source_dir: str | Path | None,
+    case_source_dir: str | Path | None,
     suffixes: list[str],
-) -> tuple[list[Path], str]:
+) -> tuple[list[tuple[Path, str]], str, Path, Path]:
+    resolved_business_dir = (
+        Path(business_source_dir).expanduser().resolve() if business_source_dir else _DEFAULT_BUSINESS_SOURCE_DIR.resolve()
+    )
+    resolved_case_dir = (
+        Path(case_source_dir).expanduser().resolve() if case_source_dir else _DEFAULT_CASE_SOURCE_DIR.resolve()
+    )
     allowed = {item.lower() for item in suffixes}
     if source_paths:
-        resolved: list[Path] = []
+        resolved: list[tuple[Path, str]] = []
         for raw in source_paths:
             candidate = Path(str(raw)).expanduser()
             if not candidate.is_absolute():
                 candidate = candidate.resolve()
             if candidate.is_dir():
-                resolved.extend(_collect_source_files(candidate, suffixes))
+                for path in _collect_source_files(candidate, suffixes):
+                    resolved.append(
+                        (
+                            path.resolve(),
+                            _infer_knowledge_type(
+                                path,
+                                business_root=resolved_business_dir,
+                                case_root=resolved_case_dir,
+                            ),
+                        )
+                    )
                 continue
             if not candidate.is_file():
                 continue
             if candidate.suffix.lower() not in allowed:
                 continue
-            resolved.append(candidate)
+            resolved.append(
+                (
+                    candidate.resolve(),
+                    _infer_knowledge_type(
+                        candidate,
+                        business_root=resolved_business_dir,
+                        case_root=resolved_case_dir,
+                    ),
+                )
+            )
 
-        deduped = sorted({path.resolve() for path in resolved}, key=lambda item: str(item))
-        return deduped, "paths"
+        deduped_map: dict[Path, str] = {}
+        for path, knowledge_type in resolved:
+            if path not in deduped_map:
+                deduped_map[path] = knowledge_type
+        deduped = sorted(deduped_map.items(), key=lambda item: str(item[0]))
+        return deduped, "paths", resolved_business_dir, resolved_case_dir
 
-    target_dir = Path(source_dir) if source_dir else (_ROOT_DIR / "rag_ingest" / "source_docs")
-    return _collect_source_files(target_dir, suffixes), "dir"
+    if source_dir:
+        target_dir = Path(source_dir).expanduser().resolve()
+        files = _collect_source_files(target_dir, suffixes)
+        rows = [
+            (
+                path.resolve(),
+                _infer_knowledge_type(
+                    path,
+                    business_root=resolved_business_dir,
+                    case_root=resolved_case_dir,
+                ),
+            )
+            for path in files
+        ]
+        return rows, "dir", resolved_business_dir, resolved_case_dir
+
+    business_files = _collect_source_files(resolved_business_dir, suffixes)
+    case_files = _collect_source_files(resolved_case_dir, suffixes)
+    rows: list[tuple[Path, str]] = [
+        (path.resolve(), "domain") for path in business_files
+    ] + [
+        (path.resolve(), "case") for path in case_files
+    ]
+    rows.sort(key=lambda item: str(item[0]))
+    return rows, "split_dirs", resolved_business_dir, resolved_case_dir
 
 
 # 方法注释（业务）:
@@ -509,6 +590,7 @@ def _build_upsert_items(
     paragraphs: list[str],
     chunk_size: int,
     chunk_overlap: int,
+    knowledge_type: str,
 ) -> tuple[str, list[dict[str, Any]]]:
     # Use stable parent_id per absolute file path so one article keeps one parent_id
     # across repeated imports.
@@ -532,6 +614,7 @@ def _build_upsert_items(
                     "source_file_abs_path": abs_path,
                     "chunk_index": idx,
                     "file_name": doc_path.name,
+                    "knowledge_type": str(knowledge_type or "domain"),
                 },
             }
         )
@@ -546,15 +629,18 @@ def run_import_entry(
     *,
     source_paths: list[str] | None = None,
     source_dir: str | Path | None = None,
+    business_source_dir: str | Path | None = None,
+    case_source_dir: str | Path | None = None,
     suffixes: list[str] | None = None,
     chunk_size: int = _DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
 ) -> dict[str, Any]:
-    resolved_source_dir = (Path(source_dir) if source_dir else (_ROOT_DIR / "rag_ingest" / "source_docs")).resolve()
     normalized_suffixes = list(suffixes or _DEFAULT_SUFFIXES)
-    files, source_mode = _resolve_source_files(
+    source_rows, source_mode, resolved_business_dir, resolved_case_dir = _resolve_source_files(
         source_paths=source_paths,
         source_dir=source_dir,
+        business_source_dir=business_source_dir,
+        case_source_dir=case_source_dir,
         suffixes=normalized_suffixes,
     )
 
@@ -562,10 +648,12 @@ def run_import_entry(
 
     file_count = 0
     chunk_count = 0
+    domain_chunk_count = 0
+    case_chunk_count = 0
     image_desc_count = 0
     skipped_files: list[str] = []
 
-    for doc_path in files:
+    for doc_path, knowledge_type in source_rows:
         paragraphs, images = _extract_document(doc_path)
         image_paragraphs: list[str] = []
         for idx, image in enumerate(images, start=1):
@@ -589,26 +677,42 @@ def run_import_entry(
             paragraphs=merged_paragraphs,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            knowledge_type=knowledge_type,
         )
         if not items:
             skipped_files.append(str(doc_path))
             continue
 
-        qdrant_store.upsert_texts(items)
+        target_collection = qdrant_store.collection_name_for_knowledge_type(knowledge_type)
+        qdrant_store.upsert_texts(items, collection_name=target_collection)
 
         file_count += 1
         chunk_count += len(items)
+        if knowledge_type == "case":
+            case_chunk_count += len(items)
+        else:
+            domain_chunk_count += len(items)
 
     return {
         "source_mode": source_mode,
-        "source_dir": str(resolved_source_dir) if source_mode == "dir" else "",
-        "source_paths": [str(path) for path in files] if source_mode == "paths" else [],
+        "source_dir": str(Path(source_dir).expanduser().resolve()) if source_mode == "dir" and source_dir else "",
+        "business_source_dir": str(resolved_business_dir),
+        "case_source_dir": str(resolved_case_dir),
+        "source_paths": [str(path) for path, _ in source_rows] if source_mode == "paths" else [],
         "suffixes": normalized_suffixes,
-        "files_found": len(files),
+        "files_found": len(source_rows),
+        "business_files_found": len([1 for _, knowledge_type in source_rows if knowledge_type == "domain"]),
+        "case_files_found": len([1 for _, knowledge_type in source_rows if knowledge_type == "case"]),
         "files_ingested": file_count,
         "chunks_ingested": chunk_count,
         "image_descriptions_generated": image_desc_count,
-        "qdrant_collection": qdrant_store.config.collection_name,
+        "qdrant_collections": {
+            "legacy_collection": qdrant_store.config.collection_name,
+            "domain_collection": qdrant_store.config.domain_collection_name,
+            "case_collection": qdrant_store.config.case_collection_name,
+        },
+        "domain_chunks_ingested": domain_chunk_count,
+        "case_chunks_ingested": case_chunk_count,
         "skipped_files": skipped_files,
     }
 
@@ -620,12 +724,16 @@ def run_import_entry(
 def run_import(
     *,
     source_dir: str | Path | None = None,
+    business_source_dir: str | Path | None = None,
+    case_source_dir: str | Path | None = None,
     suffixes: list[str] | None = None,
     chunk_size: int = _DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
 ) -> dict[str, Any]:
     return run_import_entry(
         source_dir=source_dir,
+        business_source_dir=business_source_dir,
+        case_source_dir=case_source_dir,
         suffixes=suffixes,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -641,7 +749,17 @@ def main() -> None:
     parser.add_argument(
         "--source-dir",
         default="",
-        help="文档目录，默认使用 rag_ingest/source_docs",
+        help="单目录导入模式（兼容参数）。为空时默认读取 business/case 双目录。",
+    )
+    parser.add_argument(
+        "--business-source-dir",
+        default="",
+        help="业务文档目录，默认 rag_ingest/business_docs",
+    )
+    parser.add_argument(
+        "--case-source-dir",
+        default="",
+        help="历史排障 case 文档目录，默认 rag_ingest/case_docs",
     )
     parser.add_argument(
         "--source-paths",
@@ -670,6 +788,8 @@ def main() -> None:
     result = run_import_entry(
         source_paths=_normalize_source_paths(args.source_paths),
         source_dir=args.source_dir or None,
+        business_source_dir=args.business_source_dir or None,
+        case_source_dir=args.case_source_dir or None,
         suffixes=_normalize_suffixes(args.suffixes),
         chunk_size=int(args.chunk_size),
         chunk_overlap=int(args.chunk_overlap),

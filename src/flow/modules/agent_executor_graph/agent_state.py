@@ -2,9 +2,36 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Literal, TypedDict
 
 from flow.modules.agent_executor_graph.plan_step import PlanStep
+
+
+class InvestigationPlan(TypedDict, total=False):
+    """Planner 输出：仅包含假设与宏观目标。"""
+
+    hypothesis: str
+    investigation_goals: List[str]
+    required_answers: List[Dict[str, Any]]
+
+
+class EvidenceItem(TypedDict, total=False):
+    """执行阶段沉淀的单条证据。"""
+
+    objective: str
+    skill: str
+    observation: str
+    summary: str
+    conclusion: Literal["supports", "refutes", "neutral", "insufficient"]
+    raw_result: Dict[str, Any]
+
+
+class EvidenceGraph(TypedDict, total=False):
+    """Hypothesis-first 证据图。"""
+
+    hypothesis: str
+    evidence: List[EvidenceItem]
+    supported: bool | None
 
 
 class AgentState(TypedDict, total=False):
@@ -20,6 +47,7 @@ class AgentState(TypedDict, total=False):
     intent_retry_results: List[Dict[str, Any]]
     intent_retry_count: int
     context: Dict[str, Any]
+    query_rewrite: Dict[str, Any]
 
     chat_id: str
     user_id: str
@@ -85,4 +113,13 @@ class AgentState(TypedDict, total=False):
     replan_count: int
     max_retries: int
     max_replan: int
+    max_insufficient_rounds: int
     response: Dict[str, Any]
+    replan_reason: str
+    rejected_hypothesis: List[str]
+    evaluation: Dict[str, Any]
+    plan: InvestigationPlan
+    knowledge_context: Dict[str, Any]
+    execution: Dict[str, Any]
+    replan_context: Dict[str, Any]
+    final_summary_input: Dict[str, Any]

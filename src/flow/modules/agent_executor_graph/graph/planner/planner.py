@@ -1,1268 +1,457 @@
-"""规划节点（Planner）。
-
-业务职责：
-- 聚合 RAG 检索结果（日志诊断/chunk/父文档）构建 LLM 规划上下文。
-- 调用大模型输出结构化排障计划，并映射为可执行 plan_steps。
-- LLM 不可用或输出异常时，回退到稳定的规则计划模板。
-"""
+"""Planner 节点：生成 hypothesis + investigation_goals（宏观目标）。"""
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 import logging
-from pathlib import Path
 import re
 from typing import Any
-from zoneinfo import ZoneInfo
-import zipfile
-import xml.etree.ElementTree as ET
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
-from flow.modules.agent_executor_graph.plan_step import PlanStep
 from llm.llm import chat_with_llm, load_prompt, render_prompt
 
 _LOGGER = logging.getLogger(__name__)
-_MAX_RAG_DOCS_FOR_PROMPT = 2
-_MAX_RAG_SUB_DOCS_FOR_PROMPT = 4
-_MAX_RAG_TEXT_LEN = 300
-_MAX_QUERY_LEN = 500
-_MAX_PLAN_STEPS = 6
-_MAX_HISTORY_ROWS = 10
-_MAX_HISTORY_TEXT_LEN = 1200
-_MAX_MESSAGE_CONTEXT_ROUNDS = 8
-_MAX_MESSAGE_CONTEXT_TEXT_LEN = 1600
-_MAX_FULL_DOCS_FOR_PROMPT = 2
-_MAX_FULL_DOC_TEXT_LEN = 1500
-_BUSINESS_CONSULT_INTENT = "SYSTEM_LOGIC_CONSULT"
-_BUSINESS_CONTEXT_FILTER_TOKENS = (
-    "问题根因",
-    "代码分析",
-    "日志结论",
-    "堆栈",
-    "traceid",
-    "异常",
-    "排查",
-    "根因",
+_MAX_DOCS = 4
+_MAX_DOC_TEXT = 400
+_REQUIRED_FIELD_PATTERNS = {
+    "bizErrorCode": re.compile(r"biz[_-]?error[_-]?code", re.IGNORECASE),
+    "subErrorCode": re.compile(r"sub[_-]?error[_-]?code", re.IGNORECASE),
+    "refSubErrorCode": re.compile(r"ref[_-]?sub[_-]?error[_-]?code", re.IGNORECASE),
+}
+_GENERIC_FIELD_SUFFIXES = ("code", "id", "status", "time", "timestamp", "errno", "result")
+_GENERIC_FIELD_HINTS = ("字段", "参数", "返回", "结果", "值", "编码", "错误码", "code", "id")
+_IDENTITY_HINT_PATTERN = re.compile(
+    r"(被拦截|哪位|是谁|乘机人|旅客|姓名|证件|证件号|idno|certno|identityno|passenger|traveller|traveler|name)",
+    re.IGNORECASE,
 )
-_ALLOWED_TOOL_NAMES = {
-    "log_query",
-    "dependency_log_query",
-    "knowledge_lookup",
-    "code_clone",
-    "code_pull",
-    "rag_parent_chunk_query",
-}
-_TOOL_HINT_NAME_MAP = {
-    "query_log": "query_log",
-    "log_query": "query_log",
-    "dependency_log_query": "dependency_log_query",
-    "query_dependency_log": "dependency_log_query",
-    "knowledge_lookup": "knowledge_lookup",
-    "fetch_code": "fetch_code",
-    "code_pull": "fetch_code",
-    "code_clone": "clone_code",
-    "clone_code": "clone_code",
-    "query_rag_parent_chunk": "rag_parent_chunk_query",
-    "rag_parent_chunk_query": "rag_parent_chunk_query",
-    "rag_parent_doc_query": "rag_parent_chunk_query",
-}
-_LOG_QUERY_TOOLS = {"log_query", "dependency_log_query"}
-_CODE_QUERY_TOOLS = {"code_clone", "code_pull"}
-_LOG_QUERY_LIST_PARAM_KEYS = ("match_phrase_list", "match_list")
-_SKILLS_DIR = Path(__file__).resolve().parents[5] / "skills"
-_MAX_SKILL_TEXT_LEN = 1200
-_MAX_SKILL_TOTAL_LEN = 12000
-_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
-_LOG_FILE_TO_APP_CODE = {
-    "ttsorder.log": "f_tts_trade_order",
-    "ttsorder_error.log": "f_tts_trade_order",
-    "tts.log": "f_tts_trade_core",
-    "tts_error.log": "f_tts_trade_core",
-}
-_APP_CODE_TO_BUSINESS_LOG = {
-    "f_tts_trade_order": "ttsorder.log",
-    "f_tts_trade_core": "tts.log",
-}
-_APP_CODE_PATTERN = re.compile(r"\b(f_tts_trade_(?:order|core))\b", re.IGNORECASE)
-_XEP_ORDER_PATTERN = re.compile(r"\bxep\s*(\d{6})(\d{6})\d*\b", re.IGNORECASE)
-_OPS_SLUGGER_PATTERN = re.compile(r"\bops[\s_.-]*slugger[\s_.-]*(\d{6})[\s_.-]*(\d{6})\b", re.IGNORECASE)
-_GENERIC_DT_PATTERN = re.compile(r"\b(\d{6})[\s_.-]+(\d{6})\b")
-_TRACE_ID_PATTERN = re.compile(r"[a-z]+[_-]slugger[_a-z0-9\.\-]+(?=$|[^A-Za-z0-9_\.\-])", re.IGNORECASE)
-_DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-_SRC_ROOT = Path(__file__).resolve().parents[5]
-_PROJECT_ROOT = _SRC_ROOT.parent
+_CODE_HINT_PATTERN = re.compile(r"(biz[_-]?error[_-]?code|sub[_-]?error[_-]?code|ref[_-]?sub[_-]?error[_-]?code|error[_-]?code|错误码|错误编码)", re.IGNORECASE)
+_STATUS_HINT_PATTERN = re.compile(r"(status|状态|结果状态|result[_-]?status|是否成功|success)", re.IGNORECASE)
+_TIME_HINT_PATTERN = re.compile(r"(time|timestamp|时间|时间点|何时|什么时候|失败时间)", re.IGNORECASE)
+_REASON_HINT_PATTERN = re.compile(r"(原因|失败原因|why|reason|errormsg|errmsg|失败信息)", re.IGNORECASE)
 
 
-def _as_int(value: Any, default: int) -> int:
-    """把输入转换成 int，异常时使用默认值。"""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _clip_text(text: Any, max_len: int) -> str:
+def _clip(text: Any, max_len: int = _MAX_DOC_TEXT) -> str:
     raw = str(text or "").strip()
     if len(raw) <= max_len:
         return raw
     return f"{raw[:max_len]}..."
 
 
-def _parse_json_object(text: str) -> dict[str, Any] | None:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        parsed = json.loads(raw[start : end + 1])
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _read_text_safely(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except Exception:
-        try:
-            return path.read_text(encoding="utf-8", errors="ignore").strip()
-        except Exception:
-            return ""
-
-
-def _read_docx_text_safely(path: Path) -> str:
-    try:
-        with zipfile.ZipFile(path, "r") as zf:
-            if "word/document.xml" not in zf.namelist():
-                return ""
-            root = ET.fromstring(zf.read("word/document.xml"))
-    except Exception:
-        return ""
-
-    rows: list[str] = []
-    for para in root.findall(".//w:p", _DOCX_NS):
-        text = "".join(node.text or "" for node in para.findall(".//w:t", _DOCX_NS)).strip()
-        if text:
-            rows.append(" ".join(text.split()))
-    return "\n".join(rows).strip()
-
-
-def _resolve_doc_path(path_text: str) -> Path | None:
-    raw = str(path_text or "").strip()
-    if not raw:
-        return None
-    base = Path(raw)
-    candidates = [base]
-    if not base.is_absolute():
-        candidates.append(_PROJECT_ROOT / base)
-        candidates.append(_SRC_ROOT / base)
-    for candidate in candidates:
-        try:
-            if candidate.is_file():
-                return candidate
-        except Exception:
-            continue
-    return None
-
-
-def _read_full_doc_by_path(path_text: str) -> str:
-    path = _resolve_doc_path(path_text)
-    if path is None:
-        return ""
-    if path.suffix.lower() == ".docx":
-        return _read_docx_text_safely(path)
-    try:
-        raw = path.read_bytes()
-    except Exception:
-        return ""
-    if b"\x00" in raw:
-        return ""
-    for encoding in ("utf-8", "gb18030"):
-        try:
-            return raw.decode(encoding).strip()
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="ignore").strip()
-
-
-def _merge_parent_docs_from_chunk_paths(
-    *,
-    rag_docs: list[dict[str, Any]],
-    parent_docs: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    path_to_index: dict[str, int] = {}
-    for item in list(parent_docs or []):
-        if not isinstance(item, dict):
-            continue
-        row = dict(item)
-        path = str(row.get("path") or "").strip()
-        if path:
-            content = str(row.get("content") or "").strip()
-            if not content:
-                full_content = _read_full_doc_by_path(path)
-                if full_content:
-                    row["content"] = full_content
-            if path not in path_to_index:
-                path_to_index[path] = len(merged)
-        merged.append(row)
-
-    grouped: dict[str, dict[str, Any]] = {}
-    for item in list(rag_docs or []):
-        if not isinstance(item, dict):
-            continue
-        payload = dict(item.get("payload") or {})
-        path = str(payload.get("path") or item.get("path") or "").strip()
-        if not path:
-            continue
-        row = grouped.setdefault(
-            path,
-            {
-                "path": path,
-                "parent_id": str(payload.get("parent_id") or item.get("id") or "").strip(),
-                "score": _to_float(item.get("score"), 0.0),
-                "chunk_texts": [],
-            },
-        )
-        row["score"] = max(_to_float(row.get("score"), 0.0), _to_float(item.get("score"), 0.0))
-        text = str(item.get("text") or "").strip()
-        if text:
-            chunk_texts = list(row.get("chunk_texts") or [])
-            chunk_texts.append(text)
-            row["chunk_texts"] = chunk_texts
-
-    loaded_rows: list[dict[str, Any]] = []
-    sorted_paths = sorted(grouped.values(), key=lambda row: _to_float(row.get("score"), 0.0), reverse=True)
-    for row in sorted_paths:
-        path = str(row.get("path") or "").strip()
-        if not path:
-            continue
-        existing_index = path_to_index.get(path)
-        if existing_index is not None:
-            existing_row = merged[existing_index]
-            existing_row["score"] = max(
-                _to_float(existing_row.get("score"), 0.0),
-                _to_float(row.get("score"), 0.0),
-            )
-            if str(existing_row.get("content") or "").strip():
-                continue
-            full_content = _read_full_doc_by_path(path)
-            if not full_content:
-                chunk_rows = [str(item).strip() for item in list(row.get("chunk_texts") or []) if str(item).strip()]
-                if chunk_rows:
-                    full_content = "\n".join(chunk_rows)
-            if full_content:
-                existing_row["content"] = full_content
-            continue
-
-        full_content = _read_full_doc_by_path(path)
-        if not full_content:
-            # 文件不可直接读取时，退化为该文件命中 chunk 的拼接内容，保证上下文不为空。
-            chunk_rows = [str(item).strip() for item in list(row.get("chunk_texts") or []) if str(item).strip()]
-            if chunk_rows:
-                full_content = "\n".join(chunk_rows)
-        if not full_content:
-            continue
-        loaded_rows.append(
-            {
-                "parent_id": str(row.get("parent_id") or ""),
-                "path": path,
-                "content": full_content,
-                "score": _to_float(row.get("score"), 0.0),
-            }
-        )
-
-    merged.extend(loaded_rows)
-    merged.sort(key=lambda item: _to_float(item.get("score"), 0.0), reverse=True)
-    return merged
-
-
-# 方法注释（业务）:
-# - 入参：无。
-# - 出参：`list[dict[str, str]]`=skills 文件清单（path/content）。
-# - 方法逻辑：每次规划都强制扫描并读取 `src/skills` 下全部 Markdown 技能文件，供大模型制定 planStep。
-def _load_all_skills() -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    if not _SKILLS_DIR.is_dir():
-        _LOGGER.warning("planner skills 目录不存在: %s", _SKILLS_DIR)
-        return rows
-
-    for file_path in sorted(_SKILLS_DIR.rglob("*")):
-        if not file_path.is_file():
-            continue
-        if file_path.suffix.lower() != ".md":
-            continue
-        content = _read_text_safely(file_path)
-        rel_path = str(file_path.relative_to(_SKILLS_DIR.parent))
-        rows.append({"path": rel_path, "content": content})
-
-    _LOGGER.info("planner 强制读取 skills 完成: count=%d", len(rows))
-    return rows
-
-
-def _build_skills_context(skills: list[dict[str, str]]) -> str:
-    sections: list[str] = []
-    total_len = 0
-    for idx, item in enumerate(skills, start=1):
-        path = str(item.get("path") or "").strip()
-        content = _clip_text(item.get("content"), _MAX_SKILL_TEXT_LEN)
-        section = f"[skill {idx}] path={path}\n{content}".strip()
-        if not section:
-            continue
-        total_len += len(section)
-        if total_len > _MAX_SKILL_TOTAL_LEN:
-            break
-        sections.append(section)
-    return "\n\n".join(sections).strip() or "无可用 skills 定义"
-
-
-# 方法注释（业务）:
-# - 入参：`state`(dict[str, Any])=当前 AgentState。
-# - 出参：`str`=用户原始问题文本。
-# - 方法逻辑：优先 messages[-1].content，其次 structured_context.user_query/question，最后回退 state.question。
-def _pick_user_query(state: dict[str, Any]) -> str:
-    message_rows = state.get("messages")
-    if not isinstance(message_rows, list):
-        message_rows = dict(state.get("context") or {}).get("messages")
-    if isinstance(message_rows, list) and message_rows:
-        for row in reversed(message_rows):
-            if isinstance(row, dict):
-                content = row.get("content")
-            else:
-                content = getattr(row, "content", "")
-            text = str(content or "").strip()
-            if text:
-                return text
-
-    structured_context = dict(state.get("structured_context") or {})
-    for key in ("user_query", "question"):
-        value = structured_context.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return str(state.get("question") or "").strip()
-
-
-def _prepare_history_dialogues(state: dict[str, Any]) -> str:
-    rows: list[str] = []
-    for item in list(state.get("conversation_context") or [])[:_MAX_HISTORY_ROWS]:
-        text = str(item or "").strip()
-        if text:
-            rows.append(text)
-    if not rows:
-        structured_context = dict(state.get("structured_context") or {})
-        for item in list(structured_context.get("recent_messages") or [])[:_MAX_HISTORY_ROWS]:
-            text = str(item or "").strip()
-            if text:
-                rows.append(text)
-    merged = "\n".join(rows).strip()
-    return _clip_text(merged, _MAX_HISTORY_TEXT_LEN) or "无历史对话信息"
-
-
-def _looks_like_troubleshooting_text(text: Any) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
-        return False
-    return any(token in lowered for token in _BUSINESS_CONTEXT_FILTER_TOKENS)
-
-
-def _prepare_message_context(state: dict[str, Any], *, intent_type: str = "") -> str:
-    raw_context = dict(state.get("context") or {})
-    raw_message_context = raw_context.get("message_context")
-    if raw_message_context is None:
-        raw_message_context = state.get("message_context")
-    is_business_consult = str(intent_type or "").strip() == _BUSINESS_CONSULT_INTENT
-
-    summary = ""
-    rounds: list[Any] = []
-    if isinstance(raw_message_context, dict):
-        summary = str(raw_message_context.get("summary") or "").strip()
-        rounds = list(raw_message_context.get("rounds") or [])
-    elif raw_message_context is not None:
-        summary = str(getattr(raw_message_context, "summary", "") or "").strip()
-        rounds = list(getattr(raw_message_context, "rounds", []) or [])
-
-    lines: list[str] = []
-    if summary and not (is_business_consult and _looks_like_troubleshooting_text(summary)):
-        lines.append(f"summary: {summary}")
-
-    for idx, row in enumerate(rounds[-_MAX_MESSAGE_CONTEXT_ROUNDS:], start=1):
-        if isinstance(row, dict):
-            user_text = str(row.get("message") or "").strip()
-            ai_text = str(row.get("aiResponse") or "").strip()
-        else:
-            user_text = str(getattr(row, "message", "") or "").strip()
-            ai_text = str(getattr(row, "aiResponse", "") or "").strip()
-        if user_text:
-            lines.append(f"round{idx}.user: {user_text}")
-        if ai_text and not (is_business_consult and _looks_like_troubleshooting_text(ai_text)):
-            lines.append(f"round{idx}.assistant: {ai_text}")
-
-    merged = "\n".join(lines).strip()
-    return _clip_text(merged, _MAX_MESSAGE_CONTEXT_TEXT_LEN) or "无消息缓存上下文"
-
-
-def _prepare_full_docs_content(parent_docs: list[dict[str, Any]]) -> str:
-    sections: list[str] = []
-    for idx, item in enumerate(parent_docs[:_MAX_FULL_DOCS_FOR_PROMPT], start=1):
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or "").strip()
-        parent_id = str(item.get("parent_id") or "").strip()
-        score = _to_float(item.get("score"), 0.0)
-        content = _clip_text(item.get("content"), _MAX_FULL_DOC_TEXT_LEN)
-        if not content:
-            continue
-        sections.append(
-            (
-                f"[完整文档{idx}] parent_id={parent_id or 'N/A'} "
-                f"path={path or 'N/A'} score={score:.4f}\n{content}"
-            ).strip()
-        )
-    return "\n\n".join(sections).strip() or "无完整文档内容"
-
-
-# 方法注释（业务）:
-# - 入参：`state`(dict[str, Any])=当前 AgentState；`skills`=run 阶段已强制读取的 skill 文件列表。
-# - 出参：`dict[str, Any]`=供大模型规划的摘要上下文（用户问题/日志摘要/RAG 摘要/完整文档引用）。
-# - 方法逻辑：从 structured_context 与顶层字段提取并裁剪检索结果，按优先级组织成低 token 成本摘要。
-def _prepare_context_for_llm(state: dict[str, Any], skills: list[dict[str, str]]) -> dict[str, Any]:
-    structured_context = dict(state.get("structured_context") or {})
-    user_query = _clip_text(_pick_user_query(state), _MAX_QUERY_LEN)
-    if not user_query:
-        user_query = _clip_text(state.get("question"), _MAX_QUERY_LEN)
-
-    # 仅保留核心 RAG 文档链路，不再处理 legacy 的 error_info/bm25 诊断摘要。
-    log_diagnosis_summary = "无额外日志诊断信息"
-
-    rag_sub_chunk_docs = list(structured_context.get("rag_sub_chunk_docs") or state.get("rag_sub_chunk_docs") or [])
-    rag_docs = list(structured_context.get("rag_docs") or state.get("rag_docs") or [])
-    sub_chunk_rows: list[str] = []
-    for idx, item in enumerate(rag_sub_chunk_docs[:_MAX_RAG_SUB_DOCS_FOR_PROMPT], start=1):
-        if not isinstance(item, dict):
-            continue
-        payload = dict(item.get("payload") or {})
-        path = str(payload.get("path") or item.get("path") or "").strip()
-        file_name = str(payload.get("file_name") or Path(path).name or "unknown")
-        text = _clip_text(item.get("text"), _MAX_RAG_TEXT_LEN)
-        if not text:
-            continue
-        score = _to_float(item.get("score"), 0.0)
-        sub_chunk_rows.append(
-            f"[子chunk{idx}] 来源={file_name} path={path or 'N/A'} score={score:.4f} 内容={text}"
-        )
-    rag_sub_chunks_summary = "\n".join(sub_chunk_rows).strip() or "无子 chunk 摘要"
-
-    rag_rows: list[str] = []
-    for idx, item in enumerate(rag_docs[:_MAX_RAG_DOCS_FOR_PROMPT], start=1):
-        if not isinstance(item, dict):
-            continue
-        payload = dict(item.get("payload") or {})
-        path = str(payload.get("path") or item.get("path") or "").strip()
-        file_name = str(payload.get("file_name") or Path(path).name or "unknown")
-        text = _clip_text(item.get("text"), _MAX_RAG_TEXT_LEN)
-        if not text:
-            continue
-        score = _to_float(item.get("score"), 0.0)
-        rag_rows.append(f"[文档{idx}] 来源={file_name} path={path or 'N/A'} score={score:.4f} 内容={text}")
-    rag_solutions_summary = "\n".join(rag_rows).strip() or "无 RAG 文档摘要"
-
-    parent_docs = list(structured_context.get("rag_parent_docs") or state.get("rag_parent_docs") or [])
-    parent_docs = _merge_parent_docs_from_chunk_paths(rag_docs=rag_docs, parent_docs=parent_docs)
-    history_dialogues = _prepare_history_dialogues(state)
-    message_context = _prepare_message_context(state, intent_type=str(state.get("intent_type") or ""))
-    full_docs_content = _prepare_full_docs_content(parent_docs)
-    ref_rows: list[str] = []
-    for idx, item in enumerate(parent_docs, start=1):
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or "").strip()
-        if not path:
-            continue
-        score = _to_float(item.get("score"), 0.0)
-        file_name = Path(path).name or path
-        ref_rows.append(f"- [{idx}] {file_name} | path={path} | score={score:.4f}")
-    full_docs_references = "\n".join(ref_rows).strip() or "无完整文档引用"
-    skills_context = _build_skills_context(skills)
-
-    return {
-        "user_query": user_query,
-        "log_diagnosis_summary": log_diagnosis_summary,
-        "rag_sub_chunks_summary": rag_sub_chunks_summary,
-        "rag_solutions_summary": rag_solutions_summary,
-        "full_docs_references": full_docs_references,
-        "history_dialogues": history_dialogues,
-        "message_context": message_context,
-        "full_docs_content": full_docs_content,
-        "skills_context": skills_context,
-        "skills_count": len(skills),
-        "skills_catalog": [str(item.get("path") or "") for item in skills],
-    }
-
-
-def _resolve_planner_prompt_files(intent_type: str) -> tuple[str, str]:
-    normalized = str(intent_type or "").strip()
-    if normalized == "SYSTEM_LOGIC_CONSULT":
-        return "planner_business_consult_system_prompt.txt", "planner_business_consult_user_prompt.txt"
-    return "planner_system_prompt.txt", "planner_user_prompt.txt"
-
-
-def _build_planner_user_prompt(context: dict[str, Any], *, prompt_file: str) -> str:
-    return render_prompt(
-        prompt_file,
-        user_query=str(context.get("user_query") or ""),
-        history_dialogues=str(context.get("history_dialogues") or ""),
-        message_context=str(context.get("message_context") or ""),
-        skills_context=str(context.get("skills_context") or ""),
-        log_diagnosis_summary=str(context.get("log_diagnosis_summary") or ""),
-        rag_sub_chunks_summary=str(context.get("rag_sub_chunks_summary") or ""),
-        rag_solutions_summary=str(context.get("rag_solutions_summary") or ""),
-        full_docs_references=str(context.get("full_docs_references") or ""),
-        full_docs_content=str(context.get("full_docs_content") or ""),
-    )
-
-
-def _map_tool_name(raw_name: Any) -> str:
-    name = str(raw_name or "").strip()
-    if name in _ALLOWED_TOOL_NAMES:
-        return name
-    lower = name.lower()
-    if "rag_sub" in lower or "child_chunk" in lower:
-        return "rag_parent_chunk_query"
-    if "rag_parent" in lower or "parent_chunk" in lower or "parent_doc" in lower:
-        return "rag_parent_chunk_query"
-    if "code_pull" in lower or ("pull" in lower and "git" in lower):
-        return "code_pull"
-    if "code_clone" in lower or "clone" in lower:
-        return "code_clone"
-    if "depend" in lower or "dependency" in lower:
-        return "dependency_log_query"
-    if "log" in lower:
-        return "log_query"
-    if any(token in lower for token in ("knowledge", "doc", "rag", "wiki")):
-        return "knowledge_lookup"
-    return ""
-
-
-def _normalize_tool_hints(value: Any) -> list[str]:
-    if isinstance(value, str):
-        rows = [value]
-    elif isinstance(value, list):
-        rows = [str(item).strip() for item in value if str(item).strip()]
-    else:
-        rows = []
-
-    hints: list[str] = []
-    for item in rows:
-        text = str(item or "").strip()
-        if not text:
-            continue
-        lowered = text.lower()
-        normalized = _TOOL_HINT_NAME_MAP.get(lowered, lowered)
-        if normalized and normalized not in hints:
-            hints.append(normalized)
-    return hints
-
-
-def _normalize_react_subtask_step(item: dict[str, Any]) -> PlanStep | None:
-    subtask = str(
-        item.get("subtask")
-        or item.get("task")
-        or item.get("step")
-        or item.get("title")
-        or ""
-    ).strip()
-    hypothesis = str(item.get("hypothesis") or item.get("reasoning") or item.get("why") or "").strip()
-    success_criteria = str(
-        item.get("success_criteria")
-        or item.get("done_when")
-        or item.get("expected_signal")
-        or ""
-    ).strip()
-    suggested_tools = _normalize_tool_hints(
-        item.get("suggested_tools")
-        or item.get("tool_candidates")
-        or item.get("preferred_tools")
-        or item.get("tool_hint")
-    )
-    if not subtask and not hypothesis and not success_criteria:
-        return None
-    return {
-        "action_type": "react_subtask",
-        "tool_name": None,
-        "params": {},
-        "subtask": subtask,
-        "hypothesis": hypothesis,
-        "success_criteria": success_criteria,
-        "suggested_tools": suggested_tools,
-    }
-
-
-def _tool_call_to_macro_subtask(item: dict[str, Any], tool_name: str) -> PlanStep:
-    params = dict(item.get("params") or {})
-    param_keywords = " ".join(
-        [
-            *[str(x) for x in _normalize_str_list(params.get("match_phrase_list"))],
-            *[str(x) for x in _normalize_str_list(params.get("match_list"))],
-            str(params.get("service_name") or ""),
-            str(params.get("query") or ""),
-        ]
-    ).strip()
-    keyword_suffix = f"（线索：{_clip_text(param_keywords, 80)}）" if param_keywords else ""
-
-    if tool_name == "dependency_log_query":
-        return {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": f"对依赖链路执行日志扩展检索，确认故障归属与传播路径{keyword_suffix}",
-            "hypothesis": "主服务异常由下游依赖返回异常、超时或业务拦截触发。",
-            "success_criteria": "拿到可关联同一链路的依赖侧错误证据（错误码/异常/返回原因）。",
-            "suggested_tools": ["dependency_log_query", "query_log"],
-        }
-    if tool_name == "log_query":
-        return {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": f"在主服务日志中检索失败链路并提取关键异常信号{keyword_suffix}",
-            "hypothesis": "主服务日志中可定位首个失败点并产出可复述证据。",
-            "success_criteria": "提取到 traceId/错误码/异常类名/失败返回中的至少一项。",
-            "suggested_tools": ["query_log"],
-        }
-    if tool_name == "knowledge_lookup":
-        return {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": "检索知识与历史经验，补充当前故障模式的解释与排查规则。",
-            "hypothesis": "历史案例中存在与当前现象相似的故障模式。",
-            "success_criteria": "获得可用于解释或约束下一步检索范围的规则性信息。",
-            "suggested_tools": ["knowledge_lookup"],
-        }
-    if tool_name in {"code_pull", "code_clone"}:
-        return {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": "读取相关代码实现，核对异常触发条件与返回逻辑。",
-            "hypothesis": "代码中存在与日志现象一致的抛错分支或拦截逻辑。",
-            "success_criteria": "形成“日志现象 ↔ 代码路径”的对应关系。",
-            "suggested_tools": ["fetch_code", "clone_code"],
-        }
-    if tool_name == "rag_parent_chunk_query":
-        return {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": "根据已命中的子 chunk 回查父文档 TopK，读取完整上下文后形成业务结论。",
-            "hypothesis": "完整父文档包含子 chunk 的上下文约束，能避免断章取义。",
-            "success_criteria": "形成“业务问题-规则依据-结论”的完整链路，并引用父文档路径。",
-            "suggested_tools": ["rag_parent_chunk_query"],
-        }
-    return {
-        "action_type": "react_subtask",
-        "tool_name": None,
-        "params": {},
-        "subtask": "执行下一轮证据收集并缩小根因范围。",
-        "hypothesis": "当前证据仍可通过补充检索进一步收敛。",
-        "success_criteria": "补充至少一条可用于路由下一步的有效证据。",
-        "suggested_tools": [],
-    }
-
-
-def _normalize_plan_steps(raw_steps: Any) -> list[PlanStep]:
-    rows = list(raw_steps or []) if isinstance(raw_steps, list) else []
-    result: list[PlanStep] = []
-    has_candidate_steps = False
-    for item in rows[:_MAX_PLAN_STEPS]:
-        if not isinstance(item, dict):
-            continue
-        has_candidate_steps = True
-        action_type = str(item.get("action_type") or "").strip()
-        if action_type == "merge_evidence":
-            result.append({"action_type": "merge_evidence", "tool_name": None, "params": {}})
-            continue
-        # 规划层只输出“做什么”的宏观步骤，不在此层固化调用参数。
-        react_step = _normalize_react_subtask_step(item)
-        if react_step:
-            result.append(react_step)
-            continue
-
-        tool_name = _map_tool_name(item.get("tool_name"))
-        if tool_name:
-            result.append(_tool_call_to_macro_subtask(item, tool_name))
-            continue
-
-    # 允许“按需不调工具”的计划：LLM 无步骤时，默认保留 merge_evidence 单步收口。
-    # 但若 LLM 给了候选步骤却全部无效，仍回退为空，交由上层走 fallback 规则计划。
-    if not result and not has_candidate_steps:
-        return [{"action_type": "merge_evidence", "tool_name": None, "params": {}}]
-    if not result:
+def _as_doc_rows(rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
         return []
-    if not result or str(result[-1].get("action_type")) != "merge_evidence":
-        result.append({"action_type": "merge_evidence", "tool_name": None, "params": {}})
+    result: list[dict[str, Any]] = []
+    for item in rows[:_MAX_DOCS]:
+        if isinstance(item, dict):
+            result.append(dict(item))
     return result
 
 
-def _normalize_str_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        text = value.strip()
-        return [text] if text else []
+def _summarize_docs(title: str, rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return f"【{title}】\n无"
+    lines = [f"【{title}】"]
+    for idx, item in enumerate(rows, start=1):
+        path = str(item.get("path") or "N/A").strip()
+        content = str(item.get("content") or item.get("text") or "").strip()
+        lines.append(f"{idx}. path={path} content={content}")
+    return "\n".join(lines)
+
+
+def _build_prompt_context(state: dict[str, Any]) -> dict[str, Any]:
+    structured = dict(state.get("structured_context") or {})
+    knowledge_context = dict(structured.get("knowledge_context") or state.get("knowledge_context") or {})
+    query_rewrite = dict(state.get("query_rewrite") or structured.get("query_rewrite") or {})
+    rejected = [str(item).strip() for item in list(state.get("rejected_hypothesis") or []) if str(item).strip()]
+
+    domain_docs = _as_doc_rows(knowledge_context.get("domain_docs"))
+    case_docs = _as_doc_rows(knowledge_context.get("case_docs"))
+    code_docs = _as_doc_rows(knowledge_context.get("code_docs"))
+
+    return {
+        "user_query": str(state.get("question") or "").strip(),
+        "normalized_query": str(query_rewrite.get("normalized_query") or "").strip(),
+        "keywords": ", ".join(str(item).strip() for item in list(query_rewrite.get("keywords") or []) if str(item).strip()),
+        "domain_knowledge": _summarize_docs("业务知识", domain_docs),
+        "case_knowledge": _summarize_docs("Case知识", case_docs),
+        "code_knowledge": _summarize_docs("代码知识", code_docs),
+        "rejected_hypothesis": "\n".join(f"- {item}" for item in rejected) if rejected else "- 无",
+        "replan_reason": str(state.get("replan_reason") or "").strip() or "无",
+    }
+
+
+def _parse_required_answers(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    answers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        field = ""
+        question = ""
+        required = True
+        if isinstance(item, str):
+            field = str(item).strip()
+            question = f"必须获取字段：{field}" if field else ""
+        elif isinstance(item, dict):
+            field = str(item.get("field") or item.get("name") or item.get("key") or "").strip()
+            question = str(item.get("question") or item.get("objective") or item.get("description") or "").strip()
+            required = bool(item.get("required", True))
+        if not field:
+            continue
+        lowered = field.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        answers.append(
+            {
+                "field": field,
+                "question": question or f"必须获取字段：{field}",
+                "required": required,
+            }
+        )
+    return answers
+
+
+def _derive_required_answers_from_query(state: dict[str, Any]) -> list[dict[str, Any]]:
+    query_rewrite = dict(state.get("query_rewrite") or {})
+    text = " ".join(
+        [
+            str(state.get("question") or ""),
+            str(query_rewrite.get("normalized_query") or ""),
+            " ".join(str(item) for item in list(query_rewrite.get("keywords") or [])),
+        ]
+    )
+    lowered_text = text.lower()
+    derived: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _append_field(field: str, question: str) -> None:
+        normalized = str(field or "").strip()
+        lowered = normalized.lower()
+        if not normalized or lowered in seen:
+            return
+        seen.add(lowered)
+        derived.append(
+            {
+                "field": normalized,
+                "question": question or f"给出 {normalized} 的明确取值",
+                "required": True,
+            }
+        )
+
+    for field, pattern in _REQUIRED_FIELD_PATTERNS.items():
+        if pattern.search(text):
+            _append_field(field, f"给出 {field} 的明确取值")
+
+    if any(hint in text for hint in _GENERIC_FIELD_HINTS) or any(hint in lowered_text for hint in _GENERIC_FIELD_HINTS):
+        tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", text)
+        for token in tokens:
+            lowered = token.lower()
+            if lowered.endswith(_GENERIC_FIELD_SUFFIXES) or "errorcode" in lowered:
+                _append_field(token, f"给出 {token} 的明确取值")
+
+    if ("错误码" in text or "error code" in lowered_text or "errorcode" in lowered_text) and not any(
+        str(item.get("field") or "").lower().endswith("code") for item in derived
+    ):
+        _append_field("errorCode", "给出失败返回中的错误码字段与取值")
+    if _IDENTITY_HINT_PATTERN.search(text):
+        _append_field("intercepted_passenger", "被拦截的乘机人是谁")
+        if re.search(r"(证件|证件号|idno|certno|identityno)", text, re.IGNORECASE):
+            _append_field("intercepted_passenger_id_no", "被拦截的乘机人证件号是什么")
+        if re.search(r"(姓名|name|哪位|是谁)", text, re.IGNORECASE):
+            _append_field("intercepted_passenger_name", "被拦截的乘机人姓名是谁")
+    return derived
+
+
+def _question_focus_categories(state: dict[str, Any]) -> set[str]:
+    query_rewrite = dict(state.get("query_rewrite") or {})
+    text = " ".join(
+        [
+            str(state.get("question") or ""),
+            str(query_rewrite.get("normalized_query") or ""),
+            " ".join(str(item) for item in list(query_rewrite.get("keywords") or [])),
+        ]
+    )
+    categories: set[str] = set()
+    if _IDENTITY_HINT_PATTERN.search(text):
+        categories.add("identity")
+    if _CODE_HINT_PATTERN.search(text):
+        categories.add("code")
+    if _STATUS_HINT_PATTERN.search(text):
+        categories.add("status")
+    if _TIME_HINT_PATTERN.search(text):
+        categories.add("time")
+    if _REASON_HINT_PATTERN.search(text):
+        categories.add("reason")
+    return categories
+
+
+def _required_answer_categories(item: dict[str, Any]) -> set[str]:
+    field = str(item.get("field") or "").strip()
+    question = str(item.get("question") or "").strip()
+    text = f"{field} {question}"
+    categories: set[str] = set()
+    if _IDENTITY_HINT_PATTERN.search(text):
+        categories.add("identity")
+    if _CODE_HINT_PATTERN.search(text):
+        categories.add("code")
+    if _STATUS_HINT_PATTERN.search(text):
+        categories.add("status")
+    if _TIME_HINT_PATTERN.search(text):
+        categories.add("time")
+    if _REASON_HINT_PATTERN.search(text):
+        categories.add("reason")
+    return categories
+
+
+def _is_direct_field_requested(state: dict[str, Any], field: str) -> bool:
+    if not field:
+        return False
+    query_rewrite = dict(state.get("query_rewrite") or {})
+    text = " ".join(
+        [
+            str(state.get("question") or ""),
+            str(query_rewrite.get("normalized_query") or ""),
+            " ".join(str(item) for item in list(query_rewrite.get("keywords") or [])),
+        ]
+    ).lower()
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(field).lower())
+    if not normalized:
+        return False
+    return normalized in re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text)
+
+
+def _filter_required_answers_by_question(required_answers: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
+    if not required_answers:
+        return []
+    focus = _question_focus_categories(state)
+    if not focus:
+        return required_answers
+
+    filtered: list[dict[str, Any]] = []
+    for item in required_answers:
+        row = dict(item or {})
+        field = str(row.get("field") or "").strip()
+        if not field:
+            continue
+        if _is_direct_field_requested(state, field):
+            filtered.append(row)
+            continue
+        categories = _required_answer_categories(row)
+        if categories & focus:
+            filtered.append(row)
+
+    if filtered:
+        return filtered
     return []
 
 
-def _has_non_empty_log_query_lists(params: dict[str, Any]) -> bool:
-    for key in _LOG_QUERY_LIST_PARAM_KEYS:
-        if _normalize_str_list(params.get(key)):
-            return True
-    return False
-
-
-def _validate_plan_steps_strict(plan_steps: list[PlanStep]) -> tuple[bool, str]:
-    for idx, step in enumerate(plan_steps, start=1):
-        if str(step.get("action_type")) != "tool_call":
-            continue
-        tool_name = str(step.get("tool_name") or "")
-        if tool_name not in _LOG_QUERY_TOOLS:
-            continue
-        params = dict(step.get("params") or {})
-        if not _has_non_empty_log_query_lists(params):
-            return False, f"step#{idx} {tool_name} missing match_phrase_list/match_list in params"
-    return True, ""
-
-
-def _build_time_from_yymmdd_hhmmss(yymmdd: str, hhmmss: str) -> dt.datetime | None:
-    if len(yymmdd) != 6 or len(hhmmss) != 6:
-        return None
+def _parse_plan(raw_output: str) -> tuple[str, list[str], list[dict[str, Any]]]:
     try:
-        year = 2000 + int(yymmdd[0:2])
-        month = int(yymmdd[2:4])
-        day = int(yymmdd[4:6])
-        hour = int(hhmmss[0:2])
-        minute = int(hhmmss[2:4])
-        second = int(hhmmss[4:6])
-        return dt.datetime(year, month, day, hour, minute, second, tzinfo=_LOCAL_TZ)
-    except ValueError:
-        return None
+        parsed = json.loads(raw_output)
+    except Exception:
+        return "", [], []
+    if not isinstance(parsed, dict):
+        return "", [], []
+
+    hypothesis = str(parsed.get("hypothesis") or "").strip()
+    goals_raw = parsed.get("investigation_goals")
+    goals = [str(item).strip() for item in list(goals_raw or []) if str(item).strip()] if isinstance(goals_raw, list) else []
+    required_answers = _parse_required_answers(parsed.get("required_answers"))
+    return hypothesis, goals, required_answers
 
 
-def _extract_event_time(user_query: str) -> dt.datetime | None:
-    text = str(user_query or "").strip()
-    if not text:
-        return None
-    for pattern in (_XEP_ORDER_PATTERN, _OPS_SLUGGER_PATTERN, _GENERIC_DT_PATTERN):
-        matched = pattern.search(text)
-        if not matched:
+def _build_minimal_goals_from_required_answers(required_answers: list[dict[str, Any]]) -> list[str]:
+    rows: list[str] = []
+    for item in required_answers:
+        if not bool(item.get("required", True)):
             continue
-        event_time = _build_time_from_yymmdd_hhmmss(str(matched.group(1)), str(matched.group(2)))
-        if event_time is not None:
-            return event_time
-    return None
-
-
-def _has_any_non_empty_value(mapping: dict[str, Any], keys: tuple[str, ...]) -> bool:
-    for key in keys:
-        value = mapping.get(key)
-        if value is not None and str(value).strip():
-            return True
-    return False
-
-
-def _ensure_structured_log_window(structured_context: dict[str, Any], user_query: str) -> dict[str, Any]:
-    context = dict(structured_context or {})
-    has_begin = _has_any_non_empty_value(context, ("begin_time", "beginTime", "start_time", "startTime"))
-    has_end = _has_any_non_empty_value(context, ("end_time", "endTime", "finish_time", "finishTime"))
-    if has_begin and has_end:
-        return context
-    event_time = _extract_event_time(user_query)
-    if event_time is None:
-        return context
-    if not has_begin:
-        context["begin_time"] = (event_time - dt.timedelta(hours=1)).isoformat()
-    if not has_end:
-        context["end_time"] = (event_time + dt.timedelta(hours=1)).isoformat()
-    return context
-
-
-def _pick_explicit_app_code(text: str) -> str:
-    matched = _APP_CODE_PATTERN.search(str(text or ""))
-    if not matched:
-        return ""
-    return str(matched.group(1) or "").lower()
-
-
-def _pick_explicit_logname(candidates: list[str]) -> str:
-    merged = " ".join(str(item or "") for item in candidates).lower()
-    for log_name in _LOG_FILE_TO_APP_CODE:
-        if log_name in merged:
-            return log_name
-    return ""
-
-
-def _normalize_log_params(
-    *,
-    tool_name: str,
-    params: dict[str, Any],
-    user_query: str,
-    event_time: dt.datetime | None,
-) -> dict[str, Any]:
-    normalized = dict(params or {})
-    match_phrase_list = _normalize_str_list(normalized.get("match_phrase_list"))
-    match_list = _normalize_str_list(normalized.get("match_list"))
-    app_code = str(
-        normalized.get("app_code")
-        or normalized.get("appCode")
-        or ""
-    ).strip().lower()
-    logname = str(normalized.get("logname") or "").strip().lower()
-
-    keyword_text = " ".join([*match_phrase_list, *match_list]).strip()
-    explicit_app = _pick_explicit_app_code(" ".join([user_query, keyword_text, logname]))
-    explicit_log = _pick_explicit_logname([user_query, keyword_text, logname])
-
-    if not app_code and explicit_app:
-        app_code = explicit_app
-    if not logname and explicit_log:
-        logname = explicit_log
-    if not app_code and logname:
-        app_code = _LOG_FILE_TO_APP_CODE.get(logname, "")
-    if not app_code:
-        app_code = "f_tts_trade_core" if tool_name == "dependency_log_query" else "f_tts_trade_order"
-    if not logname:
-        logname = _APP_CODE_TO_BUSINESS_LOG.get(app_code, "ttsorder.log")
-
-    normalized["app_code"] = app_code
-    normalized["logname"] = logname
-
-    if not match_phrase_list and not match_list:
-        trace_hits = _TRACE_ID_PATTERN.findall(user_query)
-        if trace_hits:
-            match_phrase_list = [str(trace_hits[0]).strip()]
-    normalized["match_phrase_list"] = match_phrase_list
-    normalized["match_list"] = match_list
-
-    has_begin = bool(str(normalized.get("begin_time") or normalized.get("beginTime") or "").strip())
-    has_end = bool(str(normalized.get("end_time") or normalized.get("endTime") or "").strip())
-    if event_time is not None and (not has_begin or not has_end):
-        begin_time = (event_time - dt.timedelta(hours=1)).isoformat()
-        end_time = (event_time + dt.timedelta(hours=1)).isoformat()
-        normalized.setdefault("begin_time", begin_time)
-        normalized.setdefault("end_time", end_time)
-    return normalized
-
-
-def _is_placeholder_git_url(value: Any) -> bool:
-    text = str(value or "").strip().lower()
-    if not text:
-        return False
-    placeholder_tokens = (
-        "待补充",
-        "todo",
-        "to be filled",
-        "tbd",
-        "placeholder",
-    )
-    return any(token in text for token in placeholder_tokens)
-
-
-def _pick_primary_app_code_from_log_steps(plan_steps: list[PlanStep]) -> str:
-    for item in list(plan_steps or []):
-        if str(item.get("action_type") or "") != "tool_call":
+        field = str(item.get("field") or "").strip()
+        question = str(item.get("question") or "").strip()
+        if not field:
             continue
-        if str(item.get("tool_name") or "") not in _LOG_QUERY_TOOLS:
-            continue
-        params = dict(item.get("params") or {})
-        app_code = str(params.get("app_code") or "").strip().lower()
-        if app_code:
-            return app_code
-    return "f_tts_trade_order"
+        if question:
+            rows.append(f"获取并确认字段 {field}：{question}")
+        else:
+            rows.append(f"获取并确认字段 {field} 的明确取值")
+    if rows:
+        return rows
 
-
-def _normalize_existing_code_steps(
-    *,
-    plan_steps: list[dict[str, Any]],
-    app_code: str,
-    structured_context: dict[str, Any],
-) -> list[dict[str, Any]]:
-    context_git_url = str(
-        structured_context.get("git_url")
-        or dict(structured_context.get("code_repo") or {}).get("git_url")
-        or ""
-    ).strip()
-    for item in plan_steps:
-        if str(item.get("action_type") or "") != "tool_call":
-            continue
-        if str(item.get("tool_name") or "") not in _CODE_QUERY_TOOLS:
-            continue
-        params = dict(item.get("params") or {})
-        step_app_code = str(params.get("app_code") or "").strip().lower() or app_code
-        params["app_code"] = step_app_code
-        params["repo_name"] = str(params.get("repo_name") or "").strip() or step_app_code
-
-        git_url = str(params.get("git_url") or "").strip()
-        if _is_placeholder_git_url(git_url):
-            params.pop("git_url", None)
-            git_url = ""
-        if not git_url and context_git_url:
-            params["git_url"] = context_git_url
-        item["params"] = params
-    return plan_steps
-
-
-def _enrich_plan_steps_for_log_queries(plan_steps: list[PlanStep], user_query: str) -> list[PlanStep]:
-    event_time = _extract_event_time(user_query)
-    enriched: list[PlanStep] = []
-    for step in list(plan_steps or []):
-        row = dict(step or {})
-        if str(row.get("action_type") or "") != "tool_call":
-            enriched.append(row)
-            continue
-        tool_name = str(row.get("tool_name") or "")
-        if tool_name not in _LOG_QUERY_TOOLS:
-            enriched.append(row)
-            continue
-        params = dict(row.get("params") or {})
-        row["params"] = _normalize_log_params(
-            tool_name=tool_name,
-            params=params,
-            user_query=user_query,
-            event_time=event_time,
-        )
-        enriched.append(row)
-    return enriched
-
-
-def _ensure_code_step_for_log_queries(
-    *,
-    plan_steps: list[PlanStep],
-    structured_context: dict[str, Any],
-) -> list[PlanStep]:
-    """规范化已有代码步骤，不再因日志步骤强制插入代码步骤。"""
-    rows = [dict(item or {}) for item in list(plan_steps or [])]
-    has_code = any(
-        str(item.get("action_type") or "") == "tool_call"
-        and str(item.get("tool_name") or "") in _CODE_QUERY_TOOLS
-        for item in rows
-    )
-    if has_code:
-        app_code = _pick_primary_app_code_from_log_steps(rows)
-        return _normalize_existing_code_steps(
-            plan_steps=rows,
-            app_code=app_code,
-            structured_context=structured_context,
-        )
+    # 兜底：当 required 标记为空时，仍尽量按字段拆分。
+    for item in required_answers:
+        field = str(item.get("field") or "").strip()
+        if field:
+            rows.append(f"获取并确认字段 {field} 的明确取值")
     return rows
 
 
-def _build_business_consult_base_steps() -> list[PlanStep]:
-    return [
-        {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": "直接查询 RAG 父文档 TopK（内部自动完成子 chunk 排序）并形成业务结论。",
-            "hypothesis": "父文档完整上下文可覆盖业务规则、模块职责与流程边界。",
-            "success_criteria": "输出“结论 + 文档依据 + 适用边界”的可复查回答。",
-            "suggested_tools": ["rag_parent_chunk_query"],
-        },
-        {"action_type": "merge_evidence", "tool_name": None, "params": {}},
+def _normalize_goals_with_required_answers(goals: list[str], required_answers: list[dict[str, Any]]) -> list[str]:
+    normalized_goals = [str(item).strip() for item in list(goals or []) if str(item).strip()]
+    required_fields = [
+        str(item.get("field") or "").strip()
+        for item in required_answers
+        if bool(item.get("required", True)) and str(item.get("field") or "").strip()
     ]
 
+    if len(required_fields) < 2:
+        return normalized_goals
 
-def _step_suggests_tool(step: dict[str, Any], tool_name: str) -> bool:
-    mapped_tool_name = _map_tool_name(step.get("tool_name"))
-    if mapped_tool_name == tool_name:
-        return True
-    hints = _normalize_tool_hints(step.get("suggested_tools") or step.get("tool_candidates"))
-    return tool_name in hints
+    lowered_fields = [field.lower() for field in required_fields]
 
+    def _goal_field_count(goal: str) -> int:
+        lowered_goal = str(goal or "").lower()
+        return sum(1 for field in lowered_fields if field in lowered_goal)
 
-def _enforce_business_rag_steps(plan_steps: list[PlanStep]) -> list[PlanStep]:
-    default_steps = _build_business_consult_base_steps()
-    if not plan_steps:
-        return default_steps
-
-    rows = [dict(item or {}) for item in list(plan_steps or []) if isinstance(item, dict)]
-    non_merge = [row for row in rows if str(row.get("action_type") or "") != "merge_evidence"]
-    if not non_merge:
-        return default_steps
-
-    parent_index = next((idx for idx, row in enumerate(non_merge) if _step_suggests_tool(row, "rag_parent_chunk_query")), -1)
-    parent_step = dict(non_merge[parent_index]) if parent_index >= 0 else dict(default_steps[0])
-    retained_steps = [
-        dict(row)
-        for idx, row in enumerate(non_merge)
-        if idx != parent_index
-    ]
-    normalized = [parent_step, *retained_steps]
-    if len(normalized) >= _MAX_PLAN_STEPS:
-        normalized = normalized[: max(1, _MAX_PLAN_STEPS - 1)]
-    normalized.append({"action_type": "merge_evidence", "tool_name": None, "params": {}})
-    return normalized
-
-
-def _fallback_plan_steps(intent_type: str, replan_count: int) -> list[PlanStep]:
-    if replan_count > 0:
-        return [
-            {
-                "action_type": "react_subtask",
-                "tool_name": None,
-                "params": {},
-                "subtask": "复查主服务失败链路，补充首个失败事件证据。",
-                "hypothesis": "重规划后仍可在主服务日志中收敛到更明确的失败点。",
-                "success_criteria": "得到至少一条可复用的失败证据（错误码/异常/失败返回）。",
-                "suggested_tools": ["query_log"],
-            },
-            {
-                "action_type": "react_subtask",
-                "tool_name": None,
-                "params": {},
-                "subtask": "对依赖链路进行交叉验证，确认故障归属。",
-                "hypothesis": "失败来自依赖侧拒绝或调用链异常传播。",
-                "success_criteria": "形成调用方与依赖方一致的证据链。",
-                "suggested_tools": ["dependency_log_query", "query_log"],
-            },
-            {"action_type": "merge_evidence", "tool_name": None, "params": {}},
-        ]
-    if intent_type == "OPS_ANALYSIS":
-        return [
-            {
-                "action_type": "react_subtask",
-                "tool_name": None,
-                "params": {},
-                "subtask": "先在主服务日志检索失败链路，提取关键线索。",
-                "hypothesis": "主服务日志中存在可定位故障的直接证据。",
-                "success_criteria": "提取到 traceId/异常/错误码/失败返回中的至少一项。",
-                "suggested_tools": ["query_log"],
-            },
-            {
-                "action_type": "react_subtask",
-                "tool_name": None,
-                "params": {},
-                "subtask": "扩展到依赖日志确认根因归属与传播路径。",
-                "hypothesis": "故障可能由依赖异常或业务拦截导致。",
-                "success_criteria": "拿到可关联同一链路的依赖侧证据。",
-                "suggested_tools": ["dependency_log_query", "query_log"],
-            },
-            {"action_type": "merge_evidence", "tool_name": None, "params": {}},
-        ]
-    if intent_type == _BUSINESS_CONSULT_INTENT:
-        return _build_business_consult_base_steps()
-    if intent_type in {"GENERAL_QA", "ORDER_INFO_QUERY"}:
-        return [
-            {
-                "action_type": "react_subtask",
-                "tool_name": None,
-                "params": {},
-                "subtask": "检索知识与规则，回答当前问题并给出可验证依据。",
-                "hypothesis": "知识库中已有可直接回答当前问题的规则或案例。",
-                "success_criteria": "给出清晰回答并附带可复查的依据来源。",
-                "suggested_tools": ["knowledge_lookup"],
-            },
-            {"action_type": "merge_evidence", "tool_name": None, "params": {}},
-        ]
-    return [
-        {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": "先补充知识背景，识别候选排查方向。",
-            "hypothesis": "先验规则可缩小日志检索范围。",
-            "success_criteria": "形成至少一个可执行的排查方向。",
-            "suggested_tools": ["knowledge_lookup"],
-        },
-        {
-            "action_type": "react_subtask",
-            "tool_name": None,
-            "params": {},
-            "subtask": "在主服务日志验证候选方向并补充证据。",
-            "hypothesis": "日志中可验证知识侧推断是否成立。",
-            "success_criteria": "得到支持或反驳该方向的日志证据。",
-            "suggested_tools": ["query_log"],
-        },
-        {"action_type": "merge_evidence", "tool_name": None, "params": {}},
-    ]
-
-
-def _plan_with_llm(context: dict[str, Any], *, intent_type: str) -> tuple[list[PlanStep], dict[str, Any]]:
-    system_prompt_file, user_prompt_file = _resolve_planner_prompt_files(intent_type)
-    system_prompt = load_prompt(system_prompt_file, default="")
-    user_prompt = _build_planner_user_prompt(context, prompt_file=user_prompt_file)
-    if not user_prompt:
-        _LOGGER.warning("planner prompt 缺失: %s", user_prompt_file)
-        return [], {
-            "raw_output": "",
-            "parse_ok": False,
-            "system_prompt_file": system_prompt_file,
-            "user_prompt_file": user_prompt_file,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-        }
-    raw_output = chat_with_llm(question=user_prompt, system_prompt=system_prompt)
-    parsed = _parse_json_object(raw_output)
-    if not parsed:
-        return [], {
-            "raw_output": raw_output,
-            "parse_ok": False,
-            "system_prompt_file": system_prompt_file,
-            "user_prompt_file": user_prompt_file,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "parsed_output": {},
-        }
-    steps = _normalize_plan_steps(parsed.get("plan_steps"))
-    if not steps:
-        _LOGGER.warning("planner LLM 计划为空或不可用")
-        return [], {
-            "raw_output": raw_output,
-            "parse_ok": False,
-            "system_prompt_file": system_prompt_file,
-            "user_prompt_file": user_prompt_file,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "parsed_output": parsed,
-            "validation_error": "empty_or_invalid_plan_steps",
-        }
-    plan_meta = {
-        "raw_output": raw_output,
-        "parse_ok": True,
-        "system_prompt_file": system_prompt_file,
-        "user_prompt_file": user_prompt_file,
-        "system_prompt": system_prompt,
-        "user_prompt": user_prompt,
-        "parsed_output": parsed,
-        "problem_analysis": str(parsed.get("problem_analysis") or "").strip(),
-        "solution_steps": list(parsed.get("solution_steps") or []),
-        "validation": str(parsed.get("validation") or "").strip(),
-        "references": list(parsed.get("references") or []),
-        "validation_error": "",
+    has_mixed_goal = any(_goal_field_count(goal) > 1 for goal in normalized_goals)
+    covered_fields = {
+        field
+        for field, lowered in zip(required_fields, lowered_fields, strict=False)
+        if any(lowered in str(goal or "").lower() for goal in normalized_goals)
     }
-    return steps, plan_meta
+    missing_fields = [field for field in required_fields if field not in covered_fields]
+
+    # 多字段场景下，目标数不足、出现混合目标、或字段未覆盖时，强制拆成最小执行单元。
+    if len(normalized_goals) < len(required_fields) or has_mixed_goal or missing_fields:
+        split_goals = _build_minimal_goals_from_required_answers(required_answers)
+        if split_goals:
+            return split_goals
+    return normalized_goals
+
+
+def _align_goals_with_required_answers(goals: list[str], required_answers: list[dict[str, Any]]) -> list[str]:
+    normalized_goals = [str(item).strip() for item in list(goals or []) if str(item).strip()]
+    required_fields = [
+        str(item.get("field") or "").strip()
+        for item in list(required_answers or [])
+        if bool(item.get("required", True)) and str(item.get("field") or "").strip()
+    ]
+    if not normalized_goals or not required_fields:
+        return normalized_goals
+
+    lowered_fields = [field.lower() for field in required_fields]
+    matched_goals = [
+        goal
+        for goal in normalized_goals
+        if any(field in str(goal).lower() for field in lowered_fields)
+    ]
+    if len(required_fields) == 1 and matched_goals:
+        return matched_goals[:1]
+    if matched_goals and len(matched_goals) >= len(required_fields):
+        return matched_goals[: len(required_fields)]
+    if len(normalized_goals) > len(required_fields):
+        return normalized_goals[: len(required_fields)]
+    return normalized_goals
+
+
+def _fallback_plan(state: dict[str, Any]) -> tuple[str, list[str], list[dict[str, Any]]]:
+    question = str(state.get("question") or "问题定位").strip()
+    hypothesis = f"{_clip(question, 40)}相关链路存在异常"
+    goals = [
+        "匹配历史排障案例",
+        "确认异常发生在哪个服务",
+        "定位触发异常的代码逻辑",
+    ]
+    required_answers = _derive_required_answers_from_query(state)
+    return hypothesis, goals, required_answers
+
+
+def _avoid_rejected(hypothesis: str, rejected_hypothesis: list[str]) -> str:
+    rejected_set = {item.strip() for item in rejected_hypothesis if item.strip()}
+    if not hypothesis:
+        return hypothesis
+    if hypothesis not in rejected_set:
+        return hypothesis
+    return f"排除已证伪方向后，重新定位：{hypothesis}"
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
-    """生成或重生成排障计划。
-
-    入参：
-    - payload: AgentState，至少包含 question、intent_type、replan_count，并携带 rag_retrieve 结果。
-
-    返参：
-    - AgentState: 写入 plan_steps/current_step_index，并路由到 executor。
-    """
     state: AgentState = dict(payload)
-    question = str(state.get("question") or "").strip()
-    intent_type = str(state.get("intent_type") or "UNKNOWN")
-    replan_count = _as_int(state.get("replan_count"), 0)
+    context = _build_prompt_context(state)
+    knowledge_context = dict(state.get("knowledge_context") or {})
+    rejected = [str(item).strip() for item in list(state.get("rejected_hypothesis") or []) if str(item).strip()]
     _LOGGER.info(
-        "planner 开始制定计划: intent=%s replan=%d question=%s",
-        intent_type,
-        replan_count,
-        _clip_text(question, 120),
-    )
-    # 强制步骤：每次规划前先读取 src/skills 下全部 skill 文件。
-    skills = _load_all_skills()
-    context_for_llm = _prepare_context_for_llm(state, skills)
-    llm_plan_steps, llm_plan_meta = _plan_with_llm(context_for_llm, intent_type=intent_type)
-
-    if llm_plan_steps:
-        plan_steps = llm_plan_steps
-        _LOGGER.info("planner LLM 规划成功: steps=%d", len(plan_steps))
-    else:
-        plan_steps = _fallback_plan_steps(intent_type=intent_type, replan_count=replan_count)
-        _LOGGER.info("planner 使用规则兜底计划: steps=%d intent=%s replan=%d", len(plan_steps), intent_type, replan_count)
-    if intent_type == _BUSINESS_CONSULT_INTENT:
-        plan_steps = _enforce_business_rag_steps(plan_steps)
-        _LOGGER.info("planner 业务咨询计划已注入 RAG 子/父 chunk 前置步骤: steps=%d", len(plan_steps))
-    structured_context = _ensure_structured_log_window(
-        dict(state.get("structured_context") or {}),
-        str(context_for_llm.get("user_query") or question),
+        "planner start query=%s rejected_count=%d replan_reason=%s domain_docs=%d case_docs=%d code_docs=%d",
+        _clip(context.get("user_query"), 120),
+        len(rejected),
+        _clip(context.get("replan_reason"), 120),
+        len(list(knowledge_context.get("domain_docs") or [])),
+        len(list(knowledge_context.get("case_docs") or [])),
+        len(list(knowledge_context.get("code_docs") or [])),
     )
 
-    previous_plan = list(state.get("current_plan") or state.get("plan_steps") or [])
-    if not previous_plan or replan_count > 0:
-        state["current_step_index"] = 0
+    system_prompt = load_prompt("planner_system_prompt.txt", default="")
+    user_prompt = render_prompt(
+        "planner_user_prompt.txt",
+        user_query=context["user_query"],
+        normalized_query=context["normalized_query"],
+        keywords=context["keywords"],
+        domain_knowledge=context["domain_knowledge"],
+        case_knowledge=context["case_knowledge"],
+        code_knowledge=context["code_knowledge"],
+        rejected_hypothesis=context["rejected_hypothesis"],
+        replan_reason=context["replan_reason"],
+    )
+    raw_output = chat_with_llm(question=user_prompt, system_prompt=system_prompt)
 
-    llm_request = {
-        "system_prompt_file": str(llm_plan_meta.get("system_prompt_file") or ""),
-        "user_prompt_file": str(llm_plan_meta.get("user_prompt_file") or ""),
-        "system_prompt": str(llm_plan_meta.get("system_prompt") or ""),
-        "user_prompt": str(llm_plan_meta.get("user_prompt") or ""),
-        "request_context": context_for_llm,
+    hypothesis, goals, required_answers = _parse_plan(raw_output)
+    if not hypothesis or not goals:
+        hypothesis, goals, required_answers = _fallback_plan(state)
+    if not required_answers:
+        required_answers = _derive_required_answers_from_query(state)
+    required_answers = _filter_required_answers_by_question(required_answers, state)
+    if not required_answers:
+        required_answers = _derive_required_answers_from_query(state)
+    goals = _normalize_goals_with_required_answers(goals, required_answers)
+    goals = _align_goals_with_required_answers(goals, required_answers)
+    if not goals:
+        goals = _build_minimal_goals_from_required_answers(required_answers)
+    if not goals:
+        hypothesis, goals, required_answers = _fallback_plan(state)
+
+    hypothesis = _avoid_rejected(hypothesis, rejected)
+
+    plan = {
+        "hypothesis": hypothesis,
+        "investigation_goals": goals,
+        "required_answers": required_answers,
     }
-    llm_response = {
-        "raw_output": str(llm_plan_meta.get("raw_output") or ""),
-        "parsed_output": dict(llm_plan_meta.get("parsed_output") or {}),
-        "parse_ok": bool(llm_plan_meta.get("parse_ok")),
-        "validation_error": str(llm_plan_meta.get("validation_error") or ""),
+
+    execution = dict(state.get("execution") or {})
+    execution["goal_index"] = 0
+    execution["objective_retry_count"] = 0
+    execution["insufficient_round_count"] = 0
+    execution["evidence_graph"] = {
+        "hypothesis": hypothesis,
+        "evidence": [],
+        "supported": None,
     }
-    program_plan = {
-        "plan_steps": plan_steps,
-        "plan_source": "llm" if llm_plan_steps else "fallback",
-    }
-    state["structured_context"] = {
-        **structured_context,
-        "user_query": str(context_for_llm.get("user_query") or ""),
-        "skills_catalog": list(context_for_llm.get("skills_catalog") or []),
-        "skills_count": _as_int(context_for_llm.get("skills_count"), 0),
-        "planner_context_for_llm": {
-            "skills_context": str(context_for_llm.get("skills_context") or ""),
-            "log_diagnosis_summary": str(context_for_llm.get("log_diagnosis_summary") or ""),
-            "rag_sub_chunks_summary": str(context_for_llm.get("rag_sub_chunks_summary") or ""),
-            "rag_solutions_summary": str(context_for_llm.get("rag_solutions_summary") or ""),
-            "full_docs_references": str(context_for_llm.get("full_docs_references") or ""),
+
+    structured = dict(state.get("structured_context") or {})
+    structured["planner_plan"] = dict(plan)
+    structured["planner_llm_trace"] = {
+        "llm_request": {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
         },
-        "planner_plan": {
-            "problem_analysis": str(llm_plan_meta.get("problem_analysis") or ""),
-            "solution_steps": list(llm_plan_meta.get("solution_steps") or []),
-            "validation": str(llm_plan_meta.get("validation") or ""),
-            "references": list(llm_plan_meta.get("references") or []),
-            "parse_ok": bool(llm_plan_meta.get("parse_ok")),
-        },
-        "planner_llm_trace": {
-            "llm_request": llm_request,
-            "llm_response": llm_response,
-            "program_plan": program_plan,
+        "llm_response": {
+            "raw_output": raw_output,
+            "parse_ok": bool(hypothesis and goals),
         },
     }
-    _LOGGER.info("planner llm_request=%s", json.dumps(llm_request, ensure_ascii=False))
-    _LOGGER.info("planner llm_response=%s", json.dumps(llm_response, ensure_ascii=False))
-    _LOGGER.info("planner program_plan=%s", json.dumps(program_plan, ensure_ascii=False))
+
+    state["plan"] = plan
+    state["execution"] = execution
+    state["structured_context"] = structured
+    state["route"] = "reactor"
     _LOGGER.info(
-        "planner 上下文摘要: skills=%d rag_docs=%d rag_parent_docs=%d parse_ok=%s",
-        _as_int(context_for_llm.get("skills_count"), 0),
-        len(list(state.get("rag_docs") or [])),
-        len(list(state.get("rag_parent_docs") or [])),
-        bool(llm_plan_meta.get("parse_ok")),
+        "planner finished hypothesis=%s goals=%d required_answers=%d rejected_count=%d",
+        _clip(hypothesis, 200),
+        len(goals),
+        len(required_answers),
+        len(rejected),
     )
-
-    state["plan_steps"] = plan_steps
-    state["current_plan"] = [dict(item) for item in plan_steps]
-    if not state.get("original_plan") or replan_count > 0:
-        state["original_plan"] = [dict(item) for item in plan_steps]
-    state["needs_adjustment"] = False
-    state["adjustment_type"] = ""
-    state["proposed_changes"] = {}
-    state["pending_insertions"] = []
-    state.setdefault("adjustment_history", [])
-    state["route"] = "executor"
+    for idx, goal in enumerate(goals, start=1):
+        _LOGGER.info("planner goal[%d]=%s", idx, _clip(goal, 240))
+    for idx, item in enumerate(required_answers, start=1):
+        _LOGGER.info("planner required_answer[%d]=field:%s required:%s question:%s", idx, str(item.get("field") or ""), bool(item.get("required")), _clip(item.get("question"), 200))
     return dict(state)

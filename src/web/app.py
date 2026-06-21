@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 
 from runtime_logging import bind_request_id, build_request_file_handler, logs_dir, reset_request_id
 from web.routes.analyze import ANALYZE_PATH, router as analyze_router
+from web.routes.admin import router as admin_router
 
 _REQUEST_LOGGER = logging.getLogger("aiops.request")
 
@@ -195,4 +196,5 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(analyze_router)
+    app.include_router(admin_router)
     return app

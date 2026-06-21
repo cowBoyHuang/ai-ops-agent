@@ -8,21 +8,31 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import logging
+import re
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
-from llm.llm import recognize_intent
+from llm.llm import recognize_intent, render_prompt
 
 _LOGGER = logging.getLogger(__name__)
 _INTENT_MAP = {
     "业务咨询": "SYSTEM_LOGIC_CONSULT",
-    "线上问题咨询": "OPS_ANALYSIS",
-    "订单信息查询": "ORDER_INFO_QUERY",
-    "未知意图": "UNKNOWN_INTENT",
+    "线上问题排查": "OPS_ANALYSIS",
 }
-_SCORE_INTENT_LABELS = ("业务咨询", "线上问题咨询", "订单信息查询")
+_SCORE_INTENT_LABELS = ("业务咨询", "线上问题排查")
 _UNKNOWN_SCORE_THRESHOLD = 0.5
+_TZ_SHANGHAI = dt.timezone(dt.timedelta(hours=8))
+_TRACE_ID_PATTERN = re.compile(r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_supply_open_api_[a-z0-9_.\-]+)", re.IGNORECASE)
+_TRACE_KEY_PATTERN = re.compile(r"\btrace[_-]?id\b\s*[:=：]?\s*([A-Za-z0-9_.:\-]{4,128})", re.IGNORECASE)
+_ORDER_TOKEN_PATTERN = re.compile(r"\b(?:xep|fod|hpv)\d{8,}\b", re.IGNORECASE)
+_ORDER_KEY_PATTERN = re.compile(
+    r"(?:\border[_-]?(?:id|no)\b|订单号|订单id|订单ID|子单号)\s*[:：=]?\s*([A-Za-z0-9_.:\-]{4,128})",
+    re.IGNORECASE,
+)
+_YYMMDD_HHMMSS_PATTERN = re.compile(r"(?<!\d)(\d{6})[\s_.-]+(\d{6})(?!\d)")
 
 
 # 方法注释（业务）:
@@ -55,7 +65,7 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 # - 出参：`str`=内部意图类型；未命中时返回 `UNKNOWN`。
 # - 逻辑：使用 `_INTENT_MAP` 做字典映射并兜底默认值。
 def _to_internal_intent(best_intent: str) -> str:
-    return _INTENT_MAP.get(str(best_intent or "").strip(), "UNKNOWN")
+    return _INTENT_MAP.get(str(best_intent or "").strip(), "SYSTEM_LOGIC_CONSULT")
 
 
 # 方法注释（业务）:
@@ -119,10 +129,129 @@ def _build_intent_history_prompt(question: str, history_rows: list[dict[str, Any
                 "请重新分析，考虑以下可能性：",
                 "1. 问题可能表述不清，尝试从不同角度理解",
                 "2. 可能是多意图问题，选择最主要的一个",
-                "3. 如果实在无法判断，选择最保守的意图（订单信息查询）",
+                "3. 如果实在无法判断，选择最保守的意图（业务咨询）",
             ]
         )
     return "\n".join(lines)
+
+
+def _build_prompt_with_recent_history(
+    question: str,
+    history_rows: list[str],
+    *,
+    trace_id: str = "",
+    order_id: str = "",
+    begin_time: str = "",
+    end_time: str = "",
+) -> str:
+    base_prompt = render_prompt("intent_recognition_user_prompt.txt", question=question)
+    if not str(base_prompt or "").strip():
+        base_prompt = f'用户问题: "{question}"'
+    rows = [str(item).strip() for item in list(history_rows or []) if str(item).strip()]
+    lines = [base_prompt]
+    if trace_id or order_id or begin_time or end_time:
+        lines.extend(
+            [
+                "",
+                "【会话上下文锚点】",
+                f"- trace_id: {trace_id or '无'}",
+                f"- order_id: {order_id or '无'}",
+                f"- begin_time: {begin_time or '无'}",
+                f"- end_time: {end_time or '无'}",
+            ]
+        )
+    if not rows:
+        return "\n".join(lines)
+    lines.extend(["", "【最近历史记录】"])
+    for idx, row in enumerate(rows[-3:], 1):
+        lines.append(f"{idx}. {row}")
+    lines.append("请结合以上历史理解当前问题，但最终只对“当前用户问题”做意图分类。")
+    return "\n".join(lines)
+
+
+def _to_iso_time(yymmdd: str, hhmmss: str) -> str:
+    year = 2000 + int(yymmdd[0:2])
+    month = int(yymmdd[2:4])
+    day = int(yymmdd[4:6])
+    hour = int(hhmmss[0:2])
+    minute = int(hhmmss[2:4])
+    second = int(hhmmss[4:6])
+    return dt.datetime(year, month, day, hour, minute, second, tzinfo=_TZ_SHANGHAI).isoformat()
+
+
+def _collect_intent_texts(state: dict[str, Any], question: str, conversation_context: list[str]) -> list[str]:
+    texts: list[str] = [str(question or "").strip()]
+    texts.extend(str(item).strip() for item in list(conversation_context or []) if str(item).strip())
+
+    raw_context = dict(state.get("context") or {})
+    raw_message_context = raw_context.get("message_context")
+    rounds: list[Any] = []
+    if hasattr(raw_message_context, "rounds"):
+        rounds = list(getattr(raw_message_context, "rounds") or [])
+    elif isinstance(raw_message_context, dict):
+        rounds = list(raw_message_context.get("rounds") or [])
+    for row in rounds[-4:]:
+        item = dict(row or {}) if isinstance(row, dict) else {
+            "message": getattr(row, "message", ""),
+            "aiResponse": getattr(row, "aiResponse", ""),
+            "toolsContext": getattr(row, "toolsContext", {}),
+        }
+        for value in (
+            item.get("message"),
+            item.get("aiResponse"),
+            json.dumps(dict(item.get("toolsContext") or {}), ensure_ascii=False, default=str),
+        ):
+            text = str(value or "").strip()
+            if text:
+                texts.append(text)
+    return texts
+
+
+def _extract_intent_context(state: dict[str, Any], question: str, conversation_context: list[str]) -> dict[str, str]:
+    trace_id = ""
+    order_id = ""
+    begin_time = ""
+    end_time = ""
+    texts = _collect_intent_texts(state, question, conversation_context)
+
+    for text in texts:
+        if not trace_id:
+            match = _TRACE_ID_PATTERN.search(text)
+            if match:
+                trace_id = str(match.group(0) or "").strip()
+        if not trace_id:
+            match = _TRACE_KEY_PATTERN.search(text)
+            if match:
+                trace_id = str(match.group(1) or "").strip()
+
+        if not order_id:
+            match = _ORDER_TOKEN_PATTERN.search(text)
+            if match:
+                order_id = str(match.group(0) or "").strip()
+        if not order_id:
+            match = _ORDER_KEY_PATTERN.search(text)
+            if match:
+                order_id = str(match.group(1) or "").strip()
+
+        if not begin_time or not end_time:
+            matched = _YYMMDD_HHMMSS_PATTERN.search(text)
+            if matched:
+                try:
+                    event_time = dt.datetime.fromisoformat(_to_iso_time(str(matched.group(1)), str(matched.group(2))))
+                    begin_time = (event_time - dt.timedelta(hours=1)).isoformat()
+                    end_time = (event_time + dt.timedelta(hours=1)).isoformat()
+                except ValueError:
+                    pass
+
+        if trace_id and order_id and begin_time and end_time:
+            break
+
+    return {
+        "trace_id": trace_id,
+        "order_id": order_id,
+        "begin_time": begin_time,
+        "end_time": end_time,
+    }
 
 
 # 方法注释（业务）:
@@ -141,7 +270,21 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     retry_count = _to_int(state.get("intent_retry_count"), 0)
     history = state.get("conversation_context") or structured_context.get("recent_messages") or []
     conversation_context = [str(item) for item in history if str(item).strip()]
+    extracted_context = _extract_intent_context(state, question, conversation_context)
+    trace_id = str(structured_context.get("trace_id") or extracted_context.get("trace_id") or "").strip()
+    order_id = str(structured_context.get("order_id") or extracted_context.get("order_id") or "").strip()
+    begin_time = str(structured_context.get("begin_time") or extracted_context.get("begin_time") or "").strip()
+    end_time = str(structured_context.get("end_time") or extracted_context.get("end_time") or "").strip()
     intent_history_prompt = str(state.get("intent_history_prompt") or "").strip()
+    if not intent_history_prompt:
+        intent_history_prompt = _build_prompt_with_recent_history(
+            question,
+            conversation_context,
+            trace_id=trace_id,
+            order_id=order_id,
+            begin_time=begin_time,
+            end_time=end_time,
+        )
 
     # 调用大模型
     intent_result = recognize_intent(
@@ -181,19 +324,22 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             **structured_context,
             "question": str(state.get("question") or structured_context.get("question") or ""),
             "conversation_context": conversation_context,
-            "order_id": str(structured_context.get("order_id") or ""),
+            "trace_id": trace_id,
+            "order_id": order_id,
+            "begin_time": begin_time,
+            "end_time": end_time,
             "request_id": str(structured_context.get("request_id") or ""),
             "intent_recognition": state["intent_recognition"],
         }
         return dict(state)
 
     if failed:
-        best_intent = "未知意图"
+        best_intent = "业务咨询"
         state["intent_recognition"] = {
             **state["intent_recognition"],
             "best_intent": best_intent,
             "confidence": best_score,
-            "reasoning": "最高意图分未超过 0.5，判定为未知意图",
+            "reasoning": "最高意图分未超过 0.5，按保守策略归入业务咨询",
             "intent_retry_count": retry_count,
         }
 
@@ -209,22 +355,27 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         **structured_context,
         "question": str(state.get("question") or structured_context.get("question") or ""),
         "conversation_context": conversation_context,
-        "order_id": str(structured_context.get("order_id") or ""),
+        "trace_id": trace_id,
+        "order_id": order_id,
+        "begin_time": begin_time,
+        "end_time": end_time,
         "request_id": str(structured_context.get("request_id") or ""),
         "intent_recognition": state["intent_recognition"],
     }
 
-    # 调用处说明：线上分析/业务咨询意图进入 rag_retrieve 节点执行检索。
-    if intent_type in {"OPS_ANALYSIS", "SYSTEM_LOGIC_CONSULT"}:
-        state["route"] = "rag_retrieve"
-    elif intent_type == "UNKNOWN_INTENT":
-        state["route"] = "fallback"
+    # 仅保留两类：排障问题进入 hypothesis-driven 主链路；其余走业务咨询分支。
+    if intent_type == "OPS_ANALYSIS":
+        state["route"] = "query_rewrite"
     else:
         state["route"] = "fixed_flow_execute"
     _LOGGER.info(
-        "intent_decide 路由完成: intent_type=%s route=%s confidence=%.2f",
+        "intent_decide 路由完成: intent_type=%s route=%s confidence=%.2f trace_id=%s order_id=%s begin_time=%s end_time=%s",
         intent_type,
         str(state.get("route") or ""),
         best_score,
+        trace_id,
+        order_id,
+        begin_time,
+        end_time,
     )
     return dict(state)

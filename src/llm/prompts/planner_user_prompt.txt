@@ -1,32 +1,30 @@
-请基于以下上下文制定排障计划：
+请基于以下信息生成 hypothesis、investigation_goals、required_answers，仅输出 JSON。
 
 【用户问题】
 {user_query}
 
-【历史对话信息】
-{history_dialogues}
+【改写后查询】
+{normalized_query}
 
-【消息缓存上下文（message_context）】
-{message_context}
+【关键词】
+{keywords}
 
-【技能定义（必须遵循）】
-{skills_context}
+{domain_knowledge}
 
-【当前系统状态】
-{log_diagnosis_summary}
+{case_knowledge}
 
-【相关解决方案文档】
-{rag_solutions_summary}
+{code_knowledge}
 
-【完整参考文档】
-{full_docs_references}
+【已证伪假设（不要重复）】
+{rejected_hypothesis}
 
-【完整文档内容】
-{full_docs_content}
+【上轮重规划原因】
+{replan_reason}
 
-要求：
-1. 你需要优先阅读“完整文档内容”，并从中识别可能用于日志查询的关键词（例如错误码、异常类名、关键业务词）。
-2. plan_steps 只输出“指导性子任务”，每个子任务必须包含：subtask、hypothesis、success_criteria、tool_candidates。
-3. 不要输出固定 tool_call 步骤与具体参数（如 app_code/logname/match_list）；这些由下游 executor 决定。
-4. 如果日志检索已经命中异常或出现关键线索，可增加代码相关子任务（fetch_code/code_pull）进一步定位。
-5. 在 solution_steps 与 validation 中优先体现“日志依据”；存在代码证据时再补充“代码依据”。
+请识别用户问题中的“必答字段诉求”（例如字段名、标识ID、错误编码、关键状态、时间点、返回值等），
+并写入 required_answers，标记 required=true。不要限制为固定字段名集合。
+
+请特别注意：
+- required_answers 中如果有多个 required=true 字段，investigation_goals 必须拆分为多个最小执行单元。
+- 每条 goal 只能对应一个字段或一个单一信息目标，不允许把“失败原因 + 错误码”等多个目标混在同一条里。
+- required_answers 必须与“当前用户问题”严格对齐；只保留用户明确需要回答的字段，不要补充额外字段。

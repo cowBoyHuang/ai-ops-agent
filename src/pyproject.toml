@@ -17,7 +17,6 @@ dependencies = [
   "langgraph>=0.2.0",
   "llama-index>=0.11.0",
   "llama-index-embeddings-openai>=0.2.0",
-  "ollama>=0.4.0",
   "pydantic>=2.11.0",
   "pydantic-settings>=2.8.0",
   "redis>=5.0.0",

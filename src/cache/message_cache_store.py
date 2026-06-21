@@ -74,3 +74,9 @@ def append_round(
         )
     )
     return set_message_cache(chat, cache)
+
+
+def clear_message_cache_fallback() -> int:
+    size = len(_FALLBACK)
+    _FALLBACK.clear()
+    return size

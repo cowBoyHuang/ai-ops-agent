@@ -33,21 +33,35 @@ def _to_int(value: Any, default: int) -> int:
 @dataclass(slots=True)
 class QdrantConfig:
     url: str
+    # 兼容历史单库名称（legacy fallback）。
     collection_name: str
+    # 新增：分库名称。
+    domain_collection_name: str
+    case_collection_name: str
     vector_dim: int
     timeout_sec: float
 
     @classmethod
     def from_env(cls) -> "QdrantConfig":
         url = str(os.getenv("QDRANT_URL", "http://127.0.0.1:6333")).strip() or "http://127.0.0.1:6333"
-        collection_name = (
-            str(os.getenv("QDRANT_COLLECTION_NAME", "ai_ops_rag_demo")).strip() or "ai_ops_rag_demo"
+        legacy_collection_name = (
+            str(os.getenv("QDRANT_COLLECTION_NAME", "ai_ops_rag")).strip() or "ai_ops_rag"
+        )
+        domain_collection_name = (
+            str(os.getenv("QDRANT_DOMAIN_COLLECTION_NAME", f"{legacy_collection_name}_domain")).strip()
+            or f"{legacy_collection_name}_domain"
+        )
+        case_collection_name = (
+            str(os.getenv("QDRANT_CASE_COLLECTION_NAME", f"{legacy_collection_name}_case")).strip()
+            or f"{legacy_collection_name}_case"
         )
         vector_dim = max(1, _to_int(os.getenv("QDRANT_VECTOR_DIM", "512"), 512))
         timeout_sec = float(os.getenv("QDRANT_TIMEOUT_SEC", "3"))
         return cls(
             url=url,
-            collection_name=collection_name,
+            collection_name=legacy_collection_name,
+            domain_collection_name=domain_collection_name,
+            case_collection_name=case_collection_name,
             vector_dim=vector_dim,
             timeout_sec=max(0.1, timeout_sec),
         )
@@ -68,16 +82,27 @@ class QdrantStore:
         self._client = QdrantClient(url=self.config.url, timeout=self.config.timeout_sec)
         return self._client
 
-    def ensure_collection(self) -> None:
+    def ensure_collection(self, *, collection_name: str | None = None) -> None:
         client = self._ensure_client()
         collections = client.get_collections()
         names = {row.name for row in list(collections.collections or [])}
-        if self.config.collection_name in names:
+        final_collection = str(collection_name or self.config.collection_name).strip()
+        if not final_collection:
+            raise ValueError("collection_name must not be empty")
+        if final_collection in names:
             return
         client.create_collection(
-            collection_name=self.config.collection_name,
+            collection_name=final_collection,
             vectors_config=VectorParams(size=self.config.vector_dim, distance=Distance.COSINE),
         )
+
+    def collection_name_for_knowledge_type(self, knowledge_type: str) -> str:
+        value = str(knowledge_type or "").strip().lower()
+        if value == "case":
+            return self.config.case_collection_name
+        if value == "domain":
+            return self.config.domain_collection_name
+        return self.config.collection_name
 
     def upsert_text(
         self,
@@ -85,23 +110,31 @@ class QdrantStore:
         text: str,
         point_id: str | int | None = None,
         payload: dict[str, Any] | None = None,
+        collection_name: str | None = None,
     ) -> str | int:
         content = str(text or "").strip()
         if not content:
             raise ValueError("text must not be empty")
-        self.ensure_collection()
+        final_collection = str(collection_name or self.config.collection_name).strip()
+        self.ensure_collection(collection_name=final_collection)
         client = self._ensure_client()
         pid: str | int = point_id if point_id is not None else uuid4().hex
         vector = text_embedding(content, dim=self.config.vector_dim)
         point_payload = {"text": content, **dict(payload or {})}
         client.upsert(
-            collection_name=self.config.collection_name,
+            collection_name=final_collection,
             points=[PointStruct(id=pid, vector=vector, payload=point_payload)],
         )
         return pid
 
-    def upsert_texts(self, items: list[dict[str, Any]]) -> list[str | int]:
-        self.ensure_collection()
+    def upsert_texts(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        collection_name: str | None = None,
+    ) -> list[str | int]:
+        final_collection = str(collection_name or self.config.collection_name).strip()
+        self.ensure_collection(collection_name=final_collection)
         client = self._ensure_client()
         rows: list[Any] = []
         ids: list[str | int] = []
@@ -115,7 +148,7 @@ class QdrantStore:
             rows.append(PointStruct(id=pid, vector=vector, payload={"text": content, **payload}))
             ids.append(pid)
         if rows:
-            client.upsert(collection_name=self.config.collection_name, points=rows)
+            client.upsert(collection_name=final_collection, points=rows)
         return ids
 
     def search(
@@ -124,18 +157,20 @@ class QdrantStore:
         query: str,
         limit: int = 5,
         score_threshold: float | None = None,
+        collection_name: str | None = None,
     ) -> list[dict[str, Any]]:
         query_text = str(query or "").strip()
         if not query_text:
             return []
-        self.ensure_collection()
+        final_collection = str(collection_name or self.config.collection_name).strip()
+        self.ensure_collection(collection_name=final_collection)
         client = self._ensure_client()
         query_vector = text_embedding(query_text, dim=self.config.vector_dim)
         max_limit = max(1, int(limit))
         if hasattr(client, "query_points"):
             # qdrant-client>=1.7 使用 query_points，结果在 QueryResponse.points
             response = client.query_points(
-                collection_name=self.config.collection_name,
+                collection_name=final_collection,
                 query=query_vector,
                 limit=max_limit,
                 score_threshold=score_threshold,
@@ -146,7 +181,7 @@ class QdrantStore:
         elif hasattr(client, "search"):
             # 兼容较老版本 qdrant-client
             points = client.search(
-                collection_name=self.config.collection_name,
+                collection_name=final_collection,
                 query_vector=query_vector,
                 limit=max_limit,
                 score_threshold=score_threshold,

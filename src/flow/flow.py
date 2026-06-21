@@ -13,6 +13,7 @@ from flow.modules.duplicate_detect.duplicate_detect import run as duplicate_dete
 from flow.modules.error_handle.error_handle import run as error_handle_run
 from flow.modules.input_validate.input_validate import run as input_validate_run
 from flow.modules.memory.memory import run as memory_run
+from flow.modules.query_rewrite.query_rewrite import run as query_rewrite_run
 from flow.modules.response_emit.response_emit import run as response_emit_run
 
 _MOD_LOG = logging.getLogger("aiops.flow.module")
@@ -58,6 +59,7 @@ def build_langchain_main_chain() -> Runnable:
         RunnableLambda(_module_node("input_validate", input_validate_run))
         | RunnableLambda(_module_node("context_build", context_build_run))
         | RunnableLambda(_module_node("duplicate_detect", duplicate_detect_run))
+        | RunnableLambda(_module_node("query_rewrite", query_rewrite_run))
         | RunnableLambda(_module_node("agent_executor_graph", agent_executor_graph_run))
         | RunnableLambda(_module_node("response_emit", response_emit_run))
         | RunnableLambda(_module_node("memory", memory_run))
