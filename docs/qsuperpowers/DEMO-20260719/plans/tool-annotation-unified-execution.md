@@ -582,6 +582,13 @@ tool_args = {
 }
 tool_args = {key: value for key, value in tool_args.items() if value is not None}
 rows = invoke_tool(registered_tool, tool_args)
+if isinstance(rows, dict) and rows.get("ok") is False:
+    return {
+        "tool": str(rows.get("tool") or registered_tool),
+        "ok": False,
+        "error": str(rows.get("error") or ""),
+        "evidence": list(rows.get("evidence") or []),
+    }
 ```
 
 For `getCreateOrderResult` and `getFlightCreateOrderResult`, keep passing only `trace_id`, `begin_time`, and `end_time` unless additional parameters are harmless. These fixed-scope tools must not require upstream `app_code` or `logname`; they use their helper functions to apply fixed app/log internally.
@@ -603,6 +610,7 @@ Remove all remaining uses of `fixed_scope`. There should be no `resolve_log_meth
 - Import `build_tool_schemas_for_prompt`, `get_all_tools`, `invoke_tool`.
 - Replace `_ALLOWED_TOOLS` with `{tool.name for tool in get_all_tools()}`.
 - Replace `_build_tool_schemas()` implementation with registry call or delete it and call `build_tool_schemas_for_prompt()`.
+- Remove `_load_skill_catalog()` and stop passing `skill_catalog_json` into `executor_react_user_prompt.txt`. Prompt-facing executable descriptions must come from `build_tool_schemas_for_prompt()` only.
 - Update aliases so `log_query` maps to `queryLog`, not to `log_query`.
 - In `_execute_tool_call`, keep the log-specific sub-executor path only for registered log tool names: `queryLog`, `dependency_log_query`, `getCreateOrderResult`, `getFlightCreateOrderResult`.
 - For `rag_parent_chunk_query`, invoke registry and adapt result into current evidence shape.
@@ -665,6 +673,7 @@ git commit -m "feat: route executor through annotated tools"
 - 修改: `src/llm/prompts/executor_react_user_prompt.txt`
 - 修改: `src/tests/flow/test_reactor.py`
 - 修改: `src/tests/tool/test_tool_registry.py`
+- 测试: `src/tests/flow/test_executor_tool_prompt.py`
 
 - [ ] **步骤 1: 更新 reactor 测试期望**
 
@@ -676,6 +685,50 @@ assert "log_method" not in dict(final_action.get("params_summary") or {})
 ```
 
 保留输入兼容测试：LLM 如果仍返回 `log_query + log_method=queryLog`，系统应归一到 `queryLog` tool name。
+
+- [ ] **步骤 1.5: 添加 executor prompt 输入测试**
+
+创建 `src/tests/flow/test_executor_tool_prompt.py`：
+
+```python
+from __future__ import annotations
+
+import json
+
+from flow.modules.agent_executor_graph.graph.executor import executor
+
+
+def test_executor_prompt_uses_registry_tool_schemas_not_skill_catalog(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def _fake_render_prompt(template: str, **kwargs):
+        captured.update({key: json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value for key, value in kwargs.items()})
+        return "prompt"
+
+    monkeypatch.setattr(executor, "render_prompt", _fake_render_prompt)
+    monkeypatch.setattr(executor, "load_prompt", lambda *args, **kwargs: "system")
+    monkeypatch.setattr(
+        executor,
+        "chat_with_llm",
+        lambda **kwargs: '{"action":{"tool_name":"queryLog","params":{"match_phrase_list":["ops_slugger_260101.120000.xxx"],"match_list":[]}}}',
+    )
+
+    out = executor._decide_skill_with_llm(
+        state={"question": "订单失败", "plan": {"hypothesis": "h", "investigation_goals": ["g"]}},
+        hypothesis="h",
+        objective="g",
+        current_evidence={},
+        evidence_rows=[],
+        retry_count=0,
+    )
+
+    assert out["tool_name"] == "queryLog"
+    rendered = json.dumps(captured, ensure_ascii=False)
+    assert "tool_schemas_json" in captured
+    assert "execute_log_query_method" not in rendered
+    assert "execute_code_index_method" not in rendered
+    assert "skill_catalog_json" not in captured
+```
 
 - [ ] **步骤 2: 更新 executor prompts**
 
@@ -700,6 +753,8 @@ action.tool_name 必须是 tool_schemas_json 中的 tool_name。
 不要用 params.log_method 选择能力。
 历史输入中的 log_method 仅用于兼容理解，新的 action 必须直接选择 queryLog、getCreateOrderResult、getFlightCreateOrderResult 或 dependency_log_query。
 ```
+
+同时删除 prompt 模板中对 `skill_catalog_json` 的引用。模型不再读取原始 `SKILL.md` 文本来决定可执行方法。
 
 - [ ] **步骤 3: 移除 runtime 中设置 `log_method` 的逻辑**
 
@@ -761,7 +816,7 @@ cd src && ../.venv/bin/python -m pytest tests/flow/test_reactor.py tests/tool/te
 - [ ] **步骤 6: 提交 cleanup**
 
 ```bash
-git add src/flow/modules/agent_executor_graph/graph/reactor/reactor.py src/flow/modules/agent_executor_graph/graph/executor/executor.py src/llm/prompts/executor_react_system_prompt.txt src/llm/prompts/executor_react_user_prompt.txt src/tests/flow/test_reactor.py src/tests/tool/test_tool_registry.py
+git add src/flow/modules/agent_executor_graph/graph/reactor/reactor.py src/flow/modules/agent_executor_graph/graph/executor/executor.py src/llm/prompts/executor_react_system_prompt.txt src/llm/prompts/executor_react_user_prompt.txt src/tests/flow/test_reactor.py src/tests/flow/test_executor_tool_prompt.py src/tests/tool/test_tool_registry.py
 git commit -m "refactor: remove local method routing semantics"
 ```
 
@@ -795,6 +850,7 @@ cd src && ../.venv/bin/python -m pytest \
   tests/flow/test_code_index_client_trade_core.py \
   tests/flow/test_log_executor_dispatch.py \
   tests/flow/test_fixed_flow_execute.py \
+  tests/flow/test_executor_tool_prompt.py \
   tests/flow/test_reactor.py \
   -q
 ```
