@@ -22,6 +22,8 @@
 - 修改: `src/flow/modules/agent_executor_graph/graph/fixed_flow_execute/business_code_consult_skill.py`，改用 `analyzeCodeForBusinessConsult` tool。
 - 修改: `src/log/log.py`、`src/log/__init__.py`，删除或停止导出 `execute_log_query_method`。
 - 修改: `src/tool/code_index_client.py`、`src/tool/__init__.py`，删除或停止导出 `execute_code_index_method`。
+- 修改: `src/llm/prompts/executor_react_system_prompt.txt`，删除 hard-coded legacy tool/method 指令。
+- 修改: `src/llm/prompts/executor_react_user_prompt.txt`，要求模型直接选择注册 tool name。
 - 测试: `src/tests/tool/test_tool_registry.py`。
 - 测试: `src/tests/log/test_log_query_dispatch.py`。
 - 测试: `src/tests/flow/test_code_index_client_trade_core.py`。
@@ -211,6 +213,17 @@ def query_log_tool(
 - `get_create_order_result_tool`，tool name 为 `getCreateOrderResult`，description 包含“总单生单结果”“最终返回态”“聚合错误口径”“固定 app/log”。
 
 不要在工具函数中接受 `method` 或 `log_method`。
+
+同文件末尾必须导出：
+
+```python
+LOG_TOOLS = [
+    query_log_tool,
+    dependency_log_query_tool,
+    get_flight_create_order_result_tool,
+    get_create_order_result_tool,
+]
+```
 
 - [ ] **步骤 2: 添加 registry**
 
@@ -571,7 +584,17 @@ tool_args = {key: value for key, value in tool_args.items() if value is not None
 rows = invoke_tool(registered_tool, tool_args)
 ```
 
-For `getCreateOrderResult` and `getFlightCreateOrderResult`, keep passing `trace_id`, `begin_time`, and `end_time`; app/log may be present but the tool ignores upstream app/log by using the helper fixed scope.
+For `getCreateOrderResult` and `getFlightCreateOrderResult`, keep passing only `trace_id`, `begin_time`, and `end_time` unless additional parameters are harmless. These fixed-scope tools must not require upstream `app_code` or `logname`; they use their helper functions to apply fixed app/log internally.
+
+After resolving `registered_tool`, update missing parameter handling:
+
+```python
+requires_upstream_scope = registered_tool in {"queryLog", "dependency_log_query"}
+if requires_upstream_scope and (not app_code or not logname):
+    # keep existing degraded fallback behavior
+```
+
+Remove all remaining uses of `fixed_scope`. There should be no `resolve_log_method_scope` import or local replacement of that function in `log_executor.py`.
 
 - [ ] **步骤 3: 更新 executor schema 和 tool execution**
 
@@ -638,6 +661,7 @@ git commit -m "feat: route executor through annotated tools"
 
 - 修改: `src/flow/modules/agent_executor_graph/graph/reactor/reactor.py`
 - 修改: `src/flow/modules/agent_executor_graph/graph/executor/executor.py`
+- 修改: `src/llm/prompts/executor_react_system_prompt.txt`
 - 修改: `src/llm/prompts/executor_react_user_prompt.txt`
 - 修改: `src/tests/flow/test_reactor.py`
 - 修改: `src/tests/tool/test_tool_registry.py`
@@ -653,7 +677,21 @@ assert "log_method" not in dict(final_action.get("params_summary") or {})
 
 保留输入兼容测试：LLM 如果仍返回 `log_query + log_method=queryLog`，系统应归一到 `queryLog` tool name。
 
-- [ ] **步骤 2: 更新 executor prompt**
+- [ ] **步骤 2: 更新 executor prompts**
+
+在 `src/llm/prompts/executor_react_system_prompt.txt` 中删除或改写 hard-coded legacy 指令，例如：
+
+- `tool_name=log_query|...`
+- `params.log_method=queryLog`
+- 要求通过 `log_method` 选择日志方法的描述。
+
+替换为：
+
+```text
+action.tool_name 必须直接选择 tool_schemas_json 中存在的注册工具名。
+日志工具必须直接选择 queryLog、getCreateOrderResult、getFlightCreateOrderResult 或 dependency_log_query。
+不要输出 params.log_method 来选择能力。
+```
 
 在 `src/llm/prompts/executor_react_user_prompt.txt` 中删除要求模型输出 `log_method` 的指令。改为要求：
 
@@ -723,7 +761,7 @@ cd src && ../.venv/bin/python -m pytest tests/flow/test_reactor.py tests/tool/te
 - [ ] **步骤 6: 提交 cleanup**
 
 ```bash
-git add src/flow/modules/agent_executor_graph/graph/reactor/reactor.py src/flow/modules/agent_executor_graph/graph/executor/executor.py src/llm/prompts/executor_react_user_prompt.txt src/tests/flow/test_reactor.py src/tests/tool/test_tool_registry.py
+git add src/flow/modules/agent_executor_graph/graph/reactor/reactor.py src/flow/modules/agent_executor_graph/graph/executor/executor.py src/llm/prompts/executor_react_system_prompt.txt src/llm/prompts/executor_react_user_prompt.txt src/tests/flow/test_reactor.py src/tests/tool/test_tool_registry.py
 git commit -m "refactor: remove local method routing semantics"
 ```
 
@@ -778,7 +816,7 @@ cd src && ../.venv/bin/python -m pytest tests/log tests/flow tests/tool -q
 运行:
 
 ```bash
-git diff -- src/tool src/log src/flow src/tests src/llm/prompts/executor_react_user_prompt.txt
+git diff -- src/tool src/log src/flow src/tests src/llm/prompts/executor_react_system_prompt.txt src/llm/prompts/executor_react_user_prompt.txt
 ```
 
 预期:
@@ -789,7 +827,7 @@ git diff -- src/tool src/log src/flow src/tests src/llm/prompts/executor_react_u
 - [ ] **步骤 5: 最终提交**
 
 ```bash
-git add src/tool src/log src/flow src/tests src/llm/prompts/executor_react_user_prompt.txt
+git add src/tool src/log src/flow src/tests src/llm/prompts/executor_react_system_prompt.txt src/llm/prompts/executor_react_user_prompt.txt
 git commit -m "feat: unify agent tools with annotations"
 ```
 
