@@ -107,6 +107,16 @@ def test_registry_invokes_query_log_tool(monkeypatch) -> None:
     assert captured["app_code"] == "f_tts_trade_order"
     assert captured["logname"] == "ttsorder"
     assert get_tool("queryLog").name == "queryLog"
+
+
+def test_invoke_tool_returns_structured_error_for_unknown_tool() -> None:
+    out = invoke_tool("missingTool", {"x": 1})
+    assert out == {
+        "tool": "missingTool",
+        "ok": False,
+        "error": "unsupported tool: missingTool",
+        "evidence": [],
+    }
 ```
 
 - [ ] **步骤 2: 重写日志工具测试为直接 tool 调用**
@@ -254,7 +264,25 @@ def build_tool_schemas_for_prompt() -> list[dict[str, Any]]:
 
 
 def invoke_tool(name: str, args: dict[str, Any]) -> Any:
-    return get_tool(name).invoke(dict(args or {}))
+    key = str(name or "").strip()
+    try:
+        tool = get_tool(key)
+    except KeyError:
+        return {
+            "tool": key,
+            "ok": False,
+            "error": f"unsupported tool: {key}",
+            "evidence": [],
+        }
+    try:
+        return tool.invoke(dict(args or {}))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "tool": key,
+            "ok": False,
+            "error": str(exc),
+            "evidence": [],
+        }
 ```
 
 - [ ] **步骤 3: 添加临时空 code/RAG 工具列表以解开导入**
@@ -556,6 +584,8 @@ For `getCreateOrderResult` and `getFlightCreateOrderResult`, keep passing `trace
 - In `_execute_tool_call`, keep the log-specific sub-executor path only for registered log tool names: `queryLog`, `dependency_log_query`, `getCreateOrderResult`, `getFlightCreateOrderResult`.
 - For `rag_parent_chunk_query`, invoke registry and adapt result into current evidence shape.
 - For `knowledge_lookup`, call registry with `docs` from `state["knowledge_context"]["domain_docs"]`.
+- For any `invoke_tool()` result where `ok is False`, return the structured error unchanged except for adding `tool` when absent.
+- Wrap executor-boundary tool calls in a final `try/except` guard so unexpected exceptions still return `{"tool": tool_name, "ok": False, "error": str(exc), "evidence": []}`.
 
 - [ ] **步骤 4: 更新 business consult skill**
 
