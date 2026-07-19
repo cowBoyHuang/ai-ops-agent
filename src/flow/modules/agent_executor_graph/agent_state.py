@@ -13,6 +13,66 @@ class InvestigationPlan(TypedDict, total=False):
     hypothesis: str
     investigation_goals: List[str]
     required_answers: List[Dict[str, Any]]
+    goals: List[Dict[str, Any]]
+    finish_criteria: List[str]
+    replan_triggers: List[str]
+
+
+class InvestigationGoalV2(TypedDict, total=False):
+    """InvestigationPlanV2 中的单个调查目标。"""
+
+    id: str
+    goal: str
+    required_capability: Literal["runtime_evidence", "business_validation", "code_analysis", "config_analysis"]
+    priority: int
+    required: bool
+    success_criteria: List[str]
+    expected_evidence: List[str]
+    depends_on: List[str]
+
+
+class InvestigationPlanV2(TypedDict, total=False):
+    """Planner V2 输出：一次性完整调查计划。"""
+
+    plan_id: str
+    hypothesis: str
+    goals: List[InvestigationGoalV2]
+    finish_criteria: List[str]
+    replan_triggers: List[str]
+
+
+class InvestigationEvidence(TypedDict, total=False):
+    """Plan Controller 持久化的标准化调查证据。"""
+
+    goal_id: str
+    capability: str
+    executor: str
+    summary: str
+    facts: Dict[str, Any]
+    evidence: List[Any]
+    artifacts: List[Any]
+    confidence: float
+    status: Literal["succeeded", "failed", "unsupported"]
+    error: str
+
+
+class InvestigationRuntime(TypedDict, total=False):
+    """Planner + Executor V2 运行时状态。"""
+
+    plan: InvestigationPlanV2
+    current_goal_id: str
+    goal_status: Dict[str, str]
+    evidence: List[InvestigationEvidence]
+    events: List[Dict[str, Any]]
+    pending_execution: Dict[str, Any]
+    last_route_result: Dict[str, Any]
+    last_executor_result: Dict[str, Any]
+    consumed_result_ids: List[str]
+    retry_counts_by_goal: Dict[str, int]
+    max_retries_per_goal: int
+    replan_count: int
+    max_replans: int
+    failure_reason: str
 
 
 class EvidenceItem(TypedDict, total=False):
@@ -119,6 +179,7 @@ class AgentState(TypedDict, total=False):
     rejected_hypothesis: List[str]
     evaluation: Dict[str, Any]
     plan: InvestigationPlan
+    investigation: InvestigationRuntime
     knowledge_context: Dict[str, Any]
     execution: Dict[str, Any]
     replan_context: Dict[str, Any]

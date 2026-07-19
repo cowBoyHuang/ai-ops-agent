@@ -1,4 +1,4 @@
-"""Planner 节点：生成 hypothesis + investigation_goals（宏观目标）。"""
+"""Planner 节点：一次性生成完整 InvestigationPlanV2。"""
 
 from __future__ import annotations
 
@@ -37,6 +37,21 @@ def _clip(text: Any, max_len: int = _MAX_DOC_TEXT) -> str:
     return f"{raw[:max_len]}..."
 
 
+def _json_clip(value: Any, max_len: int = 3000) -> str:
+    try:
+        raw = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        raw = str(value or "")
+    return _clip(raw, max_len)
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _as_doc_rows(rows: Any) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         return []
@@ -63,6 +78,17 @@ def _build_prompt_context(state: dict[str, Any]) -> dict[str, Any]:
     knowledge_context = dict(structured.get("knowledge_context") or state.get("knowledge_context") or {})
     query_rewrite = dict(state.get("query_rewrite") or structured.get("query_rewrite") or {})
     rejected = [str(item).strip() for item in list(state.get("rejected_hypothesis") or []) if str(item).strip()]
+    investigation = dict(state.get("investigation") or {})
+    previous_plan = dict(investigation.get("plan") or {})
+    goal_status = dict(investigation.get("goal_status") or {})
+    evidence = [dict(item or {}) for item in list(investigation.get("evidence") or [])]
+    failed_goal_id = str(investigation.get("current_goal_id") or "").strip()
+    failed_goal = {}
+    for item in list(previous_plan.get("goals") or []):
+        row = dict(item or {})
+        if str(row.get("id") or "").strip() == failed_goal_id:
+            failed_goal = row
+            break
 
     domain_docs = _as_doc_rows(knowledge_context.get("domain_docs"))
     case_docs = _as_doc_rows(knowledge_context.get("case_docs"))
@@ -77,6 +103,10 @@ def _build_prompt_context(state: dict[str, Any]) -> dict[str, Any]:
         "code_knowledge": _summarize_docs("代码知识", code_docs),
         "rejected_hypothesis": "\n".join(f"- {item}" for item in rejected) if rejected else "- 无",
         "replan_reason": str(state.get("replan_reason") or "").strip() or "无",
+        "previous_plan_json": _json_clip(previous_plan),
+        "goal_status_json": _json_clip(goal_status),
+        "evidence_json": _json_clip(evidence),
+        "failed_goal_json": _json_clip(failed_goal),
     }
 
 
@@ -246,6 +276,14 @@ def _filter_required_answers_by_question(required_answers: list[dict[str, Any]],
     return []
 
 
+_DEFAULT_REPLAN_TRIGGERS = [
+    "goal_unexecutable",
+    "evidence_conflict",
+    "missing_required_context",
+    "capability_not_supported",
+]
+
+
 def _parse_plan(raw_output: str) -> tuple[str, list[str], list[dict[str, Any]]]:
     try:
         parsed = json.loads(raw_output)
@@ -259,6 +297,116 @@ def _parse_plan(raw_output: str) -> tuple[str, list[str], list[dict[str, Any]]]:
     goals = [str(item).strip() for item in list(goals_raw or []) if str(item).strip()] if isinstance(goals_raw, list) else []
     required_answers = _parse_required_answers(parsed.get("required_answers"))
     return hypothesis, goals, required_answers
+
+
+def _normalize_v2_goal(raw: Any, idx: int) -> dict[str, Any]:
+    item = dict(raw or {}) if isinstance(raw, dict) else {"goal": str(raw or "").strip()}
+    goal_id = str(item.get("id") or f"g{idx}").strip()
+    goal_text = str(item.get("goal") or item.get("objective") or "").strip()
+    capability = str(item.get("required_capability") or "runtime_evidence").strip()
+    try:
+        priority = int(item.get("priority") or idx)
+    except (TypeError, ValueError):
+        priority = idx
+    success_criteria = [str(row).strip() for row in list(item.get("success_criteria") or []) if str(row).strip()]
+    expected_evidence = [str(row).strip() for row in list(item.get("expected_evidence") or []) if str(row).strip()]
+    depends_on = [str(row).strip() for row in list(item.get("depends_on") or []) if str(row).strip()]
+    return {
+        "id": goal_id or f"g{idx}",
+        "goal": goal_text or f"调查目标{idx}",
+        "required_capability": capability or "runtime_evidence",
+        "priority": priority,
+        "required": bool(item.get("required", True)),
+        "success_criteria": success_criteria or ["获得可验证证据"],
+        "expected_evidence": expected_evidence or ["evidence"],
+        "depends_on": depends_on,
+    }
+
+
+def _normalize_investigation_plan_v2(parsed: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    raw_goals = parsed.get("goals")
+    if not isinstance(raw_goals, list) or not raw_goals:
+        legacy_goals = [str(item).strip() for item in list(parsed.get("investigation_goals") or []) if str(item).strip()]
+        raw_goals = [
+            {
+                "id": f"g{idx}",
+                "goal": goal,
+                "required_capability": "runtime_evidence",
+                "priority": idx,
+                "required": True,
+                "success_criteria": ["获得可验证运行时证据"],
+                "expected_evidence": ["runtime_evidence"],
+                "depends_on": [],
+            }
+            for idx, goal in enumerate(legacy_goals, start=1)
+        ]
+    goals = [_normalize_v2_goal(item, idx) for idx, item in enumerate(list(raw_goals or []), start=1)]
+    goals = sorted(goals, key=lambda row: int(row.get("priority") or 0))
+    if not goals:
+        _, fallback_goals, _ = _fallback_plan(state)
+        goals = [_normalize_v2_goal(goal, idx) for idx, goal in enumerate(fallback_goals, start=1)]
+
+    hypothesis = str(parsed.get("hypothesis") or "").strip()
+    if not hypothesis:
+        hypothesis = f"{_clip(state.get('question'), 40)}相关链路存在异常"
+    finish_criteria = [str(row).strip() for row in list(parsed.get("finish_criteria") or []) if str(row).strip()]
+    replan_triggers = [str(row).strip() for row in list(parsed.get("replan_triggers") or []) if str(row).strip()]
+    return {
+        "plan_id": str(parsed.get("plan_id") or "plan_001").strip() or "plan_001",
+        "hypothesis": hypothesis,
+        "goals": goals,
+        "finish_criteria": finish_criteria or ["根因明确", "证据链闭合", "用户问题已被直接回答"],
+        "replan_triggers": replan_triggers or list(_DEFAULT_REPLAN_TRIGGERS),
+    }
+
+
+def _sync_v2_goals_with_goal_texts(investigation_plan: dict[str, Any], goal_texts: list[str]) -> dict[str, Any]:
+    """保持 V2 plan.goals 与兼容字段 investigation_goals 同步。"""
+    normalized_texts = [str(item).strip() for item in list(goal_texts or []) if str(item).strip()]
+    if not normalized_texts:
+        return investigation_plan
+
+    original_goals = [dict(item or {}) for item in list(investigation_plan.get("goals") or [])]
+    original_texts = [str(item.get("goal") or "").strip() for item in original_goals]
+    if original_texts == normalized_texts:
+        return investigation_plan
+
+    by_text = {str(item.get("goal") or "").strip(): item for item in original_goals if str(item.get("goal") or "").strip()}
+    synced_goals: list[dict[str, Any]] = []
+    for idx, text in enumerate(normalized_texts, start=1):
+        if text in by_text:
+            row = dict(by_text[text])
+            row["priority"] = idx
+            row["id"] = str(row.get("id") or f"g{idx}")
+        else:
+            row = {
+                "id": f"g{idx}",
+                "goal": text,
+                "required_capability": "runtime_evidence",
+                "priority": idx,
+                "required": True,
+                "success_criteria": ["获得可验证证据"],
+                "expected_evidence": ["evidence"],
+                "depends_on": [],
+            }
+        synced_goals.append(_normalize_v2_goal(row, idx))
+
+    updated = dict(investigation_plan)
+    updated["goals"] = synced_goals
+    return updated
+
+
+def _parse_investigation_plan_v2(raw_output: str, state: dict[str, Any]) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw_output)
+    except Exception:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    if not parsed:
+        hypothesis, goals, _ = _fallback_plan(state)
+        parsed = {"hypothesis": hypothesis, "investigation_goals": goals}
+    return _normalize_investigation_plan_v2(parsed, state)
 
 
 def _build_minimal_goals_from_required_answers(required_answers: list[dict[str, Any]]) -> list[str]:
@@ -366,6 +514,8 @@ def _avoid_rejected(hypothesis: str, rejected_hypothesis: list[str]) -> str:
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
+    previous_investigation = dict(state.get("investigation") or {})
+    previous_events = [dict(item or {}) for item in list(previous_investigation.get("events") or [])]
     context = _build_prompt_context(state)
     knowledge_context = dict(state.get("knowledge_context") or {})
     rejected = [str(item).strip() for item in list(state.get("rejected_hypothesis") or []) if str(item).strip()]
@@ -390,12 +540,25 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         code_knowledge=context["code_knowledge"],
         rejected_hypothesis=context["rejected_hypothesis"],
         replan_reason=context["replan_reason"],
+        previous_plan_json=context["previous_plan_json"],
+        goal_status_json=context["goal_status_json"],
+        evidence_json=context["evidence_json"],
+        failed_goal_json=context["failed_goal_json"],
     )
     raw_output = chat_with_llm(question=user_prompt, system_prompt=system_prompt)
 
-    hypothesis, goals, required_answers = _parse_plan(raw_output)
+    investigation_plan = _parse_investigation_plan_v2(raw_output, state)
+    hypothesis = str(investigation_plan.get("hypothesis") or "").strip()
+    goals = [str(dict(item or {}).get("goal") or "").strip() for item in list(investigation_plan.get("goals") or [])]
+    _, _, required_answers = _parse_plan(raw_output)
     if not hypothesis or not goals:
-        hypothesis, goals, required_answers = _fallback_plan(state)
+        fallback_hypothesis, fallback_goals, required_answers = _fallback_plan(state)
+        investigation_plan = _normalize_investigation_plan_v2(
+            {"hypothesis": fallback_hypothesis, "investigation_goals": fallback_goals},
+            state,
+        )
+        hypothesis = str(investigation_plan.get("hypothesis") or "").strip()
+        goals = [str(dict(item or {}).get("goal") or "").strip() for item in list(investigation_plan.get("goals") or [])]
     if not required_answers:
         required_answers = _derive_required_answers_from_query(state)
     required_answers = _filter_required_answers_by_question(required_answers, state)
@@ -409,11 +572,16 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         hypothesis, goals, required_answers = _fallback_plan(state)
 
     hypothesis = _avoid_rejected(hypothesis, rejected)
+    investigation_plan = _sync_v2_goals_with_goal_texts(investigation_plan, goals)
+    goals = [str(dict(item or {}).get("goal") or "").strip() for item in list(investigation_plan.get("goals") or [])]
 
     plan = {
         "hypothesis": hypothesis,
         "investigation_goals": goals,
         "required_answers": required_answers,
+        "goals": list(investigation_plan.get("goals") or []),
+        "finish_criteria": list(investigation_plan.get("finish_criteria") or []),
+        "replan_triggers": list(investigation_plan.get("replan_triggers") or []),
     }
 
     execution = dict(state.get("execution") or {})
@@ -440,9 +608,39 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
     state["plan"] = plan
+    planner_event = {
+        "type": "planner",
+        "message": "created investigation plan",
+        "payload": {
+            "plan_id": investigation_plan.get("plan_id"),
+            "replan_count": _as_int(previous_investigation.get("replan_count"), 0),
+        },
+    }
+    max_replans = previous_investigation.get("max_replans")
+    if max_replans is None:
+        max_replans = state.get("max_replan")
+    state["investigation"] = {
+        "plan": investigation_plan,
+        "current_goal_id": str(dict(list(investigation_plan.get("goals") or [{}])[0]).get("id") or ""),
+        "goal_status": {
+            str(dict(item or {}).get("id") or f"g{idx}"): "pending"
+            for idx, item in enumerate(list(investigation_plan.get("goals") or []), start=1)
+        },
+        "evidence": [],
+        "events": [*previous_events, planner_event],
+        "pending_execution": {},
+        "last_route_result": {},
+        "last_executor_result": {},
+        "consumed_result_ids": [],
+        "retry_counts_by_goal": {},
+        "max_retries_per_goal": 2,
+        "replan_count": _as_int(dict(state.get("investigation") or {}).get("replan_count"), 0),
+        "max_replans": _as_int(max_replans, 1),
+        "failure_reason": "",
+    }
     state["execution"] = execution
     state["structured_context"] = structured
-    state["route"] = "reactor"
+    state["route"] = "plan_controller"
     _LOGGER.info(
         "planner finished hypothesis=%s goals=%d required_answers=%d rejected_count=%d",
         _clip(hypothesis, 200),

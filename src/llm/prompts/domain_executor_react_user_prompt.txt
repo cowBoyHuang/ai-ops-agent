@@ -1,0 +1,41 @@
+请基于当前领域 Executor 的目标执行一轮 ReAct 决策，并仅返回 JSON。
+
+【用户问题】
+{question}
+
+【当前 Goal】
+{current_goal_json}
+
+【Allowed Tools】
+{allowed_tools_json}
+
+【Tool Schemas】
+{tool_schemas_json}
+
+【已有 Evidence】
+{existing_evidence_json}
+
+【结构化上下文】
+{structured_context_json}
+
+输出格式：
+{
+  "thought": "说明本轮 action 如何服务当前 goal",
+  "action": {
+    "tool_name": "只能来自 Allowed Tools",
+    "params": {}
+  },
+  "final_evidence": {
+    "summary": "已完成时填写证据摘要",
+    "facts": {},
+    "evidence": [],
+    "confidence": 0.0
+  },
+  "goal_complete": false
+}
+
+规则：
+- 只能选择 Allowed Tools 中的工具。
+- 不要修改 plan，不要推进 goal。
+- 如果已有证据已经满足 success_criteria，可以不调用工具，直接填写 final_evidence 并设置 goal_complete=true。
+- 如果缺少必要上下文且无法行动，goal_complete=false，并在 final_evidence.summary 说明缺失项。

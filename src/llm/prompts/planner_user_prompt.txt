@@ -1,4 +1,4 @@
-请基于以下信息生成 hypothesis、investigation_goals、required_answers，仅输出 JSON。
+请基于以下信息生成完整 InvestigationPlanV2，仅输出 JSON。
 
 【用户问题】
 {user_query}
@@ -21,10 +21,54 @@
 【上轮重规划原因】
 {replan_reason}
 
-请识别用户问题中的“必答字段诉求”（例如字段名、标识ID、错误编码、关键状态、时间点、返回值等），
-并写入 required_answers，标记 required=true。不要限制为固定字段名集合。
+【上一版 InvestigationPlanV2（仅 replan 时有值）】
+{previous_plan_json}
 
-请特别注意：
-- required_answers 中如果有多个 required=true 字段，investigation_goals 必须拆分为多个最小执行单元。
-- 每条 goal 只能对应一个字段或一个单一信息目标，不允许把“失败原因 + 错误码”等多个目标混在同一条里。
-- required_answers 必须与“当前用户问题”严格对齐；只保留用户明确需要回答的字段，不要补充额外字段。
+【已有 Goal 状态（仅 replan 时有值）】
+{goal_status_json}
+
+【已有 Evidence（仅 replan 时有值）】
+{evidence_json}
+
+【失败 Goal（仅 replan 时有值）】
+{failed_goal_json}
+
+输出格式：
+{
+  "plan_id": "plan_001",
+  "hypothesis": "一句话根因假设",
+  "goals": [
+    {
+      "id": "g1",
+      "goal": "单一调查目标",
+      "required_capability": "runtime_evidence|business_validation|code_analysis|config_analysis",
+      "priority": 1,
+      "required": true,
+      "success_criteria": ["成功标准"],
+      "expected_evidence": ["log_event|business_doc|code_context|config_item"],
+      "depends_on": []
+    }
+  ],
+  "finish_criteria": ["根因明确", "证据链闭合", "用户问题已被直接回答"],
+  "replan_triggers": ["goal_unexecutable", "evidence_conflict", "missing_required_context", "capability_not_supported"],
+  "required_answers": [
+    {
+      "field": "用户明确要求必须回答的字段名",
+      "question": "该字段需要回答的问题",
+      "required": true
+    }
+  ]
+}
+
+规划规则：
+- Planner 必须一次性给出完整调查计划；不要只给下一步。
+- 只有当上一版计划、已有 Evidence、失败 Goal 或重规划原因存在时，才把本次输出视为 replan。
+- replan 时必须避开已证伪假设，并基于失败原因调整完整计划。
+- Planner 只决定调查目标和所需能力，不决定 Executor，也不调用工具。
+- required_capability 只能取 runtime_evidence、business_validation、code_analysis、config_analysis。
+- 每个 goal 必须包含 id、goal、required_capability、priority、required、success_criteria、expected_evidence、depends_on。
+- goals 必须是最小执行单元：每条 goal 只服务一个字段或一个单一信息目标。
+- required_answers 中如果有多个 required=true 字段，goal 数量必须不少于 required=true 字段数量，并做到一字段一目标。
+- required_answers 必须与当前用户问题严格对齐，只保留用户明确需要回答的字段，不要补充额外字段。
+- 不要把 required_answers 限制为固定字段集合，按当前问题动态生成。
+- 严禁输出 tool_name、app_code、logname、match_phrase_list、match_list、DSL、SQL、代码行号或任何工具参数。

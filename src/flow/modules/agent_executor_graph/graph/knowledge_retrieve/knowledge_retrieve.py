@@ -128,8 +128,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     execution.setdefault("goal_index", goal_index)
     state["execution"] = execution
 
-    # 初次检索（尚无 hypothesis）先进入 Planner；补证场景直接回 Reactor。
-    state["route"] = "planner" if not hypothesis else "reactor"
+    # 初次检索先进入 Planner；已有 V2 调查计划时回 Plan Controller。
+    state["route"] = "plan_controller" if dict(state.get("investigation") or {}).get("plan") else "planner"
     _LOGGER.info(
         "knowledge_retrieve done route=%s goal_index=%d objective=%s hypothesis_present=%s sub_chunks=%d parent_chunks=%d parent_docs=%d domain_docs=%d case_docs=%d code_docs=%d",
         state["route"],

@@ -10,15 +10,19 @@ from langchain_core.runnables import Runnable
 from langgraph.graph import END, START, StateGraph
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
+from flow.modules.agent_executor_graph.graph.capability_router.capability_router import run as capability_router_run
+from flow.modules.agent_executor_graph.graph.domain_executors.code_executor import run as code_executor_run
+from flow.modules.agent_executor_graph.graph.domain_executors.config_executor import run as config_executor_run
+from flow.modules.agent_executor_graph.graph.domain_executors.knowledge_executor import run as domain_knowledge_executor_run
+from flow.modules.agent_executor_graph.graph.domain_executors.log_executor import run as log_executor_run
 from flow.modules.agent_executor_graph.graph.fixed_flow_execute.fixed_flow_execute import run as fixed_flow_execute_run
 from flow.modules.agent_executor_graph.graph.intent_decide.intent_decide import run as intent_decide_run
 from flow.modules.agent_executor_graph.graph.knowledge_retrieve.knowledge_retrieve import run as knowledge_retrieve_run
-from flow.modules.agent_executor_graph.graph.observer.observer import run as observer_run
+from flow.modules.agent_executor_graph.graph.plan_controller.plan_controller import run as plan_controller_run
 from flow.modules.agent_executor_graph.graph.planner.planner import run as planner_run
 from flow.modules.agent_executor_graph.graph.query_rewrite.query_rewrite import run as query_rewrite_run
-from flow.modules.agent_executor_graph.graph.reactor.reactor import run as reactor_run
-from flow.modules.agent_executor_graph.graph.replan.replan import run as replan_run
 from flow.modules.agent_executor_graph.graph.state_build.state_build import run as state_build_run
+from flow.modules.agent_executor_graph.graph.summary.summary import run as summary_run
 
 _FALLBACK_MESSAGE = "暂未能自动定位问题，请联系人工排查。"
 _LOGGER = logging.getLogger(__name__)
@@ -91,16 +95,25 @@ def _route_after_intent_decide(state: dict[str, Any]) -> str:
 
 def _route_after_knowledge_retrieve(state: dict[str, Any]) -> str:
     route = str(state.get("route") or "planner")
-    if route in {"planner", "reactor"}:
+    if route in {"planner", "plan_controller"}:
         return route
     return "fallback"
 
 
-def _route_after_observer(state: dict[str, Any]) -> str:
+def _route_after_plan_controller(state: dict[str, Any]) -> str:
     route = str(state.get("route") or "").strip()
-    if route in {"reactor", "replan", "finish", "fallback"}:
+    if route in {
+        "planner",
+        "capability_router",
+        "log_executor",
+        "code_executor",
+        "knowledge_executor",
+        "config_executor",
+        "summary",
+        "fallback",
+    }:
         return route
-    _LOGGER.info("route_after_observer route=%s -> fallback", route)
+    _LOGGER.info("route_after_plan_controller route=%s -> fallback", route)
     return "fallback"
 
 
@@ -114,9 +127,13 @@ def build_langgraph_graph() -> Runnable:
     graph.add_node("query_rewrite", query_rewrite_run)
     graph.add_node("knowledge_retrieve", knowledge_retrieve_run)
     graph.add_node("planner", planner_run)
-    graph.add_node("reactor", reactor_run)
-    graph.add_node("observer", observer_run)
-    graph.add_node("replan", replan_run)
+    graph.add_node("plan_controller", plan_controller_run)
+    graph.add_node("capability_router", capability_router_run)
+    graph.add_node("log_executor", log_executor_run)
+    graph.add_node("code_executor", code_executor_run)
+    graph.add_node("knowledge_executor", domain_knowledge_executor_run)
+    graph.add_node("config_executor", config_executor_run)
+    graph.add_node("summary", summary_run)
     graph.add_node("finish", _finish_node)
     graph.add_node("fallback", _fallback_node)
 
@@ -141,23 +158,31 @@ def build_langgraph_graph() -> Runnable:
         _route_after_knowledge_retrieve,
         {
             "planner": "planner",
-            "reactor": "reactor",
+            "plan_controller": "plan_controller",
             "fallback": "fallback",
         },
     )
-    graph.add_edge("planner", "reactor")
-    graph.add_edge("reactor", "observer")
+    graph.add_edge("planner", "plan_controller")
     graph.add_conditional_edges(
-        "observer",
-        _route_after_observer,
+        "plan_controller",
+        _route_after_plan_controller,
         {
-            "reactor": "reactor",
-            "replan": "replan",
-            "finish": "finish",
+            "planner": "planner",
+            "capability_router": "capability_router",
+            "log_executor": "log_executor",
+            "code_executor": "code_executor",
+            "knowledge_executor": "knowledge_executor",
+            "config_executor": "config_executor",
+            "summary": "summary",
             "fallback": "fallback",
         },
     )
-    graph.add_edge("replan", "planner")
+    graph.add_edge("capability_router", "plan_controller")
+    graph.add_edge("log_executor", "plan_controller")
+    graph.add_edge("code_executor", "plan_controller")
+    graph.add_edge("knowledge_executor", "plan_controller")
+    graph.add_edge("config_executor", "plan_controller")
+    graph.add_edge("summary", "finish")
 
     graph.add_edge("finish", END)
     graph.add_edge("fallback", END)
