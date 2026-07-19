@@ -33,12 +33,6 @@ _FLIGHT_CREATE_ORDER_APP_CODE = "f_tts_trade_core"
 _FLIGHT_CREATE_ORDER_LOGNAME = "tts"
 _CREATE_ORDER_APP_CODE = "f_tts_trade_order"
 _CREATE_ORDER_LOGNAME = "ttsorder"
-_FIXED_METHOD_SCOPE: dict[str, tuple[str, str]] = {
-    "getFlightCreateOrderResult": (_FLIGHT_CREATE_ORDER_APP_CODE, _FLIGHT_CREATE_ORDER_LOGNAME),
-    "get_flight_create_order_result": (_FLIGHT_CREATE_ORDER_APP_CODE, _FLIGHT_CREATE_ORDER_LOGNAME),
-    "getCreateOrderResult": (_CREATE_ORDER_APP_CODE, _CREATE_ORDER_LOGNAME),
-    "get_create_order_result": (_CREATE_ORDER_APP_CODE, _CREATE_ORDER_LOGNAME),
-}
 
 
 def _read_env_file() -> dict[str, str]:
@@ -223,14 +217,6 @@ def _normalize_query_lists(content: str | list[str] | dict[str, Any]) -> tuple[l
 
     terms = _normalize_content_terms(content)
     return [], terms
-
-
-def resolve_log_method_scope(*, method: str, app_code: str, logname: str) -> tuple[str, str, bool]:
-    normalized_method = str(method or "").strip()
-    fixed = _FIXED_METHOD_SCOPE.get(normalized_method)
-    if fixed is not None:
-        return fixed[0], fixed[1], True
-    return str(app_code or "").strip(), str(logname or "").strip(), False
 
 
 def _build_content_clause(
@@ -673,90 +659,6 @@ def get_create_order_result(
         end_time=end_time,
         match_phrase_list=phrase_list,
         match_list=[],
-        config=config,
-    )
-
-
-def execute_log_query_method(
-    *,
-    method: str,
-    app_code: str,
-    logname: str,
-    begin_time: dt.datetime | str,
-    end_time: dt.datetime | str,
-    match_phrase_list: list[str] | None = None,
-    match_list: list[str] | None = None,
-    trace_id: str = "",
-    config: LogApiConfig | None = None,
-) -> list[EsResult]:
-    """Agent 日志查询统一分发入口（所有调用方法收敛在 log.py）。"""
-    normalized_method = str(method or "").strip()
-    resolved_app_code, resolved_logname, _ = resolve_log_method_scope(
-        method=normalized_method,
-        app_code=app_code,
-        logname=logname,
-    )
-    phrase_list = [str(item).strip() for item in list(match_phrase_list or []) if str(item).strip()]
-    fuzzy_list = [str(item).strip() for item in list(match_list or []) if str(item).strip()]
-    final_trace_id = str(trace_id or "").strip()
-    if not final_trace_id:
-        for token in phrase_list:
-            lowered = token.lower()
-            if "slugger" in lowered or "flight_supply_open_api" in lowered:
-                final_trace_id = token
-                break
-    if not final_trace_id:
-        for token in phrase_list:
-            if len(token) >= 12 and any(ch.isdigit() for ch in token):
-                final_trace_id = token
-                break
-
-    if normalized_method in {"getFlightCreateOrderResult", "get_flight_create_order_result"}:
-        return get_flight_create_order_result(
-            trace_id=final_trace_id,
-            begin_time=begin_time,
-            end_time=end_time,
-            app_code=resolved_app_code,
-            logname=resolved_logname,
-            config=config,
-        )
-    if normalized_method in {"getCreateOrderResult", "get_create_order_result"}:
-        return get_create_order_result(
-            trace_id=final_trace_id,
-            begin_time=begin_time,
-            end_time=end_time,
-            app_code=resolved_app_code,
-            logname=resolved_logname,
-            config=config,
-        )
-    if normalized_method in {"dependency_log_query", "query_dependency_log"}:
-        return dependency_log_query(
-            app_code=resolved_app_code,
-            logname=resolved_logname,
-            begin_time=begin_time,
-            end_time=end_time,
-            match_phrase_list=phrase_list,
-            match_list=fuzzy_list,
-            config=config,
-        )
-    if normalized_method in {"queryLog", "query_log", "log_query", ""}:
-        return query_log(
-            app_code=resolved_app_code,
-            logname=resolved_logname,
-            begin_time=begin_time,
-            end_time=end_time,
-            match_phrase_list=phrase_list,
-            match_list=fuzzy_list,
-            config=config,
-        )
-    # 未识别方法默认走 log_query。
-    return query_log(
-        app_code=resolved_app_code,
-        logname=resolved_logname,
-        begin_time=begin_time,
-        end_time=end_time,
-        match_phrase_list=phrase_list,
-        match_list=fuzzy_list,
         config=config,
     )
 

@@ -6,39 +6,30 @@ import json
 import logging
 import re
 import datetime as dt
-from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
-from flow.modules.agent_executor_graph.graph.executor.sub_executor import run_code_sub_executor, run_log_sub_executor
+from flow.modules.agent_executor_graph.graph.executor.sub_executor import run_log_sub_executor
 from flow.modules.agent_executor_graph.graph.rag_retrieve.rag_retrieve import (
-    query_parent_docs_from_rag,
     resolve_intent_label_for_rag,
 )
 from llm.llm import chat_with_llm, load_prompt, render_prompt
+from tool.registry import build_tool_schemas_for_prompt, get_all_tools, invoke_tool
 
 _LOGGER = logging.getLogger(__name__)
-_SKILLS_ROOT = Path(__file__).resolve().parents[5] / "skills"
-_ALLOWED_TOOLS = {
-    "log_query",
-    "dependency_log_query",
-    "knowledge_lookup",
-    "code_pull",
-    "code_clone",
-    "rag_parent_chunk_query",
-}
+_ALLOWED_TOOLS = {tool.name for tool in get_all_tools()}
 _TOOL_ALIASES = {
-    "query_log": "log_query",
-    "log_query": "log_query",
+    "querylog": "queryLog",
+    "query_log": "queryLog",
+    "log_query": "queryLog",
+    "getcreateorderresult": "getCreateOrderResult",
+    "get_create_order_result": "getCreateOrderResult",
+    "getflightcreateorderresult": "getFlightCreateOrderResult",
+    "get_flight_create_order_result": "getFlightCreateOrderResult",
     "query_dependency_log": "dependency_log_query",
     "dependency_log_query": "dependency_log_query",
     "knowledge_lookup": "knowledge_lookup",
     "knowledge_search": "knowledge_lookup",
-    "fetch_code": "code_pull",
-    "code_pull": "code_pull",
-    "clone_code": "code_clone",
-    "code_clone": "code_clone",
     "rag_parent_chunk_query": "rag_parent_chunk_query",
     "query_rag_parent_chunk": "rag_parent_chunk_query",
     "rag_parent_doc_query": "rag_parent_chunk_query",
@@ -98,90 +89,13 @@ def _normalize_tool_name(value: Any) -> str:
     return mapped if mapped in _ALLOWED_TOOLS else ""
 
 
-@lru_cache(maxsize=1)
-def _load_skill_catalog() -> list[dict[str, str]]:
-    if not _SKILLS_ROOT.exists():
-        return []
-    rows: list[dict[str, str]] = []
-    for skill_file in sorted(_SKILLS_ROOT.rglob("SKILL.md")):
-        try:
-            content = skill_file.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        rows.append(
-            {
-                "path": str(skill_file.resolve()),
-                "content": content,
-            }
-        )
-    return rows
-
-
 def _build_tool_schemas() -> list[dict[str, Any]]:
-    return [
-        {
-            "tool_name": "log_query",
-            "description": "主链路日志查询",
-            "params_schema": {
-                "log_method": "queryLog|getFlightCreateOrderResult|getCreateOrderResult",
-                "begin_time": "必填",
-                "end_time": "必填",
-                "app_code": "queryLog 必填；业务封装方法可省略",
-                "logname": "queryLog 必填；业务封装方法可省略",
-                "match_phrase_list": "精确词数组。queryLog 时仅允许 traceId/orderNo（可同时包含），且至少包含一个",
-                "match_list": "模糊词数组。queryLog 时必须为空数组 []（禁止模糊扩召回）",
-                "trace_id": "可选，建议传入",
-                "keyword_extraction_hint": "queryLog 关键词规则：match_phrase_list 只放 traceId/orderNo；match_list 固定为 []；若缺少 traceId/orderNo，先继续使用业务封装方法或从上下文/历史补齐后再调用 queryLog",
-            },
-        },
-        {
-            "tool_name": "dependency_log_query",
-            "description": "依赖链路日志查询",
-            "params_schema": {
-                "log_method": "可选。若设为 queryLog，则必须遵循 queryLog 约束",
-                "begin_time": "必填",
-                "end_time": "必填",
-                "app_code": "必填",
-                "logname": "必填",
-                "match_phrase_list": "精确词数组；当 log_method=queryLog 时仅允许 traceId/orderNo 且至少一个",
-                "match_list": "模糊词数组；当 log_method=queryLog 时必须为空数组 []",
-            },
-        },
-        {
-            "tool_name": "knowledge_lookup",
-            "description": "从已检索知识上下文中取证据片段",
-            "params_schema": {},
-        },
-        {
-            "tool_name": "code_pull",
-            "description": "代码检索",
-            "params_schema": {
-                "query": "代码检索关键词",
-            },
-        },
-        {
-            "tool_name": "code_clone",
-            "description": "代码拉取/扩展检索",
-            "params_schema": {
-                "query": "代码检索关键词",
-            },
-        },
-        {
-            "tool_name": "rag_parent_chunk_query",
-            "description": "RAG 父文档检索",
-            "params_schema": {
-                "query": "检索问题",
-                "sub_chunk_top_k": "可选",
-                "parent_top_k": "可选",
-            },
-        },
-    ]
+    return build_tool_schemas_for_prompt()
 
 
 def _summarize_tool_params(params: dict[str, Any]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for key in (
-        "log_method",
         "trace_id",
         "order_id",
         "begin_time",
@@ -325,7 +239,6 @@ def _decide_skill_with_llm(
         previous_observation_json=json.dumps(previous_observation, ensure_ascii=False),
         tool_schemas_json=json.dumps(_build_tool_schemas(), ensure_ascii=False),
         history_preview=_build_history_preview([dict(item) for item in list(state.get("tool_history") or [])]),
-        skill_catalog_json=json.dumps(_load_skill_catalog(), ensure_ascii=False),
         force_querylog="true" if force_querylog else "false",
         force_querylog_reason=str(force_querylog_reason or "").strip(),
     )
@@ -335,17 +248,19 @@ def _decide_skill_with_llm(
 
     action = parsed.get("action")
     action_dict = dict(action) if isinstance(action, dict) else {}
-    tool_name = _normalize_tool_name(action_dict.get("tool_name") or parsed.get("tool_name"))
     params = action_dict.get("params")
     params_dict = dict(params) if isinstance(params, dict) else dict(parsed.get("params") or {})
-    skill = str(parsed.get("skill") or params_dict.get("log_method") or "").strip()
+    legacy_method = str(params_dict.pop("log_method", "") or "").strip()
+    candidate_tool = action_dict.get("tool_name") or parsed.get("tool_name")
+    if legacy_method and str(candidate_tool or "").strip().lower() in {"", "log_query", "query_log"}:
+        candidate_tool = legacy_method
+    tool_name = _normalize_tool_name(candidate_tool)
+    skill = str(parsed.get("skill") or tool_name or "").strip()
 
     if not tool_name:
-        tool_name = "log_query"
-    if tool_name in {"log_query", "dependency_log_query"} and skill and not str(params_dict.get("log_method") or "").strip():
-        params_dict["log_method"] = skill
+        tool_name = "queryLog"
     if not skill:
-        skill = str(params_dict.get("log_method") or tool_name)
+        skill = tool_name
 
     return {
         "skill": skill,
@@ -545,19 +460,26 @@ def _execute_tool_call(*, tool_name: str, params: dict[str, Any], state: dict[st
         "params": params,
     }
     structured_context = dict(state.get("structured_context") or {})
-    if tool_name in {"log_query", "dependency_log_query"}:
+    if tool_name in {"queryLog", "dependency_log_query", "getCreateOrderResult", "getFlightCreateOrderResult"}:
         return run_log_sub_executor(step=step, state=state, structured_context=structured_context)
-    if tool_name in {"code_pull", "code_clone"}:
-        return run_code_sub_executor(step=step, state=state, structured_context=structured_context)
     if tool_name == "rag_parent_chunk_query":
         question = str(params.get("query") or state.get("question") or "").strip()
         intent_zh = resolve_intent_label_for_rag(state)
-        sub_chunks, parent_chunks, parent_docs = query_parent_docs_from_rag(
-            question=question,
-            intent_zh=intent_zh,
-            sub_chunk_top_k=params.get("sub_chunk_top_k"),
-            parent_top_k=params.get("parent_top_k"),
+        raw = invoke_tool(
+            "rag_parent_chunk_query",
+            {
+                "query": question,
+                "intent_zh": intent_zh,
+                "sub_chunk_top_k": params.get("sub_chunk_top_k"),
+                "parent_top_k": params.get("parent_top_k"),
+            },
         )
+        if isinstance(raw, dict) and raw.get("ok") is False:
+            return raw
+        raw_dict = dict(raw or {}) if isinstance(raw, dict) else {}
+        sub_chunks = list(raw_dict.get("sub_chunks") or [])
+        parent_chunks = list(raw_dict.get("parent_chunks") or [])
+        parent_docs = list(raw_dict.get("parent_docs") or [])
         evidence = [
             f"[sub_chunk#{idx + 1}] score={item.get('score')} path={dict(item.get('payload') or {}).get('path')}"
             for idx, item in enumerate(sub_chunks[:3])
@@ -574,20 +496,12 @@ def _execute_tool_call(*, tool_name: str, params: dict[str, Any], state: dict[st
         }
     if tool_name == "knowledge_lookup":
         docs = list(dict(state.get("knowledge_context") or {}).get("domain_docs") or [])
-        snippets = [str(dict(item).get("content") or "").strip() for item in docs[:2] if str(dict(item).get("content") or "").strip()]
-        return {
-            "tool": "knowledge_lookup",
-            "ok": bool(snippets),
-            "error": "" if snippets else "knowledge empty",
-            "evidence": snippets,
-            "effective_info": {"summary": snippets[0] if snippets else "", "keywords": []},
-        }
-    return {
-        "tool": tool_name,
-        "ok": False,
-        "error": f"unsupported tool: {tool_name}",
-        "evidence": [],
-    }
+        raw = invoke_tool("knowledge_lookup", {"docs": docs})
+        return dict(raw or {}) if isinstance(raw, dict) else {"tool": "knowledge_lookup", "ok": False, "error": "invalid tool result", "evidence": []}
+    raw = invoke_tool(tool_name, params)
+    if isinstance(raw, dict):
+        return raw
+    return {"tool": tool_name, "ok": True, "error": "", "evidence": [str(raw)]}
 
 
 def _infer_conclusion(*, objective: str, hypothesis: str, raw_result: dict[str, Any]) -> str:
@@ -675,9 +589,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         _clip(skill_decision.get("llm_raw"), 320),
     )
 
-    tool_name = str(skill_decision.get("tool_name") or "log_query")
+    tool_name = str(skill_decision.get("tool_name") or "queryLog")
     tool_params = dict(skill_decision.get("params") or {})
-    tool_params.setdefault("log_method", str(skill_decision.get("skill") or tool_name))
     tool_params.setdefault("query", str(state.get("question") or ""))
     for key, value in _build_required_tool_params(state).items():
         if value:

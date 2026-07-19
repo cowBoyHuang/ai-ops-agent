@@ -18,7 +18,18 @@ _TRACE_ID_PATTERN = re.compile(r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_suppl
 _ORDER_ID_PATTERN = re.compile(r"\b(?:xep|sid|hpv|zvp)[A-Za-z0-9]{6,}\b", re.IGNORECASE)
 _ASCII_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:\-]{6,128}$")
 _QUERYLOG_METHOD_ALIASES = {"querylog", "query_log", "log_query", ""}
-_LOG_QUERY_TOOLS = {"log_query", "dependency_log_query", "query_log"}
+_LOG_QUERY_TOOLS = {"querylog", "dependency_log_query"}
+_LEGACY_TOOL_ALIASES = {
+    "querylog": "queryLog",
+    "query_log": "queryLog",
+    "log_query": "queryLog",
+    "getcreateorderresult": "getCreateOrderResult",
+    "get_create_order_result": "getCreateOrderResult",
+    "getflightcreateorderresult": "getFlightCreateOrderResult",
+    "get_flight_create_order_result": "getFlightCreateOrderResult",
+    "dependency_log_query": "dependency_log_query",
+    "query_dependency_log": "dependency_log_query",
+}
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -40,6 +51,16 @@ def _summarize_tool_params(params: dict[str, Any]) -> dict[str, Any]:
     if "query" in params and "query" not in summary:
         summary["query"] = _clip(params.get("query"), 120)
     return summary
+
+
+def _normalize_legacy_tool_decision(tool_name: str, params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    cleaned = dict(params or {})
+    legacy_method = str(cleaned.pop("log_method", "") or "").strip()
+    candidate = str(tool_name or "").strip()
+    if legacy_method and candidate.lower() in {"", "log_query", "query_log"}:
+        candidate = legacy_method
+    normalized = _LEGACY_TOOL_ALIASES.get(candidate.lower(), candidate)
+    return normalized or "queryLog", cleaned
 
 
 def _build_goal_history_preview(*, objective: str, action_chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -399,15 +420,12 @@ def _should_force_querylog_fallback(
 
 def _is_querylog_call(*, tool_name: str, tool_params: dict[str, Any]) -> bool:
     normalized_tool = str(tool_name or "").strip().lower()
-    if normalized_tool not in {"log_query", "dependency_log_query", "query_log"}:
-        return False
-    normalized_method = str(
-        tool_params.get("log_method")
-        or tool_params.get("method")
-        or tool_params.get("skill")
-        or ""
-    ).strip().lower()
-    return normalized_method in _QUERYLOG_METHOD_ALIASES
+    if normalized_tool == "querylog":
+        return True
+    if normalized_tool in {"log_query", "query_log"}:
+        normalized_method = str(tool_params.get("method") or tool_params.get("skill") or "").strip().lower()
+        return normalized_method in _QUERYLOG_METHOD_ALIASES
+    return False
 
 
 def _validate_querylog_params(*, tool_name: str, tool_params: dict[str, Any]) -> str:
@@ -655,9 +673,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             )
             break
 
-        tool_name = str(skill_decision.get("tool_name") or "log_query")
-        tool_params = dict(skill_decision.get("params") or {})
-        tool_params.setdefault("log_method", str(skill_decision.get("skill") or tool_name))
+        raw_tool_name = str(skill_decision.get("tool_name") or "queryLog")
+        tool_name, tool_params = _normalize_legacy_tool_decision(raw_tool_name, dict(skill_decision.get("params") or {}))
         tool_params.setdefault("query", str(state.get("question") or ""))
         required_tool_params = dict(executor_mod._build_required_tool_params(state) or {})
         context_locked_keys = {"trace_id", "traceId", "order_id", "orderNo", "begin_time", "end_time"}

@@ -9,7 +9,9 @@ import re
 from typing import Any
 
 from llm.llm import chat_with_llm
-from log.log import EsResult, execute_log_query_method, resolve_log_method_scope
+from log.log import EsResult
+from tool.code_index_client import analyze_code_from_logs
+from tool.registry import invoke_tool
 
 _MAX_LOG_ROWS = 8
 _MAX_LOG_EVIDENCE_CHARS = 10000
@@ -41,6 +43,42 @@ _DECISIVE_HINTS = (
     "failres",
     "block_reason",
 )
+_DIRECT_FACT_KEYS = (
+    "bizErrorCode",
+    "subErrorCode",
+    "refSubErrorCode",
+    "errorCode",
+    "errMsg",
+    "errorMsg",
+    "block_reason",
+    "reason",
+    "failRes",
+)
+_DIRECT_SUMMARY_TOKENS = (
+    "bizerrorcode",
+    "suberrorcode",
+    "refsuberrorcode",
+    "errormsg",
+    "errmsg",
+    "block_reason",
+    "校验不通过",
+    "很抱歉",
+    "connection refused",
+    "timeout",
+)
+_LOG_TOOL_ALIASES = {
+    "querylog": "queryLog",
+    "query_log": "queryLog",
+    "log_query": "queryLog",
+    "getcreateorderresult": "getCreateOrderResult",
+    "get_create_order_result": "getCreateOrderResult",
+    "getflightcreateorderresult": "getFlightCreateOrderResult",
+    "get_flight_create_order_result": "getFlightCreateOrderResult",
+    "dependency_log_query": "dependency_log_query",
+    "query_dependency_log": "dependency_log_query",
+}
+_TOOLS_REQUIRING_UPSTREAM_SCOPE = {"queryLog", "dependency_log_query"}
+_FIXED_SCOPE_LOG_TOOLS = {"getCreateOrderResult", "getFlightCreateOrderResult"}
 
 
 def _as_datetime(value: Any) -> dt.datetime | None:
@@ -88,6 +126,11 @@ def _pick_upstream_value(
         if key in params and params.get(key) is not None and str(params.get(key)).strip():
             return params.get(key)
     return None
+
+
+def _resolve_registered_log_tool_name(tool_name: str, params: dict[str, Any]) -> str:
+    raw = str(params.pop("log_method", "") or tool_name or "queryLog").strip()
+    return _LOG_TOOL_ALIASES.get(raw.lower(), raw)
 
 
 def _extract_backup_keywords(question: str) -> list[str]:
@@ -324,11 +367,29 @@ def _extract_effective_info(tool_name: str, query_word: str, rows: list[EsResult
     }
 
 
+def _log_has_direct_answer(rows: list[EsResult], extracted: dict[str, Any]) -> bool:
+    if not rows:
+        return False
+    facts = dict(extracted.get("facts") or {})
+    for key in _DIRECT_FACT_KEYS:
+        value = str(facts.get(key) or "").strip()
+        if value:
+            return True
+    summary = str(extracted.get("summary") or "").strip()
+    lowered_summary = summary.lower()
+    if "未检索到日志命中" in summary:
+        return False
+    if any(token in lowered_summary for token in _DIRECT_SUMMARY_TOKENS):
+        return True
+    merged = "\n".join(str(item.content or "") for item in rows).lower()
+    return any(token in merged for token in _DIRECT_SUMMARY_TOKENS)
+
+
 def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict[str, Any]) -> dict[str, Any]:
-    tool_name = str(step.get("tool_name") or "log_query")
+    tool_name = str(step.get("tool_name") or "queryLog")
     params = dict(step.get("params") or {})
-    query_method = str(params.get("log_method") or tool_name or "log_query").strip()
-    normalized_method = query_method.lower()
+    registered_tool = _resolve_registered_log_tool_name(tool_name, params)
+    normalized_method = registered_tool.lower()
     begin_raw = _pick_upstream_value(
         params,
         structured_context,
@@ -367,11 +428,8 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
         }
     requested_app_code = str(params.get("app_code") or structured_context.get("app_code") or "").strip()
     requested_logname = str(params.get("logname") or structured_context.get("logname") or "").strip()
-    app_code, logname, fixed_scope = resolve_log_method_scope(
-        method=query_method,
-        app_code=requested_app_code,
-        logname=requested_logname,
-    )
+    app_code = requested_app_code
+    logname = requested_logname
     raw_phrase_list = params.get("match_phrase_list")
     raw_match_list = params.get("match_list")
     match_phrase_list = _sanitize_match_phrase_terms(_normalize_terms(raw_phrase_list))
@@ -436,7 +494,7 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     # 兜底 queryLog 强约束：
     # - match_phrase_list 必须至少包含一个 traceId/orderNo 类标识；
     # - match_list 必须为空（禁止模糊扩召回）。
-    if normalized_method in {"querylog", "query_log", "log_query", ""}:
+    if registered_tool == "queryLog":
         strict_phrase_list: list[str] = []
         for token in [*match_phrase_list, *forced_terms]:
             text = str(token or "").strip()
@@ -466,8 +524,8 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
             "evidence": [],
         }
 
-    # 仅通用 queryLog 要求上游透传 app/log，业务技能方法使用固定作用域。
-    if not app_code or not logname:
+    # 仅通用 queryLog / 依赖日志要求上游透传 app/log，业务技能方法使用固定作用域。
+    if registered_tool in _TOOLS_REQUIRING_UPSTREAM_SCOPE and (not app_code or not logname):
         extracted = _extract_effective_info(
             tool_name,
             query_word_for_prompt,
@@ -494,51 +552,83 @@ def run(*, step: dict[str, Any], state: dict[str, Any], structured_context: dict
     }
     dispatch_trace_id = _pick_trace_id_for_dispatch(params, query_payload.get("match_phrase_list") or [])
     _LOGGER.info(
-        "log_executor query method=%s tool=%s requested_app_code=%s requested_logname=%s effective_app_code=%s effective_logname=%s fixed_scope=%s trace_id=%s match_phrase_list=%s match_list=%s",
-        query_method,
-        tool_name,
+        "log_executor query tool=%s requested_app_code=%s requested_logname=%s effective_app_code=%s effective_logname=%s trace_id=%s match_phrase_list=%s match_list=%s",
+        registered_tool,
         _clip_for_log(requested_app_code, 80),
         _clip_for_log(requested_logname, 80),
         _clip_for_log(app_code, 80),
         _clip_for_log(logname, 80),
-        fixed_scope,
         _clip_for_log(dispatch_trace_id, 100),
         [_clip_for_log(item, 80) for item in query_payload.get("match_phrase_list") or []],
         [_clip_for_log(item, 80) for item in query_payload.get("match_list") or []],
     )
+    if registered_tool in _FIXED_SCOPE_LOG_TOOLS:
+        tool_args = {
+            "trace_id": dispatch_trace_id,
+            "begin_time": begin_time,
+            "end_time": end_time,
+        }
+    else:
+        tool_args = {
+            "app_code": app_code,
+            "logname": logname,
+            "begin_time": begin_time,
+            "end_time": end_time,
+            "match_phrase_list": query_payload.get("match_phrase_list"),
+            "match_list": query_payload.get("match_list"),
+        }
     try:
-        rows = execute_log_query_method(
-            method=query_method,
-            app_code=app_code,
-            logname=logname,
-            begin_time=begin_time,
-            end_time=end_time,
-            match_phrase_list=query_payload.get("match_phrase_list"),
-            match_list=query_payload.get("match_list"),
-            trace_id=dispatch_trace_id,
-        )
+        rows = invoke_tool(registered_tool, tool_args)
     except Exception as exc:  # noqa: BLE001
-        _LOGGER.warning("log_executor query failed tool=%s method=%s error=%s", tool_name, query_method, exc)
-        return {"tool": tool_name, "ok": False, "error": str(exc), "evidence": []}
+        _LOGGER.warning("log_executor query failed tool=%s error=%s", registered_tool, exc)
+        return {"tool": registered_tool, "ok": False, "error": str(exc), "evidence": []}
+    if isinstance(rows, dict) and rows.get("ok") is False:
+        return {
+            "tool": str(rows.get("tool") or registered_tool),
+            "ok": False,
+            "error": str(rows.get("error") or ""),
+            "evidence": list(rows.get("evidence") or []),
+        }
 
     evidence_rows = _select_rows_for_evidence(rows)
     extracted = _extract_effective_info(tool_name, query_word_for_prompt, evidence_rows)
     evidence = [_clip_log_text(item.content or "") for item in evidence_rows]
     if extracted.get("summary"):
         evidence.insert(0, f"[summary] {str(extracted['summary'])}")
+    code_analysis: dict[str, Any] = {}
+    if not _log_has_direct_answer(evidence_rows, extracted):
+        code_analysis = analyze_code_from_logs(
+            question=str(state.get("question") or ""),
+            evidence_rows=evidence,
+            extra_keywords=[str(item or "") for item in list(extracted.get("keywords") or [])],
+        )
+        if bool(code_analysis.get("ok")):
+            evidence.extend([str(item) for item in list(code_analysis.get("evidence") or []) if str(item).strip()])
+            facts = dict(extracted.get("facts") or {})
+            facts["code_index_context"] = {
+                "mode": str(code_analysis.get("mode") or ""),
+                "current_method": dict(code_analysis.get("current_method") or {}),
+                "caller_count": len(list(code_analysis.get("caller") or [])),
+                "callee_count": len(list(code_analysis.get("callee") or [])),
+            }
+            extracted["facts"] = facts
+            code_summary = str(code_analysis.get("summary") or "").strip()
+            if code_summary:
+                log_summary = str(extracted.get("summary") or "").strip()
+                extracted["summary"] = f"{log_summary}；代码补充：{code_summary}" if log_summary else code_summary
     _LOGGER.info(
-        "log_executor done tool=%s method=%s log_hit_count=%d selected_rows=%d summary=%s",
-        tool_name,
-        query_method,
+        "log_executor done tool=%s log_hit_count=%d selected_rows=%d summary=%s",
+        registered_tool,
         len(rows),
         len(evidence_rows),
         _clip_for_log(extracted.get("summary"), 220),
     )
     return {
-        "tool": tool_name,
+        "tool": registered_tool,
         "ok": True,
         "error": "",
         "evidence": evidence,
         "effective_info": extracted,
         "log_hit_count": len(rows),
+        "code_analysis": code_analysis,
     }

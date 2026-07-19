@@ -15,9 +15,6 @@
 【当前子任务】
 {current_subtask_json}
 
-【Skill 文件（路径 + 内容，必须阅读）】
-{skill_catalog_json}
-
 【上一步观察结果（Observation）】
 {previous_observation_json}
 
@@ -40,10 +37,10 @@
    - 本轮 action 必须直接服务该字段/对象，不要做与当前目标无关的泛化检索。
 1. 从 required_answers 中识别“本 goal 仍缺失的必要字段”。
 2. 从 planner_knowledge_json 中定位与该字段最相关的文档证据（字段定义、日志位置、系统边界）。
-3. 从 skill_catalog_json 中选择最可能直接获得该字段的 skill。
+3. 从 tool_schemas_json 中选择最可能直接获得该字段的注册工具。
 3.1 如果 goal 是“获取具体字段值”（例如年龄/错误码/姓名），优先日志查询类工具；文档检索工具仅用于补充线索，不可替代字段取值查询。
 4. 若最近历史中同类调用已执行但字段仍缺失，必须切换 skill/方法/范围，不得重复相同调用。
-4.1 若进入多轮 reactor（act>=2），禁止选择与历史“完全相同”的调用（tool_name、log_method、app_code/logname、match_phrase_list、match_list 全相同）。
+4.1 若进入多轮 reactor（act>=2），禁止选择与历史“完全相同”的调用（tool_name、app_code/logname、match_phrase_list、match_list 全相同）。
     若要复用同一工具，必须给出参数变化后的新调用。
 5. 若关键字段仍未获得，优先继续补证并保持 advance_plan_step=false；若多次重试后仍无法精确命中，可输出“相近字段+不确定性说明+下一步排查建议”，并允许推进。
 6. 若本轮选择 queryLog：
@@ -55,7 +52,7 @@
    - 先执行“问题-文档匹配”：根据用户问题与当前 goal，从 planner_knowledge_json 中选择最相关的 1-2 篇 RAG 文档（优先字段定义明确、系统边界明确的文档）。
    - 你选择的 app_code/logname 必须来自这 1-2 篇文档给出的业务语义与系统边界；不要忽略与用户问题直接相关的文档。
    - 若文档间有冲突，优先选择与“用户问题对象”最一致的文档（例如用户问机票子单，就优先机票子单链路文档，而不是总单聚合文档）。
-   - 本轮 action 必须选择 `tool_name=log_query` 且 `params.log_method=queryLog`；
+   - 本轮 action 必须选择 `tool_name=queryLog`；
    - 必须生成完整参数：`app_code`、`logname`、`begin_time`、`end_time`、`match_phrase_list`、`match_list=[]`；
-   - 不允许输出 knowledge_lookup/code_* 作为本轮 action。
+   - 不允许输出 `knowledge_lookup` 或 `rag_parent_chunk_query` 作为本轮 action。
 8. thought 中必须明确写出“用户问题 -> goal -> 本轮工具调用”的映射关系，避免出现工具调用与目标脱节。
