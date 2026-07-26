@@ -30,10 +30,6 @@ _DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 _INTENT_TO_CN = {
     "SYSTEM_LOGIC_CONSULT": "业务咨询",
     "OPS_ANALYSIS": "线上问题排查",
-    # 兼容历史值：统一归并到业务咨询。
-    "ORDER_INFO_QUERY": "业务咨询",
-    "UNKNOWN_INTENT": "业务咨询",
-    "UNKNOWN": "业务咨询",
 }
 
 _INTENT_CN_NORMALIZE = {
@@ -139,13 +135,13 @@ def _pick_question(state: dict[str, Any]) -> str:
 # 方法注释（业务）:
 # - 入参：`state`(dict[str, Any])=当前 AgentState 字典，可能包含 intent_type/intent_recognition。
 # - 出参：`str`=中文意图标签（用于拼接 RAG 查询词）。
-# - 方法逻辑：优先使用 `intent_recognition.best_intent`，否则由 `intent_type` 映射为中文标签并兜底“未知意图”。
+# - 方法逻辑：优先使用 `intent_recognition.best_intent`，否则由 `intent_type` 映射为中文标签并兜底“业务咨询”。
 def resolve_intent_label_for_rag(state: dict[str, Any]) -> str:
     recognition = dict(state.get("intent_recognition") or {})
     best_intent = str(recognition.get("best_intent") or "").strip()
     if best_intent:
         return _INTENT_CN_NORMALIZE.get(best_intent, best_intent)
-    intent_type = str(state.get("intent_type") or "UNKNOWN").strip() or "UNKNOWN"
+    intent_type = str(state.get("intent_type") or "SYSTEM_LOGIC_CONSULT").strip() or "SYSTEM_LOGIC_CONSULT"
     return _INTENT_TO_CN.get(intent_type, "业务咨询")
 
 
@@ -166,17 +162,30 @@ def _search_qdrant_rag(query: str, intent_zh: str, *, limit: int = _MAX_RAG_DOCS
     )
     store = QdrantStore()
     capped_limit = max(1, min(limit, _MAX_RAG_DOCS))
+    use_hybrid = hasattr(store, "search_hybrid")
     try:
-        domain_rows = store.search(
-            query=query_text,
-            limit=capped_limit,
-            collection_name=store.config.domain_collection_name,
-        )
-        case_rows = store.search(
-            query=query_text,
-            limit=capped_limit,
-            collection_name=store.config.case_collection_name,
-        )
+        if use_hybrid:
+            domain_rows = store.search_hybrid(
+                query=query_text,
+                limit=capped_limit,
+                collection_name=store.config.domain_collection_name,
+            )
+            case_rows = store.search_hybrid(
+                query=query_text,
+                limit=capped_limit,
+                collection_name=store.config.case_collection_name,
+            )
+        else:
+            domain_rows = store.search(
+                query=query_text,
+                limit=capped_limit,
+                collection_name=store.config.domain_collection_name,
+            )
+            case_rows = store.search(
+                query=query_text,
+                limit=capped_limit,
+                collection_name=store.config.case_collection_name,
+            )
         rows: list[dict[str, Any]] = []
         for row in list(domain_rows or []):
             payload = dict(row.get("payload") or {})
@@ -188,11 +197,18 @@ def _search_qdrant_rag(query: str, intent_zh: str, *, limit: int = _MAX_RAG_DOCS
             rows.append({**row, "payload": payload})
         # 兼容老数据：分库都没命中时，回退 legacy collection。
         if not rows:
-            legacy_rows = store.search(
-                query=query_text,
-                limit=capped_limit,
-                collection_name=store.config.collection_name,
-            )
+            if use_hybrid:
+                legacy_rows = store.search_hybrid(
+                    query=query_text,
+                    limit=capped_limit,
+                    collection_name=store.config.collection_name,
+                )
+            else:
+                legacy_rows = store.search(
+                    query=query_text,
+                    limit=capped_limit,
+                    collection_name=store.config.collection_name,
+                )
             for row in list(legacy_rows or []):
                 payload = dict(row.get("payload") or {})
                 payload.setdefault("knowledge_type", "legacy")

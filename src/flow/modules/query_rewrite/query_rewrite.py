@@ -12,7 +12,7 @@ from llm.llm import chat_with_llm
 _LOGGER = logging.getLogger(__name__)
 
 _TRACE_ID_PATTERN = re.compile(
-    r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_supply_open_api_[a-z0-9_.\-]+)(?=$|[^A-Za-z0-9_\.\-])",
+    r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_supply_open_api_[a-z0-9_.\-]+|f_athena_gateway_[a-z0-9_.\-]+)(?=$|[^A-Za-z0-9_\.\-])",
     re.IGNORECASE,
 )
 _TRACE_KEY_PATTERN = re.compile(r"\btrace[_-]?id\b\s*[:=：]?\s*([A-Za-z0-9_.:\-]{4,128})", re.IGNORECASE)
@@ -22,6 +22,18 @@ _ORDER_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _API_NAME_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*_api_[A-Za-z0-9._-]+)\b")
+_PLACEHOLDER_ENTITY_VALUES = {
+    "traceid",
+    "requestid",
+    "spanid",
+    "orderid",
+    "orderno",
+    "suborderno",
+    "id",
+    "订单号",
+    "订单id",
+    "子单号",
+}
 
 _PROMPT_TEMPLATE = """# Role
 你是一个日志与链路追踪系统的查询改写专家。你的任务是将用户的自然语言问题转换为适合 RAG 检索的结构化查询。
@@ -34,6 +46,10 @@ _PROMPT_TEMPLATE = """# Role
 # Rules
 1. 【实体提取】必须完整保留所有 TraceID、错误码、IP、时间戳、API名称等技术标识符，禁止截断或修改。
 2. 【历史继承】若当前问题缺少 traceId/orderNo，必须先从“最近历史对话”提取并继承；不可凭空编造。
+   - trace_id 只能填真实 traceId 值，order_id 只能填真实 orderNo/orderId/订单号值。
+   - 如果只能找到 orderNo/orderId/订单号，不能把字段名或订单号塞入 trace_id；trace_id 必须为空字符串，order_id 填订单号。
+   - 如果只能找到 traceId，不能把字段名或 traceId 塞入 order_id；order_id 必须为空字符串。
+   - 不能把字段名、占位符或 key 名当成值输出，例如禁止输出 trace_id="order_id"、trace_id="orderNo"、order_id="trace_id"、order_id="traceId"。
 3. 【意图标准化】将口语化表述映射为标准排查动作。
    示例：
    - "为什么失败" → "生单失败原因分析"
@@ -162,13 +178,31 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _is_placeholder_entity_value(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", raw).lower()
+    return normalized in _PLACEHOLDER_ENTITY_VALUES
+
+
+def _sanitize_llm_entity_value(value: Any, source_text: str) -> str:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_entity_value(text):
+        return ""
+    if text not in source_text:
+        return ""
+    return text
+
+
 def _extract_trace_id(text: str) -> str:
     match = _TRACE_ID_PATTERN.search(text)
     if match:
         return str(match.group(0) or "").strip()
     key_match = _TRACE_KEY_PATTERN.search(text)
     if key_match:
-        return str(key_match.group(1) or "").strip()
+        value = str(key_match.group(1) or "").strip()
+        return "" if _is_placeholder_entity_value(value) else value
     return ""
 
 
@@ -178,7 +212,8 @@ def _extract_order_id(text: str) -> str:
         return str(match.group(0) or "").strip()
     key_match = _ORDER_KEY_PATTERN.search(text)
     if key_match:
-        return str(key_match.group(1) or "").strip()
+        value = str(key_match.group(1) or "").strip()
+        return "" if _is_placeholder_entity_value(value) else value
     return ""
 
 
@@ -249,10 +284,13 @@ def _normalize_result(parsed: dict[str, Any], question: str, history_lines: list
     extracted = dict(parsed.get("extracted_entities") or {})
     fallback = _fallback_rewrite(question)
     fallback_trace_id, fallback_order_id = _extract_ids(question, history_lines)
+    source_text = "\n".join([question, *history_lines])
     rewritten_queries = _normalize_rewritten_queries(parsed.get("rewritten_queries"), question)
     api_name = str(extracted.get("api_name") or fallback["extracted_entities"]["api_name"]).strip()
-    trace_id = str(extracted.get("trace_id") or parsed.get("trace_id") or fallback_trace_id or fallback["extracted_entities"]["trace_id"]).strip()
-    order_id = str(extracted.get("order_id") or parsed.get("order_id") or fallback_order_id or fallback["extracted_entities"].get("order_id") or "").strip()
+    llm_trace_id = _sanitize_llm_entity_value(extracted.get("trace_id") or parsed.get("trace_id"), source_text)
+    llm_order_id = _sanitize_llm_entity_value(extracted.get("order_id") or parsed.get("order_id"), source_text)
+    trace_id = str(llm_trace_id or fallback_trace_id or fallback["extracted_entities"]["trace_id"]).strip()
+    order_id = str(llm_order_id or fallback_order_id or fallback["extracted_entities"].get("order_id") or "").strip()
     error_code_field = str(extracted.get("error_code_field") or fallback["extracted_entities"]["error_code_field"]).strip()
     inferred_context = str(parsed.get("inferred_context") or "").strip() or _infer_context(question, api_name)
     normalized_query = " ||| ".join(rewritten_queries).strip()
@@ -285,7 +323,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = (
         _PROMPT_TEMPLATE.replace("{{user_query}}", question).replace("{{history_context}}", history_context)
     )
-    raw = chat_with_llm(question=prompt, system_prompt="")
+    raw = chat_with_llm(question=prompt, system_prompt="", scene="query_rewrite")
     parsed = _parse_json_object(raw)
     if isinstance(parsed, dict):
         query_rewrite = _normalize_result(parsed, question, history_lines)

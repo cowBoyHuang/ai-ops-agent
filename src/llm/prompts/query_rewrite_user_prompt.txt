@@ -8,4 +8,13 @@
 
 要求：
 1. 当前问题若缺少 traceId/orderNo，必须优先从“最近历史对话”提取并填入 trace_id/order_id。
-2. 不要返回解释，只返回 JSON。
+2. trace_id/order_id 只能填对应实体的真实值，不能把字段名、占位符或另一个字段的值塞错位置。
+   - 只能找到 orderNo/orderId/订单号时：trace_id 必须为空字符串，order_id 填订单号。
+   - 只能找到 traceId/QTraceId 时：trace_id 填 trace，order_id 必须为空字符串。
+   - 不能把字段名当值，例如禁止 trace_id="order_id"、trace_id="orderNo"、order_id="trace_id"、order_id="traceId"。
+3. 请对核心故障词做同义词扩展，并写入 keywords（保留原词 + 扩展词，去重）。
+4. 重点扩展词示例：
+   - 生单失败 -> 创单失败/建单失败/创建订单失败/无法生单/生单异常
+   - 支付失败 -> 支付前校验失败/无法支付/支付前校验异常
+   - 已售罄 -> 生单拦截/创单拦截/生单异常
+5. 不要返回解释，只返回 JSON。

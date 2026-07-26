@@ -147,6 +147,53 @@ def test_planner_keeps_v2_goals_aligned_after_required_answer_filter(monkeypatch
     assert "intercepted_passenger" in str(dict(v2_goals[0]).get("goal") or "")
 
 
+def test_planner_forces_runtime_evidence_for_trace_failure_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.planner.planner.chat_with_llm",
+        lambda **_: json.dumps(
+            {
+                "plan_id": "plan_001",
+                "hypothesis": "当前输入中的问题内容仍为占位符，缺少可用于形成根因假设的实际查询文本。",
+                "goals": [
+                    {
+                        "id": "g1",
+                        "goal": "确认实际用户问题文本",
+                        "required_capability": "business_validation",
+                        "priority": 1,
+                        "required": True,
+                        "success_criteria": ["确认用户问题"],
+                        "expected_evidence": ["business_doc"],
+                        "depends_on": [],
+                    }
+                ],
+                "finish_criteria": ["用户问题已被直接回答"],
+                "replan_triggers": ["missing_required_context"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    state = planner_run(
+        {
+            "question": "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1生单失败原因",
+            "query_rewrite": {
+                "normalized_query": "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1生单失败原因",
+                "trace_id": "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1",
+                "keywords": ["生单失败", "失败原因"],
+            },
+            "knowledge_context": {"domain_docs": [], "case_docs": [], "code_docs": []},
+            "structured_context": {},
+        }
+    )
+
+    investigation_plan = dict(dict(state.get("investigation") or {}).get("plan") or {})
+    goals = [dict(item or {}) for item in list(investigation_plan.get("goals") or [])]
+    assert goals
+    assert goals[0]["required_capability"] == "runtime_evidence"
+    assert "确认实际用户问题" not in str(goals[0].get("goal") or "")
+    assert "失败原因" in str(goals[0].get("goal") or "")
+
+
 def test_capability_router_maps_runtime_evidence_to_log_executor() -> None:
     from flow.modules.agent_executor_graph.graph.capability_router.capability_router import run as router_run
 
@@ -451,3 +498,301 @@ def test_log_domain_executor_receives_only_log_tools(monkeypatch: pytest.MonkeyP
     assert allowed
     assert set(allowed) <= {"queryLog", "dependency_log_query", "getFlightCreateOrderResult", "getCreateOrderResult"}
     assert dict(dict(state.get("investigation") or {}).get("last_executor_result") or {})["status"] == "succeeded"
+
+
+def test_runtime_evidence_executor_requires_tool_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flow.modules.agent_executor_graph.graph.domain_executors.common import execute_domain_goal
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.chat_with_llm",
+        lambda **_: json.dumps(
+            {
+                "thought": "直接根据问题作答",
+                "action": {},
+                "final_evidence": {
+                    "summary": "确认实际用户问题文本是生单失败原因",
+                    "facts": {},
+                    "evidence": [],
+                    "confidence": 0.8,
+                },
+                "goal_complete": True,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.filtered_tool_schemas",
+        lambda allowed_tools: [{"tool_name": "queryLog", "description": "query logs", "params_schema": {}, "required": []}],
+    )
+
+    result = execute_domain_goal(
+        executor="LogExecutor",
+        prompt_name="log_executor_react_system_prompt.txt",
+        question="ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1生单失败原因",
+        current_goal={
+            "id": "g1",
+            "goal": "查询 trace 日志定位生单失败原因",
+            "required_capability": "runtime_evidence",
+            "success_criteria": ["拿到日志证据"],
+        },
+        allowed_tools=["queryLog"],
+        existing_evidence=[],
+        structured_context={"trace_id": "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1"},
+        attempt=1,
+    )
+
+    assert result["status"] == "failed"
+    assert result["goal_complete"] is False
+    assert result["error"] == "empty_evidence"
+
+
+def test_runtime_evidence_executor_falls_back_to_create_order_tool_when_llm_omits_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flow.modules.agent_executor_graph.graph.domain_executors.common import execute_domain_goal
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.chat_with_llm",
+        lambda **_: json.dumps(
+            {
+                "thought": "直接回答",
+                "action": {},
+                "final_evidence": {
+                    "summary": "缺少日志证据",
+                    "facts": {},
+                    "evidence": [],
+                    "confidence": 0.1,
+                },
+                "goal_complete": False,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.filtered_tool_schemas",
+        lambda allowed_tools: [
+            {"tool_name": "getCreateOrderResult", "description": "query order logs", "params_schema": {}, "required": []}
+        ],
+    )
+
+    def _fake_invoke_tool(name: str, args: dict[str, object]) -> list[dict[str, object]]:
+        captured["name"] = name
+        captured["args"] = dict(args)
+        return [{"content": "生单返回结果 bizErrorCode=10321"}]
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.invoke_tool",
+        _fake_invoke_tool,
+    )
+
+    result = execute_domain_goal(
+        executor="LogExecutor",
+        prompt_name="log_executor_react_system_prompt.txt",
+        question="ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1生单失败原因",
+        current_goal={
+            "id": "g1",
+            "goal": "查询 trace 日志定位生单失败原因",
+            "required_capability": "runtime_evidence",
+            "success_criteria": ["拿到日志证据"],
+        },
+        allowed_tools=["getCreateOrderResult"],
+        existing_evidence=[],
+        structured_context={
+            "trace_id": "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1",
+            "begin_time": "2026-07-19T17:28:29+08:00",
+            "end_time": "2026-07-19T19:28:29+08:00",
+        },
+        attempt=1,
+    )
+
+    args = dict(captured.get("args") or {})
+    assert captured["name"] == "getCreateOrderResult"
+    assert args["trace_id"] == "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1"
+    assert args["begin_time"] == "2026-07-19T17:28:29+08:00"
+    assert args["end_time"] == "2026-07-19T19:28:29+08:00"
+    assert result["status"] == "succeeded"
+
+
+def test_runtime_evidence_executor_uses_flight_tool_for_passenger_goal_when_llm_omits_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flow.modules.agent_executor_graph.graph.domain_executors.common import execute_domain_goal
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.chat_with_llm",
+        lambda **_: json.dumps(
+            {
+                "thought": "需要查子单明细，但未给出工具",
+                "action": {},
+                "final_evidence": {
+                    "summary": "",
+                    "facts": {},
+                    "evidence": [],
+                    "confidence": 0.0,
+                },
+                "goal_complete": False,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.filtered_tool_schemas",
+        lambda allowed_tools: [
+            {"tool_name": "getCreateOrderResult", "description": "query order logs", "params_schema": {}, "required": []},
+            {"tool_name": "getFlightCreateOrderResult", "description": "query flight logs", "params_schema": {}, "required": []},
+        ],
+    )
+
+    def _fake_invoke_tool(name: str, args: dict[str, object]) -> list[dict[str, object]]:
+        captured["name"] = name
+        captured["args"] = dict(args)
+        return [{"content": "单程生单结果 passengerName=张三 age=13 subErrorCode=39"}]
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.invoke_tool",
+        _fake_invoke_tool,
+    )
+
+    result = execute_domain_goal(
+        executor="LogExecutor",
+        prompt_name="log_executor_react_system_prompt.txt",
+        question="具体是哪个乘机人不满足呢？",
+        current_goal={
+            "id": "g5",
+            "goal": "获取并确认字段 intercepted_passenger：被拦截的乘机人是谁",
+            "required_capability": "runtime_evidence",
+            "success_criteria": ["拿到被拦截乘机人"],
+        },
+        allowed_tools=["getCreateOrderResult", "getFlightCreateOrderResult"],
+        existing_evidence=[],
+        structured_context={
+            "trace_id": "f_athena_gateway_260719.182044.10.77.26.177.354.13273418_1",
+            "begin_time": "2026-07-19T17:28:29+08:00",
+            "end_time": "2026-07-19T19:28:29+08:00",
+        },
+        attempt=1,
+    )
+
+    args = dict(captured.get("args") or {})
+    assert captured["name"] == "getFlightCreateOrderResult"
+    assert args["trace_id"] == "f_athena_gateway_260719.182044.10.77.26.177.354.13273418_1"
+    assert result["status"] == "succeeded"
+
+
+def test_runtime_evidence_executor_treats_empty_tool_result_as_empty_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flow.modules.agent_executor_graph.graph.domain_executors.common import execute_domain_goal
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.chat_with_llm",
+        lambda **_: json.dumps(
+            {
+                "thought": "查询总单日志",
+                "action": {"tool_name": "getCreateOrderResult", "params": {"trace_id": "trace-1"}},
+                "final_evidence": {
+                    "summary": "没有查到生单返回结果",
+                    "facts": {},
+                    "evidence": [],
+                    "confidence": 0.2,
+                },
+                "goal_complete": True,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.filtered_tool_schemas",
+        lambda allowed_tools: [{"tool_name": "getCreateOrderResult", "description": "query order logs", "params_schema": {}, "required": []}],
+    )
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.invoke_tool",
+        lambda name, args: [],
+    )
+
+    result = execute_domain_goal(
+        executor="LogExecutor",
+        prompt_name="log_executor_react_system_prompt.txt",
+        question="trace-1 生单失败原因",
+        current_goal={
+            "id": "g1",
+            "goal": "查询 trace 日志定位生单失败原因",
+            "required_capability": "runtime_evidence",
+            "success_criteria": ["拿到日志证据"],
+        },
+        allowed_tools=["getCreateOrderResult"],
+        existing_evidence=[],
+        structured_context={"trace_id": "trace-1"},
+        attempt=1,
+    )
+
+    assert result["status"] == "failed"
+    assert result["goal_complete"] is False
+    assert result["error"] == "empty_evidence"
+
+
+def test_log_executor_fills_selected_tool_params_from_structured_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flow.modules.agent_executor_graph.graph.domain_executors.common import execute_domain_goal
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.chat_with_llm",
+        lambda **_: json.dumps(
+            {
+                "thought": "查询总单生单结果",
+                "action": {"tool_name": "getCreateOrderResult", "params": {}},
+                "final_evidence": {
+                    "summary": "命中生单返回日志",
+                    "facts": {"errorCode": "10321"},
+                    "evidence": [],
+                    "confidence": 0.8,
+                },
+                "goal_complete": True,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.filtered_tool_schemas",
+        lambda allowed_tools: [{"tool_name": "getCreateOrderResult", "description": "query order logs", "params_schema": {}, "required": []}],
+    )
+
+    def _fake_invoke_tool(name: str, args: dict[str, object]) -> list[dict[str, object]]:
+        captured["name"] = name
+        captured["args"] = dict(args)
+        return [{"content": "生单返回结果 errorCode=10321"}]
+
+    monkeypatch.setattr(
+        "flow.modules.agent_executor_graph.graph.domain_executors.common.invoke_tool",
+        _fake_invoke_tool,
+    )
+
+    result = execute_domain_goal(
+        executor="LogExecutor",
+        prompt_name="log_executor_react_system_prompt.txt",
+        question="trace 生单失败原因",
+        current_goal={
+            "id": "g1",
+            "goal": "查询 trace 日志定位生单失败原因",
+            "required_capability": "runtime_evidence",
+            "success_criteria": ["拿到日志证据"],
+        },
+        allowed_tools=["getCreateOrderResult"],
+        existing_evidence=[],
+        structured_context={
+            "trace_id": "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1",
+            "begin_time": "2026-07-19T17:28:29+08:00",
+            "end_time": "2026-07-19T19:28:29+08:00",
+        },
+        attempt=1,
+    )
+
+    args = dict(captured.get("args") or {})
+    assert captured["name"] == "getCreateOrderResult"
+    assert args["trace_id"] == "ops_slugger_260719.182829.10.95.133.56.480263.5786380531_1"
+    assert args["begin_time"] == "2026-07-19T17:28:29+08:00"
+    assert args["end_time"] == "2026-07-19T19:28:29+08:00"
+    assert result["status"] == "succeeded"

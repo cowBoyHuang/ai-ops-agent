@@ -28,6 +28,12 @@ _CODE_HINT_PATTERN = re.compile(r"(biz[_-]?error[_-]?code|sub[_-]?error[_-]?code
 _STATUS_HINT_PATTERN = re.compile(r"(status|状态|结果状态|result[_-]?status|是否成功|success)", re.IGNORECASE)
 _TIME_HINT_PATTERN = re.compile(r"(time|timestamp|时间|时间点|何时|什么时候|失败时间)", re.IGNORECASE)
 _REASON_HINT_PATTERN = re.compile(r"(原因|失败原因|why|reason|errormsg|errmsg|失败信息)", re.IGNORECASE)
+_TRACE_ID_PATTERN = re.compile(
+    r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_supply_open_api_[a-z0-9_.\-]+)(?=$|[^A-Za-z0-9_\.\-])",
+    re.IGNORECASE,
+)
+_TRACE_FAILURE_REASON_PATTERN = re.compile(r"(失败原因|失败.*原因|原因.*失败|为什么.*失败|生单失败|创建失败|下单失败)", re.IGNORECASE)
+_PLACEHOLDER_PLAN_PATTERN = re.compile(r"(占位符|确认实际用户问题|用户问题文本|实际查询文本|缺少.*查询文本|缺少.*问题内容)")
 
 
 def _clip(text: Any, max_len: int = _MAX_DOC_TEXT) -> str:
@@ -360,6 +366,55 @@ def _normalize_investigation_plan_v2(parsed: dict[str, Any], state: dict[str, An
     }
 
 
+def _needs_trace_runtime_evidence(state: dict[str, Any]) -> bool:
+    query_rewrite = dict(state.get("query_rewrite") or {})
+    structured = dict(state.get("structured_context") or {})
+    text = " ".join(
+        [
+            str(state.get("question") or ""),
+            str(query_rewrite.get("normalized_query") or ""),
+            " ".join(str(item) for item in list(query_rewrite.get("keywords") or [])),
+        ]
+    )
+    trace_id = str(query_rewrite.get("trace_id") or structured.get("trace_id") or "").strip()
+    return bool((trace_id or _TRACE_ID_PATTERN.search(text)) and _TRACE_FAILURE_REASON_PATTERN.search(text))
+
+
+def _has_placeholder_planning(plan: dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            str(plan.get("hypothesis") or ""),
+            " ".join(str(dict(item or {}).get("goal") or "") for item in list(plan.get("goals") or [])),
+        ]
+    )
+    return bool(_PLACEHOLDER_PLAN_PATTERN.search(text))
+
+
+def _force_trace_runtime_evidence_plan(plan: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    query_rewrite = dict(state.get("query_rewrite") or {})
+    trace_id = str(query_rewrite.get("trace_id") or dict(state.get("structured_context") or {}).get("trace_id") or "").strip()
+    goal_text = "查询 trace 运行时日志定位生单失败原因"
+    if not trace_id and _TRACE_ID_PATTERN.search(str(state.get("question") or "")):
+        goal_text = "查询用户问题中的 trace 运行时日志定位生单失败原因"
+    updated = dict(plan)
+    updated["hypothesis"] = "生单失败原因需要通过运行时日志证据定位"
+    updated["goals"] = [
+        {
+            "id": "g1",
+            "goal": goal_text,
+            "required_capability": "runtime_evidence",
+            "priority": 1,
+            "required": True,
+            "success_criteria": ["拿到 trace 相关日志证据", "明确生单失败阶段或失败原因"],
+            "expected_evidence": ["log_event", "failure_reason"],
+            "depends_on": [],
+        }
+    ]
+    updated["finish_criteria"] = list(plan.get("finish_criteria") or ["根因明确", "证据链闭合", "用户问题已被直接回答"])
+    updated["replan_triggers"] = list(plan.get("replan_triggers") or _DEFAULT_REPLAN_TRIGGERS)
+    return updated
+
+
 def _sync_v2_goals_with_goal_texts(investigation_plan: dict[str, Any], goal_texts: list[str]) -> dict[str, Any]:
     """保持 V2 plan.goals 与兼容字段 investigation_goals 同步。"""
     normalized_texts = [str(item).strip() for item in list(goal_texts or []) if str(item).strip()]
@@ -570,6 +625,14 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         goals = _build_minimal_goals_from_required_answers(required_answers)
     if not goals:
         hypothesis, goals, required_answers = _fallback_plan(state)
+
+    if _needs_trace_runtime_evidence(state) and (
+        _has_placeholder_planning(investigation_plan)
+        or not any(str(dict(item or {}).get("required_capability") or "") == "runtime_evidence" for item in list(investigation_plan.get("goals") or []))
+    ):
+        investigation_plan = _force_trace_runtime_evidence_plan(investigation_plan, state)
+        hypothesis = str(investigation_plan.get("hypothesis") or "").strip()
+        goals = [str(dict(item or {}).get("goal") or "").strip() for item in list(investigation_plan.get("goals") or [])]
 
     hypothesis = _avoid_rejected(hypothesis, rejected)
     investigation_plan = _sync_v2_goals_with_goal_texts(investigation_plan, goals)

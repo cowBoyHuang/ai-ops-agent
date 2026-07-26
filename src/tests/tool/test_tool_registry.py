@@ -32,8 +32,17 @@ def test_prompt_schema_comes_from_tool_descriptions() -> None:
     schemas = build_tool_schemas_for_prompt()
     by_name = {row["tool_name"]: row for row in schemas}
     assert "机票子单生单结果" in by_name["getFlightCreateOrderResult"]["description"]
+    assert "乘机人" in by_name["getFlightCreateOrderResult"]["description"]
+    assert "年龄" in by_name["getFlightCreateOrderResult"]["description"]
+    assert "特殊产品" in by_name["getFlightCreateOrderResult"]["description"]
+    assert "优先使用" in by_name["getFlightCreateOrderResult"]["description"]
     assert "总单生单结果" in by_name["getCreateOrderResult"]["description"]
+    assert "不适合回答具体乘机人" in by_name["getCreateOrderResult"]["description"]
+    assert "机票子单内部明细" in by_name["getCreateOrderResult"]["description"]
     assert "match_list=[]" in by_name["queryLog"]["description"]
+    assert "扩展兜底" in by_name["queryLog"]["description"]
+    assert "乘机人" in by_name["queryLog"]["description"]
+    assert "年龄" in by_name["queryLog"]["description"]
     assert "业务文档" in by_name["analyzeCodeForBusinessConsult"]["description"]
     assert "实际代码" in by_name["analyzeCodeForBusinessConsult"]["description"]
 

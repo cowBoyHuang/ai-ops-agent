@@ -62,7 +62,7 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 # 方法注释（业务）:
 # - 业务：把大模型返回的中文意图标签映射为内部统一枚举值。
 # - 入参：`best_intent`(str)=大模型识别出的最佳意图标签。
-# - 出参：`str`=内部意图类型；未命中时返回 `UNKNOWN`。
+# - 出参：`str`=内部意图类型；未命中时默认返回 `SYSTEM_LOGIC_CONSULT`。
 # - 逻辑：使用 `_INTENT_MAP` 做字典映射并兜底默认值。
 def _to_internal_intent(best_intent: str) -> str:
     return _INTENT_MAP.get(str(best_intent or "").strip(), "SYSTEM_LOGIC_CONSULT")
@@ -318,7 +318,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         state["intent_retry_count"] = retry_count
         state["intent_retry_results"] = retry_rows
         state["intent_history_prompt"] = _build_intent_history_prompt(question, retry_rows)
-        state["intent_type"] = "UNKNOWN_INTENT"
+        # 仅保留两类主意图：重试期间统一保持业务咨询默认意图。
+        state["intent_type"] = "SYSTEM_LOGIC_CONSULT"
         state["route"] = "intent_decide"
         state["structured_context"] = {
             **structured_context,
@@ -345,7 +346,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     intent_type = _to_internal_intent(best_intent)
     if not question:
-        intent_type = "UNKNOWN"
+        intent_type = "SYSTEM_LOGIC_CONSULT"
 
     state["intent_type"] = intent_type
     state["intent_history_prompt"] = ""

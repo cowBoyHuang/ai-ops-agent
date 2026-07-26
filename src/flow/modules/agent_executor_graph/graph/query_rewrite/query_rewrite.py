@@ -12,7 +12,7 @@ from flow.modules.agent_executor_graph.agent_state import AgentState
 from llm.llm import chat_with_llm, load_prompt, render_prompt
 
 _TRACE_ID_PATTERN = re.compile(
-    r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_supply_open_api_[a-z0-9_.\-]+)(?=$|[^A-Za-z0-9_\.\-])",
+    r"(?:[a-z]+[_-]slugger[_a-z0-9\.\-]+|flight_supply_open_api_[a-z0-9_.\-]+|f_athena_gateway_[a-z0-9_.\-]+)(?=$|[^A-Za-z0-9_\.\-])",
     re.IGNORECASE,
 )
 _ORDER_ID_PATTERN = re.compile(r"\b(?:xep|sid|fod|hpv)[A-Za-z0-9]{6,}\b", re.IGNORECASE)
@@ -20,6 +20,18 @@ _YYMMDD_HHMMSS_PATTERN = re.compile(r"(?<!\d)(\d{6})[\s_.-]+(\d{6})(?!\d)")
 _QUERY_REWRITE_SYSTEM_PROMPT = "query_rewrite_system_prompt.txt"
 _QUERY_REWRITE_USER_PROMPT = "query_rewrite_user_prompt.txt"
 _LOGGER = logging.getLogger(__name__)
+_PLACEHOLDER_ENTITY_VALUES = {
+    "traceid",
+    "requestid",
+    "spanid",
+    "orderid",
+    "orderno",
+    "suborderno",
+    "id",
+    "订单号",
+    "订单id",
+    "子单号",
+}
 
 _KEYWORD_STOPWORDS = {
     "traceid",
@@ -156,6 +168,23 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _is_placeholder_entity_value(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", raw).lower()
+    return normalized in _PLACEHOLDER_ENTITY_VALUES
+
+
+def _sanitize_llm_entity_value(value: Any, source_text: str) -> str:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_entity_value(text):
+        return ""
+    if text not in source_text:
+        return ""
+    return text
+
+
 def _to_iso_time(yymmdd: str, hhmmss: str) -> str:
     year = 2000 + int(yymmdd[0:2])
     month = int(yymmdd[2:4])
@@ -230,15 +259,16 @@ def _rewrite_with_remote_llm(question: str, *, history_context: str) -> dict[str
         )
         or question_text
     )
-    raw_output = chat_with_llm(question=user_prompt, system_prompt=system_prompt)
+    raw_output = chat_with_llm(question=user_prompt, system_prompt=system_prompt, scene="query_rewrite")
     parsed = _parse_json_object(raw_output)
     if not isinstance(parsed, dict):
         _LOGGER.info("query_rewrite.remote_llm.parse_failed raw_len=%d", len(str(raw_output or "")))
         return {}
 
     normalized_query = str(parsed.get("normalized_query") or parsed.get("query") or "").strip()
-    trace_id = str(parsed.get("trace_id") or parsed.get("traceId") or "").strip()
-    order_id = str(parsed.get("order_id") or parsed.get("orderId") or "").strip()
+    source_text = f"{question_text}\n{history_context or ''}"
+    trace_id = _sanitize_llm_entity_value(parsed.get("trace_id") or parsed.get("traceId"), source_text)
+    order_id = _sanitize_llm_entity_value(parsed.get("order_id") or parsed.get("orderId"), source_text)
     keywords = _normalize_keywords(parsed.get("keywords"), fallback_question=normalized_query or question_text)
     time_window = _normalize_time_window(parsed)
     return {
@@ -267,9 +297,18 @@ def _merge_rewrite(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[st
     return merged
 
 
+def _sanitize_existing_rewrite(rewrite: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(rewrite)
+    if _is_placeholder_entity_value(sanitized.get("trace_id")):
+        sanitized["trace_id"] = ""
+    if _is_placeholder_entity_value(sanitized.get("order_id")):
+        sanitized["order_id"] = ""
+    return sanitized
+
+
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     state: AgentState = dict(payload)
-    existing_rewrite = dict(state.get("query_rewrite") or {})
+    existing_rewrite = _sanitize_existing_rewrite(dict(state.get("query_rewrite") or {}))
     if existing_rewrite and (
         str(existing_rewrite.get("normalized_query") or "").strip()
         or list(existing_rewrite.get("rewritten_queries") or [])

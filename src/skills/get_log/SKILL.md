@@ -182,3 +182,14 @@ query_external_logs(
     },
 )
 ```
+
+## 日志不足时的代码分析兜底（V2）
+
+当日志无法直接给出结论时（例如命中为空、仅有模糊失败描述、缺少明确错误码/失败原因）：
+
+1. 必须触发本地 Code Index Client 做代码上下文补充：
+   - `GET /locateCode?class=...&line=...`
+   - `GET /searchMethod?keyword=...`
+2. 优先使用日志中的类名+行号定位方法；定位失败再用关键词搜索方法。
+3. 代码兜底结果必须并入同一轮 `evidence/effective_info`，由后续 LLM 综合分析。
+4. 若 Code Index 不可达或未命中，不得伪造代码结论，需明确写出失败原因。

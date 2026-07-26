@@ -15,7 +15,22 @@
 
 约束：
 1. 仅基于输入内容（当前问题 + 历史对话），不引入外部事实，不臆造值。
-2. keywords 聚焦检索价值，不要泛化词。
+2. keywords 聚焦检索价值，不要泛化词。优先输出“原始问题中的核心故障词 + 同义词扩展词”。
 3. 若当前问题中缺少 trace_id/order_id，必须先尝试从历史对话中继承。
-4. 若历史对话中出现多个 trace_id/order_id，优先选择与“最近一轮上下文”最相关的一组。
-5. 没有把握的字段置空。
+4. trace_id 与 order_id 必须严格按字段含义填值：
+   - trace_id 只能填写真实 traceId/QTraceId/request trace 值。
+   - order_id 只能填写真实 orderNo/orderId/订单号/子单号值。
+   - 如果只能找到 orderNo/orderId/订单号，不能把字段名或订单号塞入 trace_id；trace_id 必须为空字符串，order_id 填订单号。
+   - 如果只能找到 traceId，不能把字段名或 traceId 塞入 order_id；order_id 必须为空字符串。
+   - 不能把字段名、占位符或 key 名当成值输出，例如禁止输出 trace_id="order_id"、trace_id="orderNo"、order_id="trace_id"、order_id="traceId"。
+5. 若历史对话中出现多个 trace_id/order_id，优先选择与“最近一轮上下文”最相关的一组。
+6. 没有把握的字段置空。
+7. 同义词扩展规则（仅在语义明确命中时使用）：
+   - 生单失败 => 创单失败, 建单失败, 创建订单失败, 无法生单, 生单异常
+   - 支付失败 => 支付前校验失败, 无法支付, 支付前校验异常
+   - 已售罄 => 生单拦截, 创单拦截, 生单异常
+8. keywords 输出规则：
+   - 先放原始表达，再放同义词扩展；
+   - 去重后按相关性排序；
+   - 数量控制在 4-12 个；
+   - 禁止输出与当前问题无关的扩展词。

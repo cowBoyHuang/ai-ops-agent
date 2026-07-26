@@ -18,6 +18,7 @@ except Exception:  # noqa: BLE001
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 _DEFAULT_MODEL = "azure/gpt-5.5-2026-04-24"
+_DEFAULT_QUERY_REWRITE_MODEL = "azure/gpt-5.5-2026-04-24"
 _DEFAULT_BASE_URL = "http://llm.api.corp.qunar.com/v1"
 _MAX_SUMMARY_LEN = 500
 _INTENT_LABELS = ("业务咨询", "线上问题排查")
@@ -51,6 +52,8 @@ def _scene_key(scene: str) -> str:
         return "INTENT"
     if scene == "sensitive_check":
         return "SENSITIVE"
+    if scene == "query_rewrite":
+        return "QUERY_REWRITE"
     return "GENERAL"
 
 
@@ -66,6 +69,15 @@ def _resolve_runtime_model(scene: str) -> str:
     scene_key = _scene_key(scene)
     if scene_key == "GENERAL":
         return _pick_env("AIOPS_LLM_MODEL", "LLM_MODEL", default=_DEFAULT_MODEL) or _DEFAULT_MODEL
+    if scene_key == "QUERY_REWRITE":
+        return (
+            _pick_env(
+                "AIOPS_QUERY_REWRITE_LLM_MODEL",
+                "LLM_QUERY_REWRITE_MODEL",
+                default=_DEFAULT_QUERY_REWRITE_MODEL,
+            )
+            or _DEFAULT_QUERY_REWRITE_MODEL
+        )
     return _pick_env(
         f"AIOPS_{scene_key}_LLM_MODEL",
         f"LLM_{scene_key}_MODEL",
@@ -79,6 +91,17 @@ def _resolve_runtime_base_url(scene: str) -> str:
     scene_key = _scene_key(scene)
     if scene_key == "GENERAL":
         return _pick_env("AIOPS_LLM_BASE_URL", "LLM_BASE_URL", default=_DEFAULT_BASE_URL) or _DEFAULT_BASE_URL
+    if scene_key == "QUERY_REWRITE":
+        return (
+            _pick_env(
+                "AIOPS_QUERY_REWRITE_LLM_BASE_URL",
+                "LLM_QUERY_REWRITE_BASE_URL",
+                "AIOPS_LLM_BASE_URL",
+                "LLM_BASE_URL",
+                default=_DEFAULT_BASE_URL,
+            )
+            or _DEFAULT_BASE_URL
+        )
     return _pick_env(
         f"AIOPS_{scene_key}_LLM_BASE_URL",
         f"LLM_{scene_key}_BASE_URL",
@@ -93,6 +116,18 @@ def _resolve_token_price(scene: str) -> tuple[float, float]:
     if scene_key == "GENERAL":
         in_price = _pick_float_env("AIOPS_LLM_INPUT_PRICE_PER_1M", "LLM_INPUT_PRICE_PER_1M", default=0.0)
         out_price = _pick_float_env("AIOPS_LLM_OUTPUT_PRICE_PER_1M", "LLM_OUTPUT_PRICE_PER_1M", default=0.0)
+        return in_price, out_price
+    if scene_key == "QUERY_REWRITE":
+        in_price = _pick_float_env(
+            "AIOPS_QUERY_REWRITE_LLM_INPUT_PRICE_PER_1M",
+            "LLM_QUERY_REWRITE_INPUT_PRICE_PER_1M",
+            default=0.0,
+        )
+        out_price = _pick_float_env(
+            "AIOPS_QUERY_REWRITE_LLM_OUTPUT_PRICE_PER_1M",
+            "LLM_QUERY_REWRITE_OUTPUT_PRICE_PER_1M",
+            default=0.0,
+        )
         return in_price, out_price
     in_price = _pick_float_env(
         f"AIOPS_{scene_key}_LLM_INPUT_PRICE_PER_1M",
@@ -416,11 +451,11 @@ def summarize_with_llm(total_message: str, summary_message: str) -> str:
     return text[:_MAX_SUMMARY_LEN]
 
 
-def chat_with_llm(question: str, system_prompt: str = "") -> str:
+def chat_with_llm(question: str, system_prompt: str = "", *, scene: str = "general") -> str:
     question_text = str(question).strip()
     if not question_text:
         return ""
-    return _invoke_llm(system_prompt=system_prompt, user_prompt=question_text, scene="general")
+    return _invoke_llm(system_prompt=system_prompt, user_prompt=question_text, scene=scene)
 
 
 def check_sensitive_operation_with_llm(question: str) -> dict[str, Any]:

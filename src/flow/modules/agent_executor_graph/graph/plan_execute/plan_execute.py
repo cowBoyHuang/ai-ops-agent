@@ -16,10 +16,9 @@ from typing import Any
 
 from flow.modules.agent_executor_graph.agent_state import AgentState
 from llm.llm import chat_with_llm, load_prompt, render_prompt
-from tool.code_tool import clone_repo, pull_repo
 
 _LOGGER = logging.getLogger(__name__)
-_ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "code_clone", "code_pull", "none"}
+_ALLOWED_TOOL_NAMES = {"log_query", "dependency_log_query", "knowledge_lookup", "none"}
 _MAX_STEP_RETRY = 1
 _MAX_LLM_HISTORY_ROWS = 4
 _MAX_SUMMARY_LEN = 300
@@ -92,17 +91,6 @@ def _tool_failed(tool: str, error: str, extra: dict[str, Any] | None = None) -> 
     if extra:
         payload.update(extra)
     return payload
-
-
-def _extract_git_url(tool_params: dict[str, Any], structured_context: dict[str, Any]) -> str:
-    value = (
-        tool_params.get("git_url")
-        or tool_params.get("repo_url")
-        or structured_context.get("git_url")
-        or dict(structured_context.get("code_repo") or {}).get("git_url")
-        or ""
-    )
-    return str(value).strip()
 
 
 def _build_step_history_preview(execution_history: dict[str, Any]) -> str:
@@ -245,38 +233,6 @@ def _execute_tool_call(
     if normalized_tool == "knowledge_lookup":
         return _tool_success("knowledge_lookup", [f"知识库证据：{question[:64]}"])
 
-    if normalized_tool == "code_clone":
-        git_url = _extract_git_url(tool_params, structured_context)
-        if not git_url:
-            return _tool_failed("code_clone", "missing git_url")
-        result = clone_repo(git_url=git_url)
-        if bool(result.get("ok")):
-            return _tool_success(
-                "code_clone",
-                [
-                    f"clone success: {str(result.get('target_dir') or '')}",
-                    f"status={str(result.get('status') or '')}",
-                ],
-                extra={"tool_payload": result},
-            )
-        return _tool_failed("code_clone", str(result.get("message") or "clone failed"), extra={"tool_payload": result})
-
-    if normalized_tool == "code_pull":
-        git_url = _extract_git_url(tool_params, structured_context)
-        if not git_url:
-            return _tool_failed("code_pull", "missing git_url")
-        result = pull_repo(git_url=git_url)
-        if bool(result.get("ok")):
-            return _tool_success(
-                "code_pull",
-                [
-                    f"pull success: {str(result.get('target_dir') or '')}",
-                    f"status={str(result.get('status') or '')}",
-                ],
-                extra={"tool_payload": result},
-            )
-        return _tool_failed("code_pull", str(result.get("message") or "pull failed"), extra={"tool_payload": result})
-
     return _tool_success("none", [])
 
 
@@ -328,7 +284,7 @@ def _merge_all_evidence(state: dict[str, Any], execution_history: dict[str, Any]
         "context": {
             "order_id": structured_context.get("order_id") or "",
             "request_id": structured_context.get("request_id") or "",
-            "intent_type": state.get("intent_type") or "UNKNOWN",
+            "intent_type": state.get("intent_type") or "SYSTEM_LOGIC_CONSULT",
         },
     }
 

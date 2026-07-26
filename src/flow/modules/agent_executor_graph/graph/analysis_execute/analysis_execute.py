@@ -256,7 +256,7 @@ def _extract_code_summaries(rows: list[str]) -> list[str]:
             continue
         if text.startswith("[summary]"):
             text = text.split("[summary]", 1)[1].strip()
-        if text.startswith("code_file:") or text.startswith("code_pull success:") or text.startswith("code_clone success:"):
+        if text.startswith("code_file:"):
             continue
         if text and text not in summaries:
             summaries.append(text)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import logging
 import time
 import uuid
@@ -8,18 +10,33 @@ from fastapi import FastAPI
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
+from embedding.api_embedding import close_shared_embedding_client, warm_up_shared_embedding_client
 from runtime_logging import bind_request_id, build_request_file_handler, logs_dir, reset_request_id
 from web.routes.analyze import ANALYZE_PATH, router as analyze_router
 from web.routes.admin import router as admin_router
 
 _REQUEST_LOGGER = logging.getLogger("aiops.request")
+_STARTUP_LOGGER = logging.getLogger("aiops.startup")
 
 
 def create_app() -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            duration_ms = warm_up_shared_embedding_client()
+            _STARTUP_LOGGER.info("query_embedding.warmup.done duration_ms=%.2f", duration_ms)
+        except Exception as err:  # noqa: BLE001
+            _STARTUP_LOGGER.warning("query_embedding.warmup.failed err=%s", err)
+        try:
+            yield
+        finally:
+            close_shared_embedding_client()
+
     app = FastAPI(
         title="AIOps Agent",
         version="1.0.0",
         description="AIOps analysis service powered by FastAPI.",
+        lifespan=lifespan,
     )
 
     @app.middleware("http")
